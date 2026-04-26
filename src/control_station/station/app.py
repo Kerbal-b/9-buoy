@@ -120,6 +120,7 @@ def run() -> None:
     last_send_result = "Waiting for first command"
     last_command = build_manual_command(0.0, 0.0)
     last_hello_time = 0.0
+    zero_send_count = 0
     command_input = ""
     last_response = "No response yet"
     running = True
@@ -153,6 +154,10 @@ def run() -> None:
         now = time.monotonic()
         min_send_interval = 1.0 / max(args.send_rate, 0.1)
 
+        is_zero = (command.turn == 0 and command.thrust == 0)
+        if not is_zero:
+            zero_send_count = 0
+
         if args.hello_ping or args.send_text:
             hello_interval = max(args.send_interval, 0.1)
             if (now - last_hello_time) >= hello_interval:
@@ -161,7 +166,18 @@ def run() -> None:
                 last_hello_time = now
                 last_sent_line = ping_text
         else:
-            if command != last_command or (now - last_send_time) >= min_send_interval:
+            send_command_flag = False
+            if command != last_command:
+                send_command_flag = True
+            elif (now - last_send_time) >= min_send_interval:
+                if is_zero:
+                    if zero_send_count < 10:
+                        send_command_flag = True
+                        zero_send_count += 1
+                else:
+                    send_command_flag = True
+
+            if send_command_flag:
                 last_send_result = send_command(serial_link, command)
                 last_send_time = now
                 last_command = command

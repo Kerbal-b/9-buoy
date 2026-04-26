@@ -90,6 +90,12 @@ Value meaning:
 
 The Arduino buoy firmware receives the VECTOR command, computes the required motor thrusts using the same geometry model, and applies them to the motors.
 
+## Transmission Optimization
+
+To prevent excessive Bluetooth traffic:
+- VECTOR commands are only sent when the movement vector changes or at regular intervals (based on `--send-rate`)
+- When the vector is zero (stop command), it is sent up to 10 times to ensure delivery, then transmission stops until movement resumes
+
 ## Environment Setup
 
 Use a local virtual environment so the control station dependencies do not affect global Python packages.
