@@ -7,8 +7,18 @@ from .models import ManualCommand
 
 
 def build_manual_command(turn: float, thrust: float) -> ManualCommand:
-    desired_x = clamp_unit(turn)
-    desired_y = clamp_unit(thrust)
+    # Normalize inputs to -1 to 1
+    raw_x = turn / 100.0
+    raw_y = thrust / 100.0
+    
+    # Clamp vector magnitude to 1 (100% speed)
+    mag = math.sqrt(raw_x**2 + raw_y**2)
+    if mag > 1.0:
+        raw_x /= mag
+        raw_y /= mag
+    
+    desired_x = raw_x
+    desired_y = raw_y
 
     rear_axis = (0.0, 1.0)
     front_left_axis = (-math.sqrt(3) / 2, -0.5)
@@ -23,8 +33,8 @@ def build_manual_command(turn: float, thrust: float) -> ManualCommand:
     )
 
     return ManualCommand(
-        turn=int(round(clamp_unit(turn) * 100)),
-        thrust=int(round(clamp_unit(thrust) * 100)),
+        turn=int(round(desired_x * 100)),
+        thrust=int(round(desired_y * 100)),
         rear_motor=int(round(clamp_unit(rear_motor) * 100)),
         front_left_motor=int(round(clamp_unit(front_left_motor) * 100)),
         front_right_motor=int(round(clamp_unit(front_right_motor) * 100)),

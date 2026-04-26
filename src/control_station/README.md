@@ -72,19 +72,21 @@ Review this section after each control station update and confirm that the code 
 When a serial port is supplied, the control station sends one ASCII line per update:
 
 ```text
-VECTOR <turn> <thrust>
+VECTOR <x> <y>
 ```
 
 Example:
 
 ```text
-VECTOR +25 +60
+VECTOR +50 +87
 ```
 
 Value meaning:
 
-- `turn` normalized turning command from `-100` to `+100`
-- `thrust` normalized forward or reverse command from `-100` to `+100`
+- `x` horizontal movement component from `-100` to `+100`
+- `y` vertical movement component from `-100` to `+100`
+- Vector magnitude is clamped to 100 (sqrt(x² + y²) ≤ 100), representing 0-100% speed
+- Magnitude 0 stops all motors
 
 The Arduino buoy firmware receives the VECTOR command, computes the required motor thrusts using the same geometry model, and applies them to the motors.
 

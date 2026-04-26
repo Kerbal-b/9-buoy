@@ -122,9 +122,9 @@ void handleBluetoothCommand() {
         setMotorDrive(i, thrusts[i]);
       }
 
-      Serial.print("VECTOR applied: turn=");
+      Serial.print("VECTOR applied: x=");
       Serial.print(turn);
-      Serial.print(" thrust=");
+      Serial.print(" y=");
       Serial.print(thrust);
       Serial.print(" motors=");
       for (int i = 0; i < MOTOR_COUNT; i++) {
