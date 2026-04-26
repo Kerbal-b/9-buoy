@@ -94,11 +94,6 @@ def render_main_interface(
 
     # Top left: Visual buoy representation
     pygame.draw.rect(screen, PANEL, (36, 28, 500, 400), border_radius=18)
-    draw_text(screen, title_font, "Buoy Visualization", TEXT, 70, 60)
-    draw_text(screen, body_font, "Movement Vector", TEXT, 70, 118)
-
-    vector_magnitude = int(math.sqrt(state.command.turn**2 + state.command.thrust**2) / 10)
-    draw_text(screen, body_font, f"Vector Magnitude: {vector_magnitude}%", TEXT, 70, 150)
 
     draw_vector_panel(
         screen,
@@ -113,7 +108,7 @@ def render_main_interface(
         radius=120,
         command=state.command,
         show_labels=True,
-        font=body_font,
+        font=small_font,
     )
 
     # Left bottom: Buoy status and environmental readings
@@ -121,19 +116,19 @@ def render_main_interface(
     draw_text(screen, title_font, "Buoy Status", TEXT, 70, 470)
 
     # Status section
-    draw_text(screen, body_font, f"Connection: {state.serial_status}", TEXT, 70, 520)
-    draw_text(screen, body_font, f"Current Location: {state.current_location}", TEXT, 70, 550)
-    draw_text(screen, body_font, f"Target Location: {state.target_location}", TEXT, 70, 580)
+    draw_text(screen, small_font, f"Connection: {state.serial_status}", TEXT, 70, 500)
+    draw_text(screen, small_font, f"Current Location: {state.current_location}", TEXT, 70, 520)
+    draw_text(screen, small_font, f"Target Location: {state.target_location}", TEXT, 70, 540)
     if state.hold_position:
-        draw_text(screen, body_font, "Hold Position: ON", ACCENT, 70, 610)
-    draw_text(screen, body_font, f"Controller Vector: {state.command.turn}, {state.command.thrust}", TEXT, 70, 640)
-    draw_text(screen, body_font, f"Ack Vector: {state.ack_vector}", TEXT, 70, 670)
+        draw_text(screen, small_font, "Hold Position: ON", ACCENT, 70, 560)
+    draw_text(screen, small_font, f"Controller Vector: {state.command.turn}, {state.command.thrust}", TEXT, 70, 580)
+    draw_text(screen, small_font, f"Ack Vector: {state.ack_vector}", TEXT, 70, 600)
 
     # Environmental section
-    draw_text(screen, body_font, "Environmental Readings:", TEXT, 70, 700)
-    draw_text(screen, body_font, f"Depth: {state.current_depth}", TEXT, 70, 730)
-    draw_text(screen, body_font, f"Water Temp: {state.water_temperature}", TEXT, 70, 760)
-    draw_text(screen, body_font, f"Air Temp: {state.air_temperature}", TEXT, 70, 790)
+    draw_text(screen, small_font, "Environmental Readings:", TEXT, 70, 630)
+    draw_text(screen, small_font, f"Depth: {state.current_depth}", TEXT, 70, 650)
+    draw_text(screen, small_font, f"Water Temp: {state.water_temperature}", TEXT, 70, 670)
+    draw_text(screen, small_font, f"Air Temp: {state.air_temperature}", TEXT, 70, 690)
 
     # Right side: Communication log
     pygame.draw.rect(screen, PANEL, (560, 28, 440, 722), border_radius=18)
