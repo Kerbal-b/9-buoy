@@ -77,6 +77,14 @@ def build_runtime_state(
     command: ManualCommand,
     command_input: str,
     last_response: str,
+    current_location: str,
+    target_location: str,
+    hold_position: bool,
+    ack_vector: str,
+    current_depth: str,
+    water_temperature: str,
+    air_temperature: str,
+    comm_log: list[str],
 ) -> RuntimeState:
     controller_status = "Connected" if joystick is not None else "Not connected"
     controller_name = joystick.get_name() if joystick is not None else "Connect Xbox controller"
@@ -91,6 +99,14 @@ def build_runtime_state(
         last_sent_line=last_sent_line,
         command_input=command_input,
         last_response=last_response,
+        current_location=current_location,
+        target_location=target_location,
+        hold_position=hold_position,
+        ack_vector=ack_vector,
+        current_depth=current_depth,
+        water_temperature=water_temperature,
+        air_temperature=air_temperature,
+        comm_log=comm_log,
     )
 
 
@@ -123,6 +139,14 @@ def run() -> None:
     zero_send_count = 0
     command_input = ""
     last_response = "No response yet"
+    current_location = "Unknown"
+    target_location = "Not set"
+    hold_position = False
+    ack_vector = "0,0"
+    current_depth = "N/A"
+    water_temperature = "N/A"
+    air_temperature = "N/A"
+    comm_log = []
     running = True
 
     while running:
@@ -186,6 +210,9 @@ def run() -> None:
         response_text = read_text(serial_link)
         if response_text:
             last_response = response_text
+            comm_log.append(f"{time.time()}: {response_text}")
+            if len(comm_log) > 50:  # Keep last 50 messages
+                comm_log.pop(0)
 
         state = build_runtime_state(
             joystick=joystick,
@@ -197,6 +224,14 @@ def run() -> None:
             command=command,
             command_input=command_input,
             last_response=last_response,
+            current_location=current_location,
+            target_location=target_location,
+            hold_position=hold_position,
+            ack_vector=ack_vector,
+            current_depth=current_depth,
+            water_temperature=water_temperature,
+            air_temperature=air_temperature,
+            comm_log=comm_log,
         )
 
         if args.debug_controller:
@@ -215,6 +250,7 @@ def run() -> None:
                 screen=screen,
                 title_font=title_font,
                 body_font=body_font,
+                small_font=small_font,
                 state=state,
                 turn=turn,
                 thrust=thrust,

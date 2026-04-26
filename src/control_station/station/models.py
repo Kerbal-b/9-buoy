@@ -47,3 +47,11 @@ class RuntimeState:
     last_sent_line: str
     command_input: str
     last_response: str
+    current_location: str
+    target_location: str
+    hold_position: bool
+    ack_vector: str
+    current_depth: str
+    water_temperature: str
+    air_temperature: str
+    comm_log: list[str]

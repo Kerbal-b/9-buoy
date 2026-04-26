@@ -85,47 +85,66 @@ def render_main_interface(
     screen: pygame.Surface,
     title_font: pygame.font.Font,
     body_font: pygame.font.Font,
+    small_font: pygame.font.Font,
     state: RuntimeState,
     turn: float,
     thrust: float,
 ) -> None:
     screen.fill(BACKGROUND)
-    pygame.draw.rect(screen, PANEL, (36, 28, 908, 630), border_radius=18)
 
-    draw_text(screen, title_font, "Buoy Control Station", TEXT, 70, 60)
+    # Top left: Visual buoy representation
+    pygame.draw.rect(screen, PANEL, (36, 28, 500, 400), border_radius=18)
+    draw_text(screen, title_font, "Buoy Visualization", TEXT, 70, 60)
     draw_text(screen, body_font, "Movement Vector", TEXT, 70, 118)
+
+    vector_magnitude = int(math.sqrt(state.command.turn**2 + state.command.thrust**2) / 10)
+    draw_text(screen, body_font, f"Vector Magnitude: {vector_magnitude}%", TEXT, 70, 150)
 
     draw_vector_panel(
         screen,
-        center=(490, 350),
-        radius=190,
+        center=(290, 280),
+        radius=120,
         x_value=turn,
         y_value=thrust,
     )
     draw_buoy_overlay(
         screen,
-        center=(490, 350),
-        radius=190,
+        center=(290, 280),
+        radius=120,
         command=state.command,
-        show_labels=False,
+        show_labels=True,
+        font=body_font,
     )
 
-    vector_magnitude = int(math.sqrt(state.command.turn**2 + state.command.thrust**2) / 10)
-    draw_text(screen, body_font, f"Vector Magnitude: {vector_magnitude}%", TEXT, 70, 480)
+    # Left bottom: Buoy status and environmental readings
+    pygame.draw.rect(screen, PANEL, (36, 450, 500, 300), border_radius=18)
+    draw_text(screen, title_font, "Buoy Status", TEXT, 70, 470)
 
-    draw_text(screen, body_font, "Command input:", TEXT, 70, 510)
-    input_box = pygame.Rect(66, 535, 860, 40)
-    pygame.draw.rect(screen, GRID, input_box, border_radius=12)
-    pygame.draw.rect(screen, TEXT, input_box, 2, border_radius=12)
-    command_text = state.command_input if state.command_input else "Type a command and press Enter"
-    command_color = TEXT if state.command_input else GRID
-    draw_text(screen, body_font, command_text, command_color, input_box.x + 14, input_box.y + 6)
+    # Status section
+    draw_text(screen, body_font, f"Connection: {state.serial_status}", TEXT, 70, 520)
+    draw_text(screen, body_font, f"Current Location: {state.current_location}", TEXT, 70, 550)
+    draw_text(screen, body_font, f"Target Location: {state.target_location}", TEXT, 70, 580)
+    if state.hold_position:
+        draw_text(screen, body_font, "Hold Position: ON", ACCENT, 70, 610)
+    draw_text(screen, body_font, f"Controller Vector: {state.command.turn}, {state.command.thrust}", TEXT, 70, 640)
+    draw_text(screen, body_font, f"Ack Vector: {state.ack_vector}", TEXT, 70, 670)
 
-    draw_text(screen, body_font, "Buoy Communication:", TEXT, 70, 590)
-    comm_box = pygame.Rect(66, 615, 860, 30)
-    pygame.draw.rect(screen, GRID, comm_box, border_radius=12)
-    pygame.draw.rect(screen, TEXT, comm_box, 2, border_radius=12)
-    draw_text(screen, body_font, state.last_response, TEXT, comm_box.x + 14, comm_box.y + 4)
+    # Environmental section
+    draw_text(screen, body_font, "Environmental Readings:", TEXT, 70, 700)
+    draw_text(screen, body_font, f"Depth: {state.current_depth}", TEXT, 70, 730)
+    draw_text(screen, body_font, f"Water Temp: {state.water_temperature}", TEXT, 70, 760)
+    draw_text(screen, body_font, f"Air Temp: {state.air_temperature}", TEXT, 70, 790)
+
+    # Right side: Communication log
+    pygame.draw.rect(screen, PANEL, (560, 28, 440, 722), border_radius=18)
+    draw_text(screen, title_font, "Buoy Communication", TEXT, 580, 60)
+
+    y_offset = 100
+    for msg in state.comm_log[-20:]:  # Show last 20 messages
+        if y_offset > 720:
+            break
+        draw_text(screen, small_font, msg, TEXT, 580, y_offset)
+        y_offset += 20
 
 
 def render_debug_interface(
