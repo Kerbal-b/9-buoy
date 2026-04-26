@@ -13,8 +13,7 @@ class ManualCommand:
 
     def to_line(self) -> str:
         return (
-            f"CTRL {self.turn:+d} {self.thrust:+d} "
-            f"{self.rear_motor:+d} {self.front_left_motor:+d} {self.front_right_motor:+d}\n"
+            f"VECTOR {self.turn:+d} {self.thrust:+d}\n"
         )
 
 
@@ -46,3 +45,5 @@ class RuntimeState:
     serial_target: str
     last_send_result: str
     last_sent_line: str
+    command_input: str
+    last_response: str

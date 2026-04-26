@@ -21,6 +21,8 @@ This file explains what the main source files mean and what configuration decisi
 - Controls three motors in one loop.
 - Applies output to each motor through its motor-driver pins.
 - Exposes a motor-drive helper that later code can call from joystick or serial logic.
+- Runs a simple hardware test mode where all three motors are active at the same time.
+- Supports a simple serial toggle command: typing `banana` toggles all motors on or off.
 - Prints motor debug information over serial at `9600`.
 - Uses a clean motor-channel structure that stores only the three real motor-control pins:
   - `speedPin`
@@ -49,7 +51,8 @@ This file explains what the main source files mean and what configuration decisi
 - The current Arduino firmware is based on the exact Nano wiring that was provided during setup.
 - The speed pins are now mapped to valid Arduino Nano PWM outputs: `D3`, `D5`, and `D6`.
 - The current firmware no longer reads joystick or analog inputs directly.
-- The current firmware does not yet parse serial `CTRL ...` commands from the laptop control station.
+- The current firmware is in motor test mode: rear, front-left, and front-right are all driven together.
+- The current firmware does not yet parse serial `CTRL ...` commands from the laptop control station, but it does accept the `banana` toggle command.
 - Motor labels and current drive values are stored separately from the motor-channel pin structure.
 
 ## Control Station
@@ -89,6 +92,10 @@ This file explains what the main source files mean and what configuration decisi
   - left stick Y for forward and reverse movement
 - Manual command format
   - `CTRL <turn> <thrust> <rear_motor> <front_left_motor> <front_right_motor>`
+- Hello ping mode
+  - optional repeated `hello world` messages for Bluetooth link testing
+- Bluetooth auto-discovery
+  - defaults to looking for the device name `DSDTECHHC-05`
 - Main interface
   - minimalist movement vector plus buoy layout
 - Debug interface
@@ -101,6 +108,8 @@ This file explains what the main source files mean and what configuration decisi
 - The control station is modular on purpose so future systems can be added without growing one large file.
 - The debug window is meant for controller discovery and mapping, not for the main buoy UI.
 - The control station already assumes a three-motor buoy layout for movement visualization and command generation.
+- The serial layer can now auto-discover a Bluetooth serial port by device name when an explicit `--port` is not provided.
+- The app also supports a ping-only send mode to quickly verify serial RX (`--hello-ping`).
 
 ## Configuration Decisions We Are Currently Making
 
@@ -111,6 +120,7 @@ This file explains what the main source files mean and what configuration decisi
 - The control station and firmware are being developed in parallel.
 - The control station is prepared for serial command-based control.
 - The joystick logic and the Arduino motor-output logic are now being kept separate.
+- The Arduino firmware is currently acting as a simple simultaneous hardware test instead of taking live control commands.
 - The next major integration step is likely to connect the laptop `CTRL ...` serial output to Arduino motor control logic.
 
 ## When To Update This File

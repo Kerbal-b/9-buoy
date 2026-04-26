@@ -27,10 +27,12 @@ Review this section after each control station update and confirm that the code 
 - Deadzone behavior: ignore small stick movement near center
 - Buoy layout: one rear motor and two front motors arranged with 120 degree spacing
 - Output command format: `CTRL <turn> <thrust> <rear_motor> <front_left_motor> <front_right_motor>`
-- Transport path: Bluetooth serial when `--port` is supplied
+- Hello ping mode: optional repeated `hello world` messages for link testing
+- Transport path: Bluetooth serial when `--port` is supplied, or auto-discovered by Bluetooth device name
 - Main interface goal: show only the movement vector and buoy layout
 - Debug mode launch: `--debug-controller`
 - Debug mode goal: show generic controller inputs, with analog values as live bars and digital buttons as labeled on/off indicators
+- Default Bluetooth target name: `DSDTECHHC-05`
 - Test fallback: simulation mode when no serial port is supplied
 - Display goal: keep diagnostics out of the main interface unless debug mode is opened
 
@@ -70,34 +72,21 @@ Review this section after each control station update and confirm that the code 
 When a serial port is supplied, the control station sends one ASCII line per update:
 
 ```text
-CTRL <turn> <thrust> <rear_motor> <front_left_motor> <front_right_motor>
+VECTOR <turn> <thrust>
 ```
 
 Example:
 
 ```text
-CTRL +25 +60 +40 -34 -5
+VECTOR +25 +60
 ```
 
 Value meaning:
 
 - `turn` normalized turning command from `-100` to `+100`
 - `thrust` normalized forward or reverse command from `-100` to `+100`
-- `rear_motor` thrust for the rear motor
-- `front_left_motor` thrust for the front-left motor
-- `front_right_motor` thrust for the front-right motor
 
-## Geometry Reference
-
-The current thrust model assumes three reversible motors with force directions spaced evenly by 120 degrees:
-
-- Rear motor axis points forward
-- Front-left motor axis points down-left
-- Front-right motor axis points down-right
-
-This lets the control station decompose the requested movement vector into three motor thrust values for visual testing and later Arduino integration.
-
-This is the expected format for the future Arduino Bluetooth receiver.
+The Arduino buoy firmware receives the VECTOR command, computes the required motor thrusts using the same geometry model, and applies them to the motors.
 
 ## Environment Setup
 
@@ -113,6 +102,36 @@ To run against a Bluetooth serial link:
 
 ```bash
 ./src/control_station/.venv/bin/python ./src/control_station/main.py --port /dev/tty.HC-05-DevB --baudrate 9600
+```
+
+To auto-discover the Bluetooth device named `DSDTECHHC-05`:
+
+```bash
+./src/control_station/run_control_station.sh
+```
+
+To auto-discover a different Bluetooth device name:
+
+```bash
+./src/control_station/.venv/bin/python ./src/control_station/main.py --device-name My-Device-Name
+```
+
+To send repeated `hello world` ping messages:
+
+```bash
+./src/control_station/.venv/bin/python ./src/control_station/main.py --hello-ping
+```
+
+To send your own text command repeatedly over Bluetooth:
+
+```bash
+./src/control_station/.venv/bin/python ./src/control_station/main.py --send-text "banana" --send-interval 1.0
+```
+
+To change the repeat interval in seconds:
+
+```bash
+./src/control_station/.venv/bin/python ./src/control_station/main.py --send-text "banana" --send-interval 0.5
 ```
 
 To open the separate controller diagnostics window:
