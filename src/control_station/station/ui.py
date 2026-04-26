@@ -1,6 +1,7 @@
-import math
+from __future__ import annotations
 
-from .geometry import get_motor_positions
+import math
+import pygame
 from .models import AnalogInput, ControllerSnapshot, DigitalInput, ManualCommand, RuntimeState
 from .settings import ACCENT, BACKGROUND, GRID, PANEL, TEXT, VECTOR_COLOR, WARNING
 
