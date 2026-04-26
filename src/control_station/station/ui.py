@@ -109,15 +109,21 @@ def render_main_interface(
         show_labels=False,
     )
 
-    draw_text(screen, body_font, "Command input:", TEXT, 70, 520)
-    input_box = pygame.Rect(66, 555, 860, 40)
+    draw_text(screen, body_font, f"Current Vector: x={state.command.turn} y={state.command.thrust}", TEXT, 70, 480)
+
+    draw_text(screen, body_font, "Command input:", TEXT, 70, 510)
+    input_box = pygame.Rect(66, 535, 860, 40)
     pygame.draw.rect(screen, GRID, input_box, border_radius=12)
     pygame.draw.rect(screen, TEXT, input_box, 2, border_radius=12)
     command_text = state.command_input if state.command_input else "Type a command and press Enter"
     command_color = TEXT if state.command_input else GRID
     draw_text(screen, body_font, command_text, command_color, input_box.x + 14, input_box.y + 6)
 
-    draw_text(screen, body_font, f"Last response: {state.last_response}", TEXT, 70, 615)
+    draw_text(screen, body_font, "Buoy Communication:", TEXT, 70, 590)
+    comm_box = pygame.Rect(66, 615, 860, 30)
+    pygame.draw.rect(screen, GRID, comm_box, border_radius=12)
+    pygame.draw.rect(screen, TEXT, comm_box, 2, border_radius=12)
+    draw_text(screen, body_font, state.last_response, TEXT, comm_box.x + 14, comm_box.y + 4)
 
 
 def render_debug_interface(
