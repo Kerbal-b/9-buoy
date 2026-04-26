@@ -83,9 +83,9 @@ VECTOR +50 +87
 
 Value meaning:
 
-- `x` horizontal movement component from `-100` to `+100`
-- `y` vertical movement component from `-100` to `+100`
-- Vector magnitude is clamped to 100 (sqrt(x² + y²) ≤ 100), representing 0-100% speed
+- `x` horizontal movement component from `-1000` to `+1000`
+- `y` vertical movement component from `-1000` to `+1000`
+- Vector magnitude is clamped to 1000 (sqrt(x² + y²) ≤ 1000), representing 0-100% speed
 - Magnitude 0 stops all motors
 
 The Arduino buoy firmware receives the VECTOR command, computes the required motor thrusts using the same geometry model, and applies them to the motors.

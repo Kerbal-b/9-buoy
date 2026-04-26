@@ -1,6 +1,4 @@
-from __future__ import annotations
-
-import pygame
+import math
 
 from .geometry import get_motor_positions
 from .models import AnalogInput, ControllerSnapshot, DigitalInput, ManualCommand, RuntimeState
@@ -109,7 +107,8 @@ def render_main_interface(
         show_labels=False,
     )
 
-    draw_text(screen, body_font, f"Current Vector: x={state.command.turn} y={state.command.thrust}", TEXT, 70, 480)
+    vector_magnitude = int(math.sqrt(state.command.turn**2 + state.command.thrust**2) / 10)
+    draw_text(screen, body_font, f"Vector Magnitude: {vector_magnitude}%", TEXT, 70, 480)
 
     draw_text(screen, body_font, "Command input:", TEXT, 70, 510)
     input_box = pygame.Rect(66, 535, 860, 40)

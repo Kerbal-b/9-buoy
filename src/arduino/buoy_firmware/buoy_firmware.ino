@@ -112,8 +112,8 @@ void handleBluetoothCommand() {
       int turn = turnStr.toInt();
       int thrust = thrustStr.toInt();
 
-      float turn_f = turn / 100.0;
-      float thrust_f = thrust / 100.0;
+      float turn_f = turn / 1000.0;
+      float thrust_f = thrust / 1000.0;
 
       int thrusts[3];
       computeMotorThrusts(turn_f, thrust_f, thrusts);
