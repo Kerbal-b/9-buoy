@@ -124,6 +124,9 @@ def run() -> None:
     title_font = pygame.font.SysFont("arial", 30, bold=True)
     body_font = pygame.font.SysFont("arial", 22)
     small_font = pygame.font.SysFont("arial", 18)
+    table_title_font = pygame.font.SysFont("arial", 20, bold=True)
+    table_caption_font = pygame.font.SysFont("arial", 16)
+    table_value_font = pygame.font.SysFont("arial", 14)
 
     joystick = get_controller()
     serial_link, serial_status, serial_target = open_serial_connection(
@@ -251,6 +254,9 @@ def run() -> None:
                 title_font=title_font,
                 body_font=body_font,
                 small_font=small_font,
+                table_title_font=table_title_font,
+                table_caption_font=table_caption_font,
+                table_value_font=table_value_font,
                 state=state,
                 turn=turn,
                 thrust=thrust,

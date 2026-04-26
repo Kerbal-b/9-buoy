@@ -86,6 +86,9 @@ def render_main_interface(
     title_font: pygame.font.Font,
     body_font: pygame.font.Font,
     small_font: pygame.font.Font,
+    table_title_font: pygame.font.Font,
+    table_caption_font: pygame.font.Font,
+    table_value_font: pygame.font.Font,
     state: RuntimeState,
     turn: float,
     thrust: float,
@@ -112,22 +115,35 @@ def render_main_interface(
 
     # Left bottom: Buoy status and environmental readings
     pygame.draw.rect(screen, PANEL, (36, 400, 400, 400), border_radius=18)
-    draw_text(screen, title_font, "Buoy Status", TEXT, 70, 420)
+    draw_text(screen, table_title_font, "Buoy Status", TEXT, 70, 420)
 
-    # Status section
-    draw_text(screen, small_font, f"Connection: {state.serial_status}", TEXT, 70, 450)
-    draw_text(screen, small_font, f"Current Location: {state.current_location}", TEXT, 70, 470)
-    draw_text(screen, small_font, f"Target Location: {state.target_location}", TEXT, 70, 490)
-    if state.hold_position:
-        draw_text(screen, small_font, "Hold Position: ON", ACCENT, 70, 510)
-    draw_text(screen, small_font, f"Controller Vector: {state.command.turn}, {state.command.thrust}", TEXT, 70, 530)
-    draw_text(screen, small_font, f"Ack Vector: {state.ack_vector}", TEXT, 70, 550)
+    # Table rows
+    table_data = [
+        ("Connection:", state.serial_status),
+        ("Current Location:", state.current_location),
+        ("Target Location:", state.target_location),
+        ("Hold Position:", "ON" if state.hold_position else "OFF"),
+        ("Controller Vector:", f"{state.command.turn}, {state.command.thrust}"),
+        ("Ack Vector:", state.ack_vector),
+        ("", ""),  # spacer
+        ("Depth:", state.current_depth),
+        ("Water Temp:", state.water_temperature),
+        ("Air Temp:", state.air_temperature),
+    ]
 
-    # Environmental section
-    draw_text(screen, small_font, "Environmental Readings:", TEXT, 70, 580)
-    draw_text(screen, small_font, f"Depth: {state.current_depth}", TEXT, 70, 600)
-    draw_text(screen, small_font, f"Water Temp: {state.water_temperature}", TEXT, 70, 620)
-    draw_text(screen, small_font, f"Air Temp: {state.air_temperature}", TEXT, 70, 640)
+    y_start = 460
+    row_height = 20
+    caption_x = 70
+    value_x = 380  # Right aligned
+
+    for i, (caption, value) in enumerate(table_data):
+        if not caption:  # spacer
+            continue
+        y = y_start + i * row_height
+        draw_text(screen, table_caption_font, caption, TEXT, caption_x, y)
+        value_surface = table_value_font.render(value, True, TEXT)
+        value_rect = value_surface.get_rect(right=value_x, centery=y)
+        screen.blit(value_surface, value_rect)
 
     # Right side: Communication log
     pygame.draw.rect(screen, PANEL, (460, 28, 700, 772), border_radius=18)
