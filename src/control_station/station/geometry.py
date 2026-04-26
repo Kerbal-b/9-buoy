@@ -33,8 +33,8 @@ def build_manual_command(turn: float, thrust: float) -> ManualCommand:
     )
 
     return ManualCommand(
-        turn=int(round(desired_x * 1000)),
-        thrust=int(round(desired_y * 1000)),
+        turn=int(round(desired_x * 100)),
+        thrust=int(round(desired_y * 100)),
         rear_motor=int(round(clamp_unit(rear_motor) * 100)),
         front_left_motor=int(round(clamp_unit(front_left_motor) * 100)),
         front_right_motor=int(round(clamp_unit(front_right_motor) * 100)),
