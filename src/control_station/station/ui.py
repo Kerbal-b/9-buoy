@@ -1,11 +1,20 @@
 from __future__ import annotations
 
-import math
 import pygame
 
 from .geometry import get_motor_positions
 from .models import AnalogInput, ControllerSnapshot, DigitalInput, ManualCommand, RuntimeState
-from .settings import ACCENT, BACKGROUND, GRID, PANEL, TEXT, VECTOR_COLOR, WARNING
+from .settings import ACCENT, BACKGROUND, ERROR, GRID, PANEL, TEXT, VECTOR_COLOR, WARNING
+
+
+def get_connection_color(status: str) -> tuple[int, int, int]:
+    if status.startswith("Connected"):
+        return ACCENT
+    if status.startswith("Reconnecting"):
+        return WARNING
+    if status.startswith("Disconnected"):
+        return ERROR
+    return TEXT
 
 
 def draw_text(
@@ -81,6 +90,31 @@ def draw_buoy_overlay(
             surface.blit(label_surface, label_rect)
 
 
+def draw_status_table(
+    screen: pygame.Surface,
+    table_caption_font: pygame.font.Font,
+    table_value_font: pygame.font.Font,
+    rows: list[tuple[str, str]],
+    *,
+    caption_x: int,
+    value_x: int,
+    y_start: int,
+    row_height: int,
+) -> None:
+    for i, (caption, value) in enumerate(rows):
+        if not caption:
+            continue
+        y = y_start + i * row_height
+        caption_surface = table_caption_font.render(caption, True, TEXT)
+        caption_rect = caption_surface.get_rect(left=caption_x, centery=y)
+        screen.blit(caption_surface, caption_rect)
+        color = get_connection_color(value) if caption == "Connection:" else TEXT
+        value_surface = table_value_font.render(value, True, color)
+        value_rect = value_surface.get_rect(right=value_x, centery=y)
+        screen.blit(value_surface, value_rect)
+        pygame.draw.line(screen, GRID, (caption_x - 10, y + 15), (value_x + 10, y + 15), 1)
+
+
 def render_main_interface(
     screen: pygame.Surface,
     title_font: pygame.font.Font,
@@ -100,54 +134,53 @@ def render_main_interface(
 
     draw_vector_panel(
         screen,
-        center=(236, 203),
+        center=(236, 173),
         radius=100,
         x_value=turn,
         y_value=thrust,
     )
     draw_buoy_overlay(
         screen,
-        center=(236, 203),
+        center=(236, 173),
         radius=100,
         command=state.command,
         show_labels=False,
     )
 
     # Left bottom: Buoy status and environmental readings
-    pygame.draw.rect(screen, PANEL, (36, 400, 400, 400), border_radius=18)
-    draw_text(screen, table_title_font, "Buoy Status", TEXT, 70, 420)
+    pygame.draw.rect(screen, PANEL, (36, 350, 400, 450), border_radius=18)
+    draw_text(screen, table_title_font, "Buoy Status", TEXT, 70, 360)
 
-    # Table rows
     table_data = [
         ("Connection:", state.serial_status),
-        ("Current Location:", state.current_location),
-        ("Target Location:", state.target_location),
-        ("Hold Position:", "ON" if state.hold_position else "OFF"),
+        ("Mode:", state.telemetry.control_mode),
+        ("Current Location:", state.telemetry.current_location),
+        ("Target Location:", state.telemetry.target_location),
+        ("Hold Position:", "ON" if state.telemetry.hold_position else "OFF"),
         ("Controller Vector:", f"{state.command.turn}, {state.command.thrust}"),
         ("Ack Vector:", state.ack_vector),
+        ("Battery:", state.telemetry.battery_status),
+        ("Current Draw:", state.telemetry.current_draw),
         ("", ""),  # spacer
-        ("Depth:", state.current_depth),
-        ("Water Temp:", state.water_temperature),
-        ("Air Temp:", state.air_temperature),
+        ("Depth:", state.telemetry.current_depth),
+        ("Water Temp:", state.telemetry.water_temperature),
+        ("Air Temp:", state.telemetry.air_temperature),
     ]
 
-    y_start = 460
-    row_height = 20
-    caption_x = 70
-    value_x = 380  # Right aligned
-
-    for i, (caption, value) in enumerate(table_data):
-        if not caption:  # spacer
-            continue
-        y = y_start + i * row_height
-        draw_text(screen, table_caption_font, caption, TEXT, caption_x, y)
-        value_surface = table_value_font.render(value, True, TEXT)
-        value_rect = value_surface.get_rect(right=value_x, centery=y)
-        screen.blit(value_surface, value_rect)
+    draw_status_table(
+        screen,
+        table_caption_font,
+        table_value_font,
+        table_data,
+        caption_x=70,
+        value_x=380,
+        y_start=410,
+        row_height=35,
+    )
 
     # Right side: Communication log
     pygame.draw.rect(screen, PANEL, (460, 28, 700, 772), border_radius=18)
-    draw_text(screen, title_font, "Buoy Communication", TEXT, 480, 60)
+    draw_text(screen, table_title_font, "Buoy Communication", TEXT, 480, 60)
 
     y_offset = 100
     for msg in state.comm_log[-30:]:  # Show last 30 messages

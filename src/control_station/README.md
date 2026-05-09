@@ -26,13 +26,14 @@ Review this section after each control station update and confirm that the code 
 - Main movement input: left stick X for horizontal movement and left stick Y for forward and reverse movement
 - Deadzone behavior: ignore small stick movement near center
 - Buoy layout: one rear motor and two front motors arranged with 120 degree spacing
-- Output command format: `CTRL <turn> <thrust> <rear_motor> <front_left_motor> <front_right_motor>`
+- Output command format: `CTRL VECTOR <turn> <thrust>`
 - Hello ping mode: optional repeated `hello world` messages for link testing
-- Transport path: Bluetooth serial when `--port` is supplied, or auto-discovered by Bluetooth device name
+- Default transport path: HM-10 BLE through `bleak` using the default HM-10 `FFE0` service and `FFE1` characteristic
+- Alternate path: Bluetooth serial when `--transport serial` is selected
 - Main interface goal: show only the movement vector and buoy layout
 - Debug mode launch: `--debug-controller`
 - Debug mode goal: show generic controller inputs, with analog values as live bars and digital buttons as labeled on/off indicators
-- Default Bluetooth target name: `DSDTECHHC-05`
+- Default Bluetooth target name: `DSD TECH`
 - Test fallback: simulation mode when no serial port is supplied
 - Display goal: keep diagnostics out of the main interface unless debug mode is opened
 
@@ -50,6 +51,7 @@ Review this section after each control station update and confirm that the code 
 - Python
 - `pygame` for Xbox controller input
 - `pyserial` for Bluetooth serial communication
+- `bleak` for HM-10 BLE communication
 
 ## Working Files
 
@@ -72,13 +74,13 @@ Review this section after each control station update and confirm that the code 
 When a serial port is supplied, the control station sends one ASCII line per update:
 
 ```text
-VECTOR <x> <y>
+CTRL VECTOR <x> <y>
 ```
 
 Example:
 
 ```text
-VECTOR +50 +87
+CTRL VECTOR +50 +87
 ```
 
 Value meaning:
@@ -88,12 +90,23 @@ Value meaning:
 - Vector magnitude is clamped to 100 (sqrt(x² + y²) ≤ 100), representing 0-100% speed
 - Magnitude 0 stops all motors
 
-The Arduino buoy firmware receives the VECTOR command, computes the required motor thrusts using the same geometry model, and applies them to the motors.
+The Arduino buoy firmware receives the `CTRL VECTOR` command, computes the required motor thrusts using the same geometry model, and applies them to the motors.
+
+Responses from the buoy should use:
+
+```text
+ACK ...
+ERR ...
+TEL STATUS ...
+TEL SCI ...
+```
+
+Telemetry is intentionally split into small typed messages instead of one large snapshot line. Operational buoy state should use `TEL STATUS ...`, while environmental measurements should use `TEL SCI ...`.
 
 ## Transmission Optimization
 
 To prevent excessive Bluetooth traffic:
-- VECTOR commands are only sent when the movement vector changes or at regular intervals (based on `--send-rate`)
+- `CTRL VECTOR` commands are only sent when the movement vector changes or at regular intervals (based on `--send-rate`)
 - When the vector is zero (stop command), it is sent up to 10 times to ensure delivery, then transmission stops until movement resumes
 
 ## Environment Setup
@@ -106,22 +119,90 @@ source ./src/control_station/activate_env.sh
 ./src/control_station/run_control_station.sh
 ```
 
+On Windows PowerShell:
+
+```powershell
+.\src\control_station\setup_env.ps1
+.\src\control_station\activate_env.ps1
+.\src\control_station\run_control_station.ps1
+```
+
+These Windows setup scripts now use `py -3.12` explicitly, because `pygame` may fail to install on newer interpreter versions such as Python 3.14.
+
+On Windows Command Prompt or by double-clicking batch files:
+
+```bat
+src\control_station\setup_env.bat
+src\control_station\activate_env.bat
+src\control_station\run_control_station.bat
+```
+
 To run against a Bluetooth serial link:
 
 ```bash
 ./src/control_station/.venv/bin/python ./src/control_station/main.py --port /dev/tty.HC-05-DevB --baudrate 9600
 ```
 
-To auto-discover the Bluetooth device named `DSDTECHHC-05`:
+To start the control station against the default HM-10 BLE device name `DSD TECH`:
 
 ```bash
 ./src/control_station/run_control_station.sh
 ```
 
-To auto-discover a different Bluetooth device name:
+On Windows PowerShell:
+
+```powershell
+.\src\control_station\run_control_station.ps1
+```
+
+Windows batch equivalent:
+
+```bat
+src\control_station\run_control_station.bat
+```
+
+To auto-discover a different HM-10 BLE device name:
 
 ```bash
 ./src/control_station/.venv/bin/python ./src/control_station/main.py --device-name My-Device-Name
+```
+
+To run against an HM-10 BLE module explicitly:
+
+```bash
+./src/control_station/.venv/bin/python ./src/control_station/main.py --transport ble --device-name "DSD TECH"
+```
+
+If your HM-10 firmware uses different custom UUIDs:
+
+```bash
+./src/control_station/.venv/bin/python ./src/control_station/main.py --transport ble --device-name HMSoft --ble-service-uuid 0000ffe0-0000-1000-8000-00805f9b34fb --ble-characteristic-uuid 0000ffe1-0000-1000-8000-00805f9b34fb
+```
+
+To use the older Bluetooth serial workflow instead:
+
+```bash
+./src/control_station/.venv/bin/python ./src/control_station/main.py --transport serial --port /dev/tty.HC-05-DevB --device-name DSDTECHHC-05
+```
+
+Windows PowerShell example with explicit COM port:
+
+```powershell
+.\src\control_station\run_control_station.ps1 --port COM5 --baudrate 9600
+```
+
+Windows batch example with explicit COM port:
+
+```bat
+src\control_station\run_control_station.bat --port COM5 --baudrate 9600
+```
+
+The control station now writes communication logs to `src/control_station/logs/comm-YYYYMMDD-HHMMSS.log` by default, including raw TX/RX bytes and decoded text.
+
+To write to a specific log file:
+
+```bash
+./src/control_station/.venv/bin/python ./src/control_station/main.py --comm-log-file ./src/control_station/logs/my-test.log
 ```
 
 To send repeated `hello world` ping messages:
@@ -146,4 +227,16 @@ To open the separate controller diagnostics window:
 
 ```bash
 ./src/control_station/run_controller_debug.sh
+```
+
+On Windows PowerShell:
+
+```powershell
+.\src\control_station\run_controller_debug.ps1
+```
+
+Windows batch equivalent:
+
+```bat
+src\control_station\run_controller_debug.bat
 ```

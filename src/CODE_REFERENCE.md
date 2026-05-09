@@ -2,6 +2,20 @@
 
 This file explains what the main source files mean and what configuration decisions are currently active.
 
+## Change Workflow Rules
+
+- When changing the buoy firmware, change one section at a time whenever possible.
+- If two sections are tightly coupled, it is acceptable to change those two sections together in one pass.
+- Prefer structural refactors that preserve behavior before making functional changes.
+- Keep subsystem boundaries clear:
+  - motor control should contain vector math and motor-output behavior
+  - communications should parse commands and send responses, not contain motor or sensor logic inline
+  - operational sensors should cover buoy-health and navigation hardware
+  - scientific sensors should cover environmental and research measurements
+  - telemetry/reporting should format and emit status from those subsystems
+- Update this reference file when the firmware structure, protocol, or subsystem responsibilities change.
+- Update the wiring diagram in this file whenever a new device is added or a connection changes.
+
 ## Main Source Areas
 
 - `src/arduino/buoy_firmware/`
@@ -18,42 +32,173 @@ This file explains what the main source files mean and what configuration decisi
 ### What It Does
 
 - Defines the Arduino firmware for the buoy motor system.
-- Controls three motors in one loop.
-- Applies output to each motor through its motor-driver pins.
-- Exposes a motor-drive helper that later code can call from joystick or serial logic.
-- Runs a simple hardware test mode where all three motors are active at the same time.
-- Supports a simple serial toggle command: typing `banana` toggles all motors on or off.
-- Prints motor debug information over serial at `9600`.
-- Uses a clean motor-channel structure that stores only the three real motor-control pins:
-  - `speedPin`
-  - `directionPin1`
-  - `directionPin2`
+- Receives Bluetooth text commands and applies buoy motor control from `CTRL VECTOR <turn> <thrust>`.
+- Computes individual thrust values for the rear, front-left, and front-right motors from a 120-degree vector model.
+- Measures buoy current draw through the ACS712 current sensor.
+- Sends protocol acknowledgements and current telemetry back over Bluetooth.
+- Uses a sectioned structure so the firmware can grow by subsystem instead of as one long file.
+
+### Current Firmware Sections
+
+- Configuration / Protocol Constants
+- Data Structures
+- Hardware Configuration
+- Runtime State
+- Utility Helpers
+- Motor Control
+- Operational Sensors
+- Scientific Sensors
+- Telemetry / Reporting
+- Communications / Bluetooth Protocol
+- Safety / Fault Handling
+- Arduino Lifecycle
+
+### Protocol Reference
+
+Commands sent to the buoy should be grouped by purpose.
+
+Control commands:
+
+```text
+CTRL STOP
+CTRL VECTOR <x> <y>
+CTRL HOLD <ON|OFF>
+CTRL GOTO <lat> <lon>
+```
+
+Transport and request commands:
+
+```text
+PING
+REQ STATUS ALL
+```
+
+Acknowledgements and errors:
+
+```text
+ACK CTRL STOP
+ACK CTRL VECTOR <x> <y>
+ACK CTRL HOLD <ON|OFF>
+ACK CTRL GOTO <lat> <lon>
+ACK PING
+ACK REQ STATUS ALL
+ERR <reason>
+```
+
+Telemetry is split into short messages by category instead of one large message.
+
+Operational status telemetry:
+
+```text
+TEL STATUS MODE <mode>
+TEL STATUS POS <lat|UNKNOWN> <lon|UNKNOWN>
+TEL STATUS TARGET <lat|UNKNOWN> <lon|UNKNOWN>
+TEL STATUS HOLD <ON|OFF>
+TEL STATUS BATTERY <volts|UNKNOWN> <amps|UNKNOWN> <percent|UNKNOWN>
+TEL STATUS CURRENT <amps|UNKNOWN>
+```
+
+Scientific telemetry:
+
+```text
+TEL SCI WATER_TEMP <c|UNKNOWN>
+TEL SCI AIR_TEMP <c|UNKNOWN>
+TEL SCI DEPTH <m|UNKNOWN>
+```
 
 ### Current Configuration
 
 - Rear motor
-  - `ENA`: `D3`
-  - `IN1`: `D8`
-  - `IN2`: `D4`
+  - `PWM`: `D3`
+  - `DIR`: `D8`
 
 - Front-left motor
-  - `ENB`: `D5`
-  - `IN3`: `D7`
-  - `IN4`: `D10`
+  - `PWM`: `D5`
+  - `DIR`: `D7`
 
 - Front-right motor
-  - `ENA`: `D6`
-  - `IN1`: `D11`
-  - `IN2`: `D12`
+  - `PWM`: `D6`
+  - `DIR`: `D11`
+
+- Bluetooth module
+  - `RX`: `D2`
+  - `TX`: `D10`
+
+- Current sensor
+  - `ACS712 OUT`: `A0`
+
+### Module-Based Wiring Diagram
+
+#### Motor Drive
+
+```text
+[ Arduino Nano ]
+   |
+   |-- D3  (PWM) -> Rear motor driver speed input
+   |-- D8  (DIR) -> Rear motor driver direction input
+   |               direction reverse path uses 74HC14 inverter
+   |
+   |-- D5  (PWM) -> Front-left motor driver speed input
+   |-- D7  (DIR) -> Front-left motor driver direction input
+   |               direction reverse path uses 74HC14 inverter
+   |
+   |-- D6  (PWM) -> Front-right motor driver speed input
+   |-- D11 (DIR) -> Front-right motor driver direction input
+                   direction reverse path uses 74HC14 inverter
+```
+
+#### Communication
+
+```text
+[ Laptop Control Station ]
+   |
+   |  Bluetooth commands and telemetry
+   v
+[ Bluetooth Module ]
+   |
+   |-- TX -> Arduino D2  (SoftwareSerial RX)
+   |-- RX <- Arduino D10 (SoftwareSerial TX)
+   |-- VCC -> Arduino 5V   assumed
+   |-- GND -> Arduino GND  assumed
+```
+
+#### Operational Sensors
+
+```text
+[ ACS712 Current Sensor ]
+   |
+   |-- OUT -> Arduino A0
+   |-- VCC -> Arduino 5V
+   |-- GND -> Arduino GND
+```
+
+This is the only operational sensor currently implemented in firmware.
+
+#### Scientific Sensors
+
+```text
+Not wired in current firmware yet.
+
+Planned examples:
+- Water temperature sensor
+- Air temperature sensor
+- Depth / pressure sensor
+- Other environmental probes
+```
 
 ### Important Notes
 
 - The current Arduino firmware is based on the exact Nano wiring that was provided during setup.
 - The speed pins are now mapped to valid Arduino Nano PWM outputs: `D3`, `D5`, and `D6`.
+- The HC-05 Bluetooth module is now intended to use `SoftwareSerial` on `D2` (Arduino RX, module TX) and `D10` (Arduino TX, module RX).
 - The current firmware no longer reads joystick or analog inputs directly.
-- The current firmware is in motor test mode: rear, front-left, and front-right are all driven together.
-- The current firmware does not yet parse serial `CTRL ...` commands from the laptop control station, but it does accept the `banana` toggle command.
-- Motor labels and current drive values are stored separately from the motor-channel pin structure.
+- The current firmware now uses `CTRL ...`, `PING`, and `REQ STATUS ALL` as the primary protocol surface.
+- Legacy commands such as `banana`, `start`, `stop`, and `current` are still accepted for transition compatibility.
+- The target protocol should use `CTRL`, `ACK`, `ERR`, `TEL STATUS`, and `TEL SCI` prefixes consistently.
+- Motor vector math and output application now live in the motor-control section.
+- Bluetooth parsing and protocol responses now live in the communications section.
+- Current-sensor logic now lives in the operational-sensors section.
+- The scientific-sensors and safety sections are placeholders for future expansion.
 
 ## Control Station
 
@@ -91,11 +236,11 @@ This file explains what the main source files mean and what configuration decisi
   - left stick X for horizontal movement
   - left stick Y for forward and reverse movement
 - Manual command format
-  - `CTRL <turn> <thrust> <rear_motor> <front_left_motor> <front_right_motor>`
+  - `CTRL VECTOR <turn> <thrust>`
 - Hello ping mode
   - optional repeated `hello world` messages for Bluetooth link testing
 - Bluetooth auto-discovery
-  - defaults to looking for the device name `DSDTECHHC-05`
+  - defaults to looking for the device name `DSD TECH`
 - Main interface
   - minimalist movement vector plus buoy layout
 - Debug interface
@@ -120,8 +265,8 @@ This file explains what the main source files mean and what configuration decisi
 - The control station and firmware are being developed in parallel.
 - The control station is prepared for serial command-based control.
 - The joystick logic and the Arduino motor-output logic are now being kept separate.
-- The Arduino firmware is currently acting as a simple simultaneous hardware test instead of taking live control commands.
-- The next major integration step is likely to connect the laptop `CTRL ...` serial output to Arduino motor control logic.
+- The Arduino firmware currently takes live `VECTOR` commands and computes motor thrust onboard.
+- Firmware changes should be scoped section-by-section to keep refactors controlled.
 
 ## When To Update This File
 
@@ -129,6 +274,8 @@ Update this file when:
 
 - a source file is added or renamed
 - a motor pin mapping changes
+- a device is added to the buoy wiring
+- a wiring connection changes
 - the serial protocol changes
 - the control station behavior changes
 - a major code module gets a new responsibility
