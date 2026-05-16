@@ -1,4 +1,6 @@
 #include <SoftwareSerial.h>
+#include <AltSoftSerial.h>
+#include <TinyGPSPlus.h>
 
 // ---------------------------------------------------------------------------
 // Configuration / Protocol Constants
@@ -7,14 +9,25 @@
 const int BLUETOOTH_RX_PIN = 2;
 const int BLUETOOTH_TX_PIN = 10;
 const int CURRENT_SENSOR_PIN = A0;
+const int BATTERY_VOLTAGE_SENSOR_PIN = A1;
+
+// GPS (GT-U7) wiring - connect GT-U7 TX -> GPS_RX_PIN, GT-U7 RX -> GPS_TX_PIN
+const int GPS_RX_PIN = 8;  // Arduino pin to receive GPS TX
+const int GPS_TX_PIN = 9;  // Arduino pin to transmit to GPS (not required for read-only) - moved from D9 to avoid motor conflict
+const long GPS_BAUDRATE = 9600;
 
 const long SERIAL_BAUDRATE = 9600;
+const long BLUETOOTH_BAUDRATE = 9600;
 const char* const FIRMWARE_BANNER = "FW_PATCHED_2026_04_26";
 
 const float ADC_REFERENCE_VOLTAGE = 5.0;
 const float ADC_COUNTS = 1023.0;
 const float ACS712_SENSITIVITY_VOLTS_PER_AMP = 0.066;  // 30A module
+const float BATTERY_SENSOR_MAX_VOLTAGE = 25.0;  // 0-25V module scaled for 0-5V ADC input
+const float BATTERY_FULL_VOLTAGE = 12.6;  // 3S lithium-ion full charge
+const float BATTERY_EMPTY_VOLTAGE = 9.6;  // conservative 3S lithium-ion empty threshold
 const int CURRENT_SENSOR_SAMPLE_COUNT = 32;
+const int BATTERY_VOLTAGE_SAMPLE_COUNT = 16;
 const int CURRENT_SENSOR_ZERO_CALIBRATION_SAMPLES = 200;
 const float CURRENT_SENSOR_NOISE_FLOOR_AMPS = 0.15;
 
@@ -44,7 +57,7 @@ enum ControlMode {
 
 // Pin map matched to the current Arduino Nano wiring.
 MotorChannel motors[] = {
-  {3, 8},
+  {3, 12},
   {5, 7},
   {6, 11},
 };
@@ -63,6 +76,11 @@ const float* motor_axes[3] = {rear_axis, front_left_axis, front_right_axis};
 // ---------------------------------------------------------------------------
 
 SoftwareSerial bluetoothSerial(BLUETOOTH_RX_PIN, BLUETOOTH_TX_PIN);
+// SoftwareSerial gpsSerial(GPS_RX_PIN, GPS_TX_PIN);
+AltSoftSerial gpsSerial;
+TinyGPSPlus gps;
+double gpsLatitude = 0.0;
+double gpsLongitude = 0.0;
 
 char bluetoothLineBuffer[BLUETOOTH_LINE_BUFFER_SIZE];
 int bluetoothLineLength = 0;
@@ -184,8 +202,29 @@ float readCurrentSensorAverageCounts(int sampleCount) {
   return total / static_cast<float>(sampleCount);
 }
 
+float readBatterySensorAverageCounts(int sampleCount) {
+  long total = 0;
+
+  for (int i = 0; i < sampleCount; i++) {
+    total += analogRead(BATTERY_VOLTAGE_SENSOR_PIN);
+  }
+
+  return total / static_cast<float>(sampleCount);
+}
+
 float countsToVoltage(float counts) {
   return counts * (ADC_REFERENCE_VOLTAGE / ADC_COUNTS);
+}
+
+float readBatterySystemVoltage() {
+  float sensorCounts = readBatterySensorAverageCounts(BATTERY_VOLTAGE_SAMPLE_COUNT);
+  return sensorCounts * (BATTERY_SENSOR_MAX_VOLTAGE / ADC_COUNTS);
+}
+
+int estimateBatteryPercent(float batteryVoltage) {
+  float normalized = (batteryVoltage - BATTERY_EMPTY_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_EMPTY_VOLTAGE);
+  normalized = clamp(normalized, 0.0, 1.0);
+  return round(normalized * 100.0);
 }
 
 void calibrateCurrentSensorZero() {
@@ -223,7 +262,16 @@ void sendStatusModeTelemetry() {
 }
 
 void sendStatusPositionTelemetry() {
-  bluetoothSerial.println(F("TEL STATUS POS UNKNOWN UNKNOWN"));
+  // Report GPS-derived position if available, otherwise fall back to UNKNOWN
+  if (gps.location.isValid()) {
+    // Keep 6 decimal places for compatibility with controller parsing
+    bluetoothSerial.print(F("TEL STATUS POS "));
+    bluetoothSerial.print(gpsLatitude, 6);
+    bluetoothSerial.print(F(" "));
+    bluetoothSerial.println(gpsLongitude, 6);
+  } else {
+    bluetoothSerial.println(F("TEL STATUS POS UNKNOWN UNKNOWN"));
+  }
 }
 
 void sendStatusTargetTelemetry() {
@@ -244,7 +292,38 @@ void sendStatusHoldTelemetry() {
 }
 
 void sendStatusBatteryTelemetry() {
-  bluetoothSerial.println(F("TEL STATUS BATTERY UNKNOWN UNKNOWN UNKNOWN"));
+  float batteryVoltage = readBatterySystemVoltage();
+  float currentAmps = readCurrentSensorAmps();
+  int batteryPercent = estimateBatteryPercent(batteryVoltage);
+
+  // Determine charging state based on measured current (negative = charging)
+  const float threshold = CURRENT_SENSOR_NOISE_FLOOR_AMPS;
+  const char* charge_state = "IDLE";
+  if (currentAmps <= -threshold) {
+    charge_state = "CHARGING";
+  } else if (currentAmps >= threshold) {
+    charge_state = "DISCHARGING";
+  }
+
+  Serial.print(F("Battery voltage: "));
+  Serial.print(batteryVoltage, 3);
+  Serial.print(F(" V, estimated charge: "));
+  Serial.print(batteryPercent);
+  Serial.print(F("%"));
+  Serial.print(F(", current: "));
+  Serial.print(currentAmps, 3);
+  Serial.print(F(" A, state: "));
+  Serial.println(charge_state);
+
+  // Send a single BATTERY telemetry line including the charge state
+  bluetoothSerial.print(F("TEL STATUS BATTERY "));
+  bluetoothSerial.print(batteryVoltage, 3);
+  bluetoothSerial.print(F(" "));
+  bluetoothSerial.print(currentAmps, 3);
+  bluetoothSerial.print(F(" "));
+  bluetoothSerial.print(batteryPercent);
+  bluetoothSerial.print(F(" "));
+  bluetoothSerial.println(charge_state);
 }
 
 void sendStatusCurrentTelemetry() {
@@ -366,13 +445,38 @@ void handleStatusRequest(char* payload) {
   sendFullTelemetrySnapshot();
 }
 
+void _processBluetoothIncomingChar(char incoming) {
+  if (incoming == '\r') {
+    return;
+  }
+
+  if (incoming == '\n') {
+    if (bluetoothLineLength == 0) {
+      return;
+    }
+
+    bluetoothLineBuffer[bluetoothLineLength] = '\0';
+    processBluetoothCommand(bluetoothLineBuffer);
+    bluetoothLineLength = 0;
+    return;
+  }
+
+  if (bluetoothLineLength < BLUETOOTH_LINE_BUFFER_SIZE - 1) {
+    bluetoothLineBuffer[bluetoothLineLength++] = incoming;
+  } else {
+    bluetoothLineLength = 0;
+    Serial.println(F("Bluetooth command too long"));
+    bluetoothSerial.println(F("ERR TOOLONG"));
+  }
+}
+
 void processBluetoothCommand(char* command) {
   Serial.print(F("Bluetooth RX: "));
   Serial.println(command);
 
   if (strcmp(command, "PING") == 0) {
     bluetoothSerial.println(F("ACK PING"));
-    sendStatusCurrentTelemetry();
+    sendStatusSnapshot();
     return;
   }
 
@@ -449,35 +553,6 @@ void processBluetoothCommand(char* command) {
   bluetoothSerial.println(F("ERR UNKNOWN"));
 }
 
-void handleBluetoothCommand() {
-  while (bluetoothSerial.available()) {
-    char incoming = static_cast<char>(bluetoothSerial.read());
-
-    if (incoming == '\r') {
-      continue;
-    }
-
-    if (incoming == '\n') {
-      if (bluetoothLineLength == 0) {
-        continue;
-      }
-
-      bluetoothLineBuffer[bluetoothLineLength] = '\0';
-      processBluetoothCommand(bluetoothLineBuffer);
-      bluetoothLineLength = 0;
-      continue;
-    }
-
-    if (bluetoothLineLength < BLUETOOTH_LINE_BUFFER_SIZE - 1) {
-      bluetoothLineBuffer[bluetoothLineLength++] = incoming;
-    } else {
-      bluetoothLineLength = 0;
-      Serial.println(F("Bluetooth command too long"));
-      bluetoothSerial.println(F("ERR TOOLONG"));
-    }
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Safety / Fault Handling
 // ---------------------------------------------------------------------------
@@ -492,8 +567,11 @@ void handleBluetoothCommand() {
 void setup() {
   Serial.begin(SERIAL_BAUDRATE);
   Serial.setTimeout(100);
-  bluetoothSerial.begin(SERIAL_BAUDRATE);
+  bluetoothSerial.begin(BLUETOOTH_BAUDRATE);
+  Serial.println(F("Bluetooth Serial Initialized."));
+  gpsSerial.begin(GPS_BAUDRATE);
   pinMode(CURRENT_SENSOR_PIN, INPUT);
+  pinMode(BATTERY_VOLTAGE_SENSOR_PIN, INPUT);
   calibrateCurrentSensorZero();
 
   for (int i = 0; i < MOTOR_COUNT; i++) {
@@ -509,6 +587,7 @@ void setup() {
   Serial.println(F("Front left motor: PWM D5, DIR D7, reverse from 74HC14"));
   Serial.println(F("Front right motor: PWM D6, DIR D11, reverse from 74HC14"));
   Serial.println(F("ACS712 current sensor: OUT A0, VCC 5V, GND common"));
+  Serial.println(F("0-25V battery voltage sensor: OUT A1, VCC 5V, GND common"));
   Serial.print(F("ACS712 zero-current counts calibrated to: "));
   Serial.println(currentSensorZeroCounts, 2);
   Serial.print(F("ACS712 zero-current voltage calibrated to: "));
@@ -517,8 +596,40 @@ void setup() {
   Serial.println(F("Send 'CTRL VECTOR <turn> <thrust>', 'CTRL HOLD ON', 'CTRL GOTO <lat> <lon>', or 'REQ STATUS ALL'."));
 }
 
+unsigned long previousMillis = 0;
+const long interval = 500; // 1 second interval
+
 void loop() {
-  handleBluetoothCommand();
+  unsigned long currentMillis = millis(); // Get current time
+
+ // Always start by ensuring Bluetooth is the active listener
+  if(!bluetoothSerial.isListening()) bluetoothSerial.listen();
+  // Process all available Bluetooth characters (Burst read for responsiveness)
+  while (bluetoothSerial.available()) {
+    char incoming = static_cast<char>(bluetoothSerial.read());
+    _processBluetoothIncomingChar(incoming);
+  }
+  // Check if 1 second has passed
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+    // Briefly switch to GPS to read exactly one character if available
+    while (gpsSerial.available()) {
+      char c = gpsSerial.read();
+      gps.encode(c);
+      Serial.print(c);
+    }
+    Serial.println(' ');
+  }
+
+  // Immediately switch back to Bluetooth to maximize its listening window
+  //bluetoothSerial.listen();
+
+  // Update cached coordinates when a new valid location is available
+  if (gps.location.isUpdated() && gps.location.isValid()) {
+    gpsLatitude = gps.location.lat();
+    gpsLongitude = gps.location.lng();
+  }
+  
 
   // Motors are controlled by VECTOR commands when enabled.
 }
