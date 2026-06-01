@@ -10,4 +10,4 @@ if [ ! -x "$VENV_PYTHON" ]; then
   exit 1
 fi
 
-"$VENV_PYTHON" "$SCRIPT_DIR/main.py"
+"$VENV_PYTHON" "$SCRIPT_DIR/main.py" "$@"
