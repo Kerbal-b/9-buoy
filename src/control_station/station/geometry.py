@@ -6,10 +6,13 @@ from .controller import clamp_unit
 from .models import ManualCommand
 
 
+MOTOR_OUTPUT_BOOST = 2.0
+
+
 def build_manual_command(turn: float, thrust: float) -> ManualCommand:
-    # Normalize inputs to -1 to 1
-    raw_x = turn / 100.0
-    raw_y = thrust / 100.0
+    # Inputs are already -1 to 1 from controller
+    raw_x = turn
+    raw_y = thrust
     
     # Clamp vector magnitude to 1 (100% speed)
     mag = math.sqrt(raw_x**2 + raw_y**2)
@@ -35,9 +38,9 @@ def build_manual_command(turn: float, thrust: float) -> ManualCommand:
     return ManualCommand(
         turn=int(round(desired_x * 100)),
         thrust=int(round(desired_y * 100)),
-        rear_motor=int(round(clamp_unit(rear_motor) * 100)),
-        front_left_motor=int(round(clamp_unit(front_left_motor) * 100)),
-        front_right_motor=int(round(clamp_unit(front_right_motor) * 100)),
+        rear_motor=int(round(clamp_unit(rear_motor * MOTOR_OUTPUT_BOOST) * 100)),
+        front_left_motor=int(round(clamp_unit(front_left_motor * MOTOR_OUTPUT_BOOST) * 100)),
+        front_right_motor=int(round(clamp_unit(front_right_motor * MOTOR_OUTPUT_BOOST) * 100)),
     )
 
 

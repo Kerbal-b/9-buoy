@@ -1,5 +1,15 @@
 .DS_Store
+desktop.ini
 __pycache__/
 *.pyc
 
 src/control_station/.venv/
+src/control_station/logs/
+
+# Only src/ is tracked among top-level folders.
+/*/
+!/src/
+
+# Root documentation remains local.
+/README.md
+/markdown-guide.md

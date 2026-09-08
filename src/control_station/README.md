@@ -37,6 +37,16 @@ Review this section after each control station update and confirm that the code 
 - Test fallback: simulation mode when no serial port is supplied
 - Display goal: keep diagnostics out of the main interface unless debug mode is opened
 
+## Control-Station Layout Contract
+
+The main control-station window uses three stable panel regions:
+
+- Top-left: `Buoy Visualization` — the buoy shape, motor arrangement, and movement vector.
+- Bottom-left: `Buoy Operational` — connection, Wi-Fi, navigation, movement, power, and operational telemetry.
+- Full-height right: `Dashboard` — a tabbed area for Science & Audio, logs, maps/science views, motor testing, and future subtabs.
+
+Future control-station changes must preserve these three regions and their responsibilities. New right-side features should be added as Dashboard subtabs. Change this layout only when the project owner explicitly requests a design change.
+
 ## Current Responsibilities
 
 - Read Xbox controller input
@@ -49,6 +59,7 @@ Review this section after each control station update and confirm that the code 
 ## Current Stack
 
 - Python
+- Python 3.13 x64 is currently required for the Windows control-station environment because the pinned pygame release does not yet provide a Python 3.14 Windows wheel.
 - `PySide6` / Qt Quick for the main desktop UI
 - `pygame` for Xbox controller input and legacy fallback UI
 - `pyserial` for serial communication
@@ -66,6 +77,9 @@ Review this section after each control station update and confirm that the code 
 - `station/ui.py` drawing code for the main and debug interfaces
 - `station/models.py` shared runtime and command data structures
 - `station/settings.py` UI and runtime constants
+- `qml/Main.qml` main three-region window layout and dashboard tabs
+- `qml/ScienceAudioPanel.qml` Science & Audio dashboard tab
+- `qml/MotorTestPanel.qml` motor testing, output visualization, and calibration dashboard tab
 - `requirements.txt` Python dependencies for the laptop program
 - `setup_env.sh` create the local virtual environment and install dependencies
 - `activate_env.sh` activate the local virtual environment in the current shell
@@ -116,6 +130,8 @@ UDP telemetry port: 5001
 UDP audio port: 5002
 ```
 
+When multiple laptop network adapters are active, you can select which local IPv4 address the control station should use for discovery and source binding with `--source-ip <address>` or `--wifi-local-ip <address>`. This covers Wi-Fi and Ethernet uplinks to the router. The Qt UI exposes the same choice in the main status panel as `Source interface`.
+
 UDP packet types currently implemented:
 
 ```text
@@ -151,6 +167,8 @@ Use a local virtual environment so the control station dependencies do not affec
 source ./src/control_station/activate_env.sh
 ./src/control_station/run_control_station.sh
 ```
+
+On macOS, run the same `setup_env.sh` script from Terminal. It installs `PySide6-Addons` through `requirements.txt`, so the QML map modules are available there too.
 
 On Windows PowerShell:
 

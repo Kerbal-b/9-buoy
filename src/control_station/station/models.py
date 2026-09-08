@@ -44,6 +44,22 @@ class TelemetryState:
     current_depth: str
     water_temperature: str
     air_temperature: str
+    imu_accel: str = "N/A"
+    imu_gyro: str = "N/A"
+    imu_temperature: str = "N/A"
+    imu_udp_loss: str = "N/A"
+    audio_stream: str = "N/A"
+    audio_level: str = "N/A"
+
+
+@dataclass(frozen=True)
+class ScienceSample:
+    timestamp: float
+    latitude: float
+    longitude: float
+    depth_m: float
+    audio_level_percent: float
+    water_temperature_c: float | None = None
 
 
 @dataclass(frozen=True)
@@ -61,3 +77,5 @@ class RuntimeState:
     telemetry: TelemetryState
     ack_vector: str
     comm_log: list[str]
+    audio_muted: bool = True
+    audio_waveform: tuple[float, ...] = ()

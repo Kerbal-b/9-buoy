@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 import serial
@@ -33,6 +34,7 @@ WIFI_DEFAULT_HOST = "auto"
 WIFI_DEFAULT_TCP_PORT = 5000
 WIFI_DEFAULT_UDP_PORT = 5001
 WIFI_DEFAULT_AUDIO_PORT = 5002
+CONNECTION_PREFS_FILENAME = "connection-prefs.json"
 
 PACKET_TYPE_IMU = 1
 PACKET_TYPE_RANGE = 2
@@ -242,13 +244,19 @@ class WiFiTransport:
         tcp_port: int,
         udp_port: int,
         audio_port: int,
+        local_ip: str | None = None,
         connect_timeout: float = 5.0,
     ) -> None:
         self.host = host
         self.tcp_port = tcp_port
         self.udp_port = udp_port
         self.audio_port = audio_port
-        self._tcp = socket.create_connection((host, tcp_port), timeout=connect_timeout)
+        self.local_ip = local_ip
+        self._tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._tcp.settimeout(connect_timeout)
+        if local_ip and local_ip.lower() != "auto":
+            self._tcp.bind((local_ip, 0))
+        self._tcp.connect((host, tcp_port))
         self._tcp.setblocking(False)
         self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -351,10 +359,20 @@ class WiFiTransport:
             pass
 
 
-def _probe_tcp_host(host: str, port: int, timeout: float = 0.15) -> bool:
+def _probe_tcp_host(host: str, port: int, timeout: float = 0.15, local_ip: str | None = None) -> bool:
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(timeout)
+            if local_ip and local_ip.lower() != "auto":
+                sock.bind((local_ip, 0))
+            sock.connect((host, port))
             return True
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
     except OSError:
         return False
 
@@ -368,6 +386,51 @@ def _get_local_ipv4() -> str | None:
         return local_ip
     except OSError:
         return None
+
+
+def _get_local_interface_addresses() -> list[tuple[str, str]]:
+    interfaces: list[tuple[str, str]] = []
+    seen_ips: set[str] = set()
+
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(["ipconfig"], capture_output=True, text=True, check=True)
+            current_name = ""
+            for line in result.stdout.splitlines():
+                adapter_match = re.match(r"^\s*([^:]+ adapter [^:]+):\s*$", line)
+                if adapter_match:
+                    current_name = adapter_match.group(1).strip()
+                    continue
+                ip_match = re.search(r"IPv4 Address[^:]*:\s*(\d+\.\d+\.\d+\.\d+)", line)
+                if current_name and ip_match:
+                    ip_address = ip_match.group(1)
+                    if ip_address != "127.0.0.1" and ip_address not in seen_ips:
+                        seen_ips.add(ip_address)
+                        interfaces.append((current_name, ip_address))
+            return interfaces
+
+        result = subprocess.run(["ifconfig"], capture_output=True, text=True, check=True)
+        current_name = ""
+        for line in result.stdout.splitlines():
+            name_match = re.match(r"^([^\s:]+):\s", line)
+            if name_match:
+                current_name = name_match.group(1).strip()
+                continue
+            ip_match = re.search(r"\binet (\d+\.\d+\.\d+\.\d+)\b", line)
+            if current_name and ip_match:
+                ip_address = ip_match.group(1)
+                if ip_address != "127.0.0.1" and ip_address not in seen_ips:
+                    seen_ips.add(ip_address)
+                    interfaces.append((current_name, ip_address))
+    except Exception:
+        pass
+
+    if not interfaces:
+        fallback = _get_local_ipv4()
+        if fallback is not None:
+            interfaces.append(("auto", fallback))
+
+    return interfaces
 
 
 def _get_local_ipv4s() -> list[str]:
@@ -396,19 +459,87 @@ def _get_local_ipv4s() -> list[str]:
     return unique_addresses
 
 
-def discover_wifi_host(tcp_port: int) -> tuple[str | None, str]:
+def list_wifi_interfaces() -> list[dict[str, str]]:
+    interfaces = [{"label": "Auto (all interfaces)", "value": "auto"}]
+    for name, ip_address in _get_local_interface_addresses():
+        interfaces.append({"label": f"{name} ({ip_address})", "value": ip_address})
+    return interfaces
+
+
+def load_connection_preferences(path: Path) -> dict[str, str]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return {}
+        wifi_host = str(payload.get("wifi_host", ""))
+        wifi_local_ip = str(payload.get("wifi_local_ip", ""))
+        result: dict[str, str] = {}
+        if wifi_host:
+            result["wifi_host"] = wifi_host
+        if wifi_local_ip:
+            result["wifi_local_ip"] = wifi_local_ip
+        return result
+    except Exception:
+        return {}
+
+
+def save_connection_preferences(path: Path, *, wifi_host: str | None = None, wifi_local_ip: str | None = None) -> None:
+    data: dict[str, str] = {}
+    if wifi_host:
+        data["wifi_host"] = wifi_host
+    if wifi_local_ip:
+        data["wifi_local_ip"] = wifi_local_ip
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def apply_connection_preferences(args: object, path: Path) -> None:
+    prefs = load_connection_preferences(path)
+    if getattr(args, "transport", "") != "wifi":
+        return
+
+    wifi_host = getattr(args, "wifi_host", WIFI_DEFAULT_HOST)
+    if isinstance(wifi_host, str) and wifi_host.strip().lower() == WIFI_DEFAULT_HOST:
+        saved_host = prefs.get("wifi_host")
+        if saved_host:
+            setattr(args, "wifi_host", saved_host)
+
+    wifi_local_ip = getattr(args, "wifi_local_ip", "auto")
+    if isinstance(wifi_local_ip, str) and wifi_local_ip.strip().lower() == "auto":
+        saved_local_ip = prefs.get("wifi_local_ip")
+        if saved_local_ip:
+            setattr(args, "wifi_local_ip", saved_local_ip)
+
+
+def extract_wifi_host_from_target(target: str) -> str | None:
+    if not target.startswith("WIFI:"):
+        return None
+    remainder = target[len("WIFI:"):]
+    if not remainder:
+        return None
+    return remainder.split(":", 1)[0]
+
+
+def discover_wifi_host(tcp_port: int, local_ip: str | None = None) -> tuple[str | None, str]:
     mdns_candidates = ("esp32-buoy.local", "buoy.local")
     for candidate in mdns_candidates:
         try:
             resolved = socket.gethostbyname(candidate)
         except OSError:
             continue
-        if _probe_tcp_host(resolved, tcp_port):
+        if _probe_tcp_host(resolved, tcp_port, local_ip=local_ip):
             return resolved, f"Auto-discovered via mDNS: {candidate} -> {resolved}"
 
+    preferred_ip = local_ip if local_ip and local_ip.lower() != "auto" else None
     local_ips = _get_local_ipv4s()
     if not local_ips:
         return None, "Auto-discovery failed: no local IPv4 interface"
+
+    if preferred_ip and preferred_ip in local_ips:
+        local_ips = [preferred_ip] + [ip for ip in local_ips if ip != preferred_ip]
 
     seen_prefixes: set[str] = set()
     prefixes: list[str] = []
@@ -428,18 +559,22 @@ def discover_wifi_host(tcp_port: int) -> tuple[str | None, str]:
         local_hosts = {ip.rsplit(".", 1)[-1] for ip in local_ips if ip.startswith(f"{prefix}.")}
         candidates = [f"{prefix}.{host}" for host in range(1, 255) if str(host) not in local_hosts]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as executor:
-            futures = {
-                executor.submit(_probe_tcp_host, host, tcp_port): host
-                for host in candidates
-            }
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=64)
+        futures = {
+            executor.submit(_probe_tcp_host, host, tcp_port, 0.15, local_ip): host
+            for host in candidates
+        }
+        try:
             for future in concurrent.futures.as_completed(futures):
                 host = futures[future]
                 try:
                     if future.result():
+                        executor.shutdown(wait=False, cancel_futures=True)
                         return host, f"Auto-discovered on subnet {prefix}.0/24"
                 except Exception:
                     continue
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     return None, f"Auto-discovery failed on subnets: {', '.join(f'{prefix}.0/24' for prefix in prefixes)}"
 
@@ -631,6 +766,7 @@ def open_serial_connection(
     use_ble: bool = False,
     use_wifi: bool = False,
     wifi_host: str = WIFI_DEFAULT_HOST,
+    local_ip: str | None = None,
     tcp_port: int = WIFI_DEFAULT_TCP_PORT,
     udp_port: int = WIFI_DEFAULT_UDP_PORT,
     audio_port: int = WIFI_DEFAULT_AUDIO_PORT,
@@ -640,7 +776,7 @@ def open_serial_connection(
     if use_wifi:
         resolved_host = wifi_host
         if wifi_host.strip().lower() == "auto":
-            resolved_host, discovery_status = discover_wifi_host(tcp_port)
+            resolved_host, discovery_status = discover_wifi_host(tcp_port, local_ip=local_ip)
             if resolved_host is None:
                 target = f"WIFI:auto:{tcp_port}/udp:{udp_port}"
                 return None, f"Open failed: {discovery_status}", target
@@ -651,10 +787,13 @@ def open_serial_connection(
                 tcp_port=tcp_port,
                 udp_port=udp_port,
                 audio_port=audio_port,
+                local_ip=local_ip,
             )
-            return transport, "Connected", f"WIFI:{resolved_host}:{tcp_port}/udp:{udp_port}/audio:{audio_port}"
+            source_label = f" src:{local_ip}" if local_ip and local_ip.lower() != "auto" else ""
+            return transport, "Connected", f"WIFI:{resolved_host}:{tcp_port}/udp:{udp_port}/audio:{audio_port}{source_label}"
         except Exception as exc:
-            return None, f"Open failed: {exc}", f"WIFI:{resolved_host}:{tcp_port}/udp:{udp_port}/audio:{audio_port}"
+            source_label = f" src:{local_ip}" if local_ip and local_ip.lower() != "auto" else ""
+            return None, f"Open failed: {exc}", f"WIFI:{resolved_host}:{tcp_port}/udp:{udp_port}/audio:{audio_port}{source_label}"
 
     if use_ble:
         if not device_name:

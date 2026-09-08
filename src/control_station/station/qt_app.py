@@ -9,7 +9,10 @@ import sys
 import time
 import threading
 
-import pygame
+try:
+    import pygame
+except ModuleNotFoundError:
+    pygame = None
 from PySide6.QtCore import QObject, Property, QTimer, Signal, Slot, QUrl
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
@@ -19,13 +22,18 @@ from .geometry import build_manual_command
 from .models import ScienceSample
 from .protocol import is_protocol_message, parse_acknowledgement, parse_error, parse_science_update, parse_status_update
 from .serial_link import (
+    CONNECTION_PREFS_FILENAME,
     WIFI_DEFAULT_AUDIO_PORT,
     WIFI_DEFAULT_HOST,
     WIFI_DEFAULT_TCP_PORT,
     WIFI_DEFAULT_UDP_PORT,
+    apply_connection_preferences,
+    extract_wifi_host_from_target,
+    list_wifi_interfaces,
     open_serial_connection,
     read_available_bytes,
     read_telemetry_packets,
+    save_connection_preferences,
     send_command,
     send_text,
 )
@@ -46,6 +54,13 @@ def parse_args() -> argparse.Namespace:
         help="Device name(s) to auto-discover when --port is not supplied or when using BLE/serial (comma-separated)",
     )
     parser.add_argument("--wifi-host", default=WIFI_DEFAULT_HOST, help="ESP32 Wi-Fi host or IP address")
+    parser.add_argument(
+        "--wifi-local-ip",
+        "--source-ip",
+        dest="wifi_local_ip",
+        default="auto",
+        help="Local IPv4 address used to select the source interface",
+    )
     parser.add_argument("--tcp-port", type=int, default=WIFI_DEFAULT_TCP_PORT, help="TCP port used for reliable command/control")
     parser.add_argument("--udp-port", type=int, default=WIFI_DEFAULT_UDP_PORT, help="Local UDP port used for fast telemetry")
     parser.add_argument("--audio-port", type=int, default=WIFI_DEFAULT_AUDIO_PORT, help="Local UDP port used for streamed audio")
@@ -95,6 +110,7 @@ def _parse_location_pair(location_text: str) -> tuple[float, float] | None:
 def _parse_science_sample(state: dict[str, object], timestamp: float) -> ScienceSample | None:
     location = _parse_location_pair(str(state.get("currentLocation", "")))
     depth_m = _parse_float_prefix(str(state.get("currentDepth", "")))
+    water_temperature_c = _parse_float_prefix(str(state.get("waterTemperature", "")))
     audio_level_text = str(state.get("audioLevel", ""))
 
     if location is None or depth_m is None:
@@ -112,6 +128,7 @@ def _parse_science_sample(state: dict[str, object], timestamp: float) -> Science
         longitude=longitude,
         depth_m=depth_m,
         audio_level_percent=audio_level_percent,
+        water_temperature_c=water_temperature_c,
     )
 
 
@@ -202,10 +219,11 @@ class ControlStationBackend(QObject):
     dashboardTabChanged = Signal()
     audioMutedChanged = Signal()
 
-    def __init__(self, args: argparse.Namespace, log_file: Path) -> None:
+    def __init__(self, args: argparse.Namespace, log_file: Path, prefs_path: Path) -> None:
         super().__init__()
         self._args = args
         self._log_file = log_file
+        self._prefs_path = prefs_path
         self._state: dict[str, object] = {
             "controllerStatus": "Not connected",
             "controllerName": "Connect Xbox controller",
@@ -235,12 +253,23 @@ class ControlStationBackend(QObject):
             "imuUdpLoss": "N/A",
             "audioStream": "N/A",
             "audioLevel": "N/A",
+            "motorConfigFetchId": 0,
+            "motorConfigMotor": "",
+            "motorConfigDirection": "",
+            "motorConfigStartBoostPwm": 0,
+            "motorConfigStartBoostMs": 0,
+            "motorConfigSustainMinPwm": 0,
+            "motorConfigMaxPwm": 0,
+            "motorConfigCurveTimes100": 0,
+            "motorConfigRampTenths": 0,
         }
         self._comm_log: list[str] = []
         self._science_history: list[dict[str, object]] = []
         self._audio_waveform: list[float] = [0.0] * 480
         self._dashboard_tab = "logs"
         self._audio_muted = False
+        self._network_interfaces = list_wifi_interfaces()
+        self._wifi_local_ip = getattr(args, "wifi_local_ip", "auto") or "auto"
         self._waveform_buffer: deque[float] = deque([0.0] * 480, maxlen=480)
         self._audio_channel = None
         self._mixer_ready = False
@@ -302,13 +331,35 @@ class ControlStationBackend(QObject):
     def audioMuted(self) -> bool:
         return self._audio_muted
 
+    @Property(list, notify=stateChanged)
+    def networkInterfaces(self) -> list[dict[str, str]]:
+        return self._network_interfaces
+
+    @Property(str, notify=stateChanged)
+    def wifiLocalIp(self) -> str:
+        return self._wifi_local_ip
+
+    @Property(str, notify=stateChanged)
+    def connectionButtonLabel(self) -> str:
+        serial_status = str(self._state.get("serialStatus", "Disconnected"))
+        if serial_status.startswith("Connecting"):
+            return "Connecting..."
+        if serial_status.startswith("Reconnecting"):
+            return "Reconnecting..."
+        if serial_status.startswith("Connected"):
+            return "Disconnect"
+        return "Reconnect"
+
     @Slot(str)
     def setDashboardTab(self, tab: str) -> None:
-        if tab not in {"logs", "analysis"}:
+        if tab not in {"science", "logs", "map", "analysis", "motors"}:
             return
         if self._dashboard_tab != tab:
+            leaving_motor_debug = self._dashboard_tab == "motors" and tab != "motors"
             self._dashboard_tab = tab
             self.dashboardTabChanged.emit()
+            if leaving_motor_debug:
+                self.stopAllMotors()
 
     @Slot()
     def toggleAudioMute(self) -> None:
@@ -320,6 +371,253 @@ class ControlStationBackend(QObject):
                 pass
         self.audioMutedChanged.emit()
         self.stateChanged.emit()
+
+    @Slot(str)
+    def setWifiLocalIp(self, local_ip: str) -> None:
+        normalized = local_ip or "auto"
+        if normalized == self._wifi_local_ip:
+            return
+        self._wifi_local_ip = normalized
+        self._args.wifi_local_ip = normalized
+        self._connection_request_id += 1
+        with self._connection_lock:
+            self._pending_connection = None
+            self._connection_in_flight = False
+        if self._transport is not None:
+            try:
+                self._transport.close()
+            except Exception:
+                pass
+            self._transport = None
+        self._set_state(serialStatus="Reconnecting", serialTarget="No port selected")
+        self._queue_transport_connection(initial=False)
+        self.stateChanged.emit()
+
+    @Slot()
+    def toggleConnection(self) -> None:
+        if self._transport is not None:
+            try:
+                self._transport.close()
+            except Exception:
+                pass
+            self._transport = None
+            self._connection_request_id += 1
+            self._set_state(serialStatus="Disconnected", serialTarget="No port selected")
+            self.stateChanged.emit()
+            return
+
+        self._queue_transport_connection(initial=False)
+        self.stateChanged.emit()
+
+    @Slot()
+    def stopAllMotors(self) -> None:
+        if self._transport is None:
+            self._set_state(lastSendResult="No serial link", lastSentLine="")
+            return
+
+        command = "CTRL STOP"
+        result = send_text(self._transport, command)
+        self._set_state(lastSendResult=result, lastSentLine=command)
+        if "failed" not in result.lower():
+            self._append_comm_log(f"TX {command}")
+
+    @Slot()
+    def stopMotorTest(self) -> None:
+        self.stopAllMotors()
+
+    @Slot(str)
+    def sendText(self, text: str) -> None:
+        message = (text or "").strip()
+        if not message:
+            self._set_state(lastSendResult="Empty text", lastSentLine="")
+            return
+        if self._transport is None:
+            self._set_state(lastSendResult="No serial link", lastSentLine=message)
+            return
+
+        result = send_text(self._transport, message)
+        self._set_state(lastSendResult=result, lastSentLine=message)
+        if "failed" not in result.lower():
+            self._append_comm_log(f"TX {message}")
+
+    @Slot(str, str, int, int, int, int, float, float, bool, int)
+    def startMotorTest(
+        self,
+        motor: str,
+        direction: str,
+        start_boost_pwm: int,
+        start_boost_ms: int,
+        sustain_min_pwm: int,
+        max_pwm: int,
+        curve: float,
+        ramp_seconds: float,
+        default_reversed: bool,
+        throttle_percent: int,
+    ) -> None:
+        if self._transport is None:
+            self._set_state(lastSendResult="No serial link", lastSentLine="")
+            return
+
+        normalized_motor = (motor or "").strip().lower().replace("-", "_")
+        normalized_direction = (direction or "").strip().lower()
+        start_boost_ms_value = max(0, min(5000, int(start_boost_ms)))
+        sustain_min_pwm_value = max(0, min(255, int(sustain_min_pwm)))
+        max_pwm_value = max(sustain_min_pwm_value, min(255, int(max_pwm)))
+        start_boost_pwm_value = max(sustain_min_pwm_value, min(max_pwm_value, int(start_boost_pwm)))
+        curve_value = max(0.1, float(curve))
+        ramp_seconds_value = max(0.1, float(ramp_seconds))
+
+        calibration = (
+            f"CTRL MOTOR CAL {normalized_motor} {normalized_direction} "
+            f"{start_boost_pwm_value:d} {start_boost_ms_value:d} {sustain_min_pwm_value:d} "
+            f"{max_pwm_value:d} {curve_value:.2f} {ramp_seconds_value:.2f} "
+            f"{1 if default_reversed else 0:d}"
+        )
+        self._append_comm_log(f"TX {calibration}")
+        result = send_text(self._transport, calibration)
+        self._set_state(lastSendResult=result, lastSentLine=calibration)
+        if "failed" in result.lower():
+            self._append_comm_log(f"TX failed {calibration}: {result}")
+            return
+
+        self.sendMotorThrottle(normalized_motor, normalized_direction, curve_value, throttle_percent)
+
+    @Slot(str, str, float, int)
+    def sendMotorThrottle(
+        self,
+        motor: str,
+        direction: str,
+        curve: float,
+        throttle_percent: int,
+    ) -> None:
+        if self._transport is None:
+            self._set_state(lastSendResult="No serial link", lastSentLine="")
+            return
+
+        normalized_motor = (motor or "").strip().lower().replace("-", "_")
+        normalized_direction = (direction or "").strip().lower()
+        throttle_value = max(0, min(100, int(throttle_percent)))
+        curve_value = max(0.1, float(curve))
+        drive_floor = 11
+
+        if throttle_value <= 0:
+            drive_value = 0
+        else:
+            drive_fraction = pow(throttle_value / 100.0, 1.0 / curve_value)
+            drive_value = int(round(drive_floor + ((255 - drive_floor) * drive_fraction)))
+            drive_value = max(drive_floor, min(255, drive_value))
+
+        if normalized_direction == "reverse":
+            drive_value = -drive_value
+
+        command = f"CTRL MOTOR {normalized_motor} {drive_value:+d}"
+        result = send_text(self._transport, command)
+        self._set_state(lastSendResult=result, lastSentLine=command)
+        if "failed" not in result.lower():
+            self._append_comm_log(f"TX {command}")
+
+    @Slot(str, int)
+    def sendMotorTestPower(self, motor: str, power_percent: int) -> None:
+        """Send signed test power and let firmware apply direction-specific calibration."""
+        if self._transport is None:
+            self._set_state(lastSendResult="No serial link", lastSentLine="")
+            return
+
+        normalized_motor = (motor or "").strip().lower().replace("-", "_")
+        power_value = max(-100, min(100, int(power_percent)))
+        drive_floor = 11
+
+        if power_value == 0:
+            drive_value = 0
+        else:
+            drive_magnitude = int(round(drive_floor + ((255 - drive_floor) * (abs(power_value) / 100.0))))
+            drive_value = -drive_magnitude if power_value < 0 else drive_magnitude
+
+        command = f"CTRL MOTOR {normalized_motor} {drive_value:+d}"
+        result = send_text(self._transport, command)
+        self._set_state(lastSendResult=result, lastSentLine=command)
+        if "failed" not in result.lower():
+            self._append_comm_log(f"TX {command}")
+
+    @Slot(str, str, int, int, int, int, float, float, bool)
+    def sendMotorCalibration(
+        self,
+        motor: str,
+        direction: str,
+        start_boost_pwm: int,
+        start_boost_ms: int,
+        sustain_min_pwm: int,
+        max_pwm: int,
+        curve: float,
+        ramp_seconds: float,
+        default_reversed: bool,
+    ) -> None:
+        if self._transport is None:
+            self._set_state(lastSendResult="No serial link", lastSentLine="")
+            return
+
+        normalized_motor = (motor or "").strip().lower().replace("-", "_")
+        normalized_direction = (direction or "").strip().lower()
+        start_boost_ms_value = max(0, min(5000, int(start_boost_ms)))
+        sustain_min_pwm_value = max(0, min(255, int(sustain_min_pwm)))
+        max_pwm_value = max(sustain_min_pwm_value, min(255, int(max_pwm)))
+        start_boost_pwm_value = max(sustain_min_pwm_value, min(max_pwm_value, int(start_boost_pwm)))
+        curve_value = max(0.1, float(curve))
+        ramp_seconds_value = max(0.1, float(ramp_seconds))
+        command = (
+            f"CTRL MOTOR CAL {normalized_motor} {normalized_direction} "
+            f"{start_boost_pwm_value:d} {start_boost_ms_value:d} {sustain_min_pwm_value:d} "
+            f"{max_pwm_value:d} {curve_value:.2f} {ramp_seconds_value:.2f} "
+            f"{1 if default_reversed else 0:d}"
+        )
+        result = send_text(self._transport, command)
+        self._set_state(lastSendResult=result, lastSentLine=command)
+        if "failed" not in result.lower():
+            self._append_comm_log(f"TX {command}")
+
+    @Slot(str, int, int, int, int, float, float, bool)
+    def sendSharedMotorCalibration(
+        self,
+        motor: str,
+        start_boost_pwm: int,
+        start_boost_ms: int,
+        sustain_min_pwm: int,
+        max_pwm: int,
+        curve: float,
+        ramp_seconds: float,
+        default_reversed: bool,
+    ) -> None:
+        """Apply one calibration profile to both motor directions."""
+        if self._transport is None:
+            self._set_state(lastSendResult="No serial link", lastSentLine="")
+            return
+
+        for direction in ("forward", "reverse"):
+            self.sendMotorCalibration(
+                motor,
+                direction,
+                start_boost_pwm,
+                start_boost_ms,
+                sustain_min_pwm,
+                max_pwm,
+                curve,
+                ramp_seconds,
+                default_reversed,
+            )
+
+    @Slot(str, str)
+    def requestMotorConfiguration(self, motor: str, direction: str) -> None:
+        if self._transport is None:
+            self._set_state(lastSendResult="No serial link", lastSentLine="")
+            return
+
+        normalized_motor = (motor or "").strip().lower().replace("-", "_")
+        normalized_direction = (direction or "").strip().lower()
+        command = f"REQ MOTOR CAL {normalized_motor} {normalized_direction}"
+        result = send_text(self._transport, command)
+        self._set_state(lastSendResult=result, lastSentLine=command)
+        if "failed" not in result.lower():
+            self._append_comm_log(f"TX {command}")
 
     @Slot(str, bool)
     def setKeyboardInput(self, key: str, pressed: bool) -> None:
@@ -352,16 +650,17 @@ class ControlStationBackend(QObject):
         self._set_state(serialStatus=status, serialTarget="No port selected", currentDraw="N/A")
 
     def start(self) -> None:
-        pygame.init()
-        pygame.joystick.init()
-        self._mixer_ready = pygame.mixer.get_init() is not None
-        if not self._mixer_ready:
-            try:
-                pygame.mixer.init(frequency=16000, size=-16, channels=2, buffer=512)
-                self._mixer_ready = True
-            except pygame.error:
-                self._mixer_ready = False
-        self._audio_channel = pygame.mixer.Channel(0) if self._mixer_ready else None
+        if pygame is not None:
+            pygame.init()
+            pygame.joystick.init()
+            self._mixer_ready = pygame.mixer.get_init() is not None
+            if not self._mixer_ready:
+                try:
+                    pygame.mixer.init(frequency=16000, size=-16, channels=2, buffer=512)
+                    self._mixer_ready = True
+                except pygame.error:
+                    self._mixer_ready = False
+            self._audio_channel = pygame.mixer.Channel(0) if self._mixer_ready else None
         self._joystick = get_controller()
         self._queue_transport_connection(initial=True)
         self._timer.start()
@@ -378,14 +677,16 @@ class ControlStationBackend(QObject):
                 self._joystick.quit()
         except Exception:
             pass
-        try:
-            pygame.quit()
-        except Exception:
-            pass
+        if pygame is not None:
+            try:
+                pygame.quit()
+            except Exception:
+                pass
 
     def _build_transport_target(self) -> str:
         if self._args.transport == "wifi":
-            return f"WIFI:{self._args.wifi_host}:{self._args.tcp_port}/udp:{self._args.udp_port}/audio:{self._args.audio_port}"
+            source_label = f" src:{self._wifi_local_ip}" if self._wifi_local_ip and self._wifi_local_ip.lower() != "auto" else ""
+            return f"WIFI:{self._args.wifi_host}:{self._args.tcp_port}/udp:{self._args.udp_port}/audio:{self._args.audio_port}{source_label}"
         if self._args.transport == "ble":
             return f"BLE:{self._args.device_name}"
         if self._args.port:
@@ -405,20 +706,23 @@ class ControlStationBackend(QObject):
         request_id = self._connection_request_id
         target = self._build_transport_target()
         self._set_state(serialStatus="Connecting...", serialTarget=target)
+        source_ip = self._wifi_local_ip if self._args.transport == "wifi" else "n/a"
+        self._append_comm_log(f"CONNECT start target={target} source={source_ip}")
 
         def worker() -> None:
             transport, status, resolved_target = open_serial_connection(
                 self._args.port,
                 self._args.baudrate,
                 self._args.device_name,
-                use_ble=(self._args.transport == "ble"),
-                use_wifi=(self._args.transport == "wifi"),
-                wifi_host=self._args.wifi_host,
-                tcp_port=self._args.tcp_port,
-                udp_port=self._args.udp_port,
-                audio_port=self._args.audio_port,
-                ble_service_uuid=self._args.ble_service_uuid,
-                ble_characteristic_uuid=self._args.ble_characteristic_uuid,
+            use_ble=(self._args.transport == "ble"),
+            use_wifi=(self._args.transport == "wifi"),
+            wifi_host=self._args.wifi_host,
+            local_ip=self._wifi_local_ip,
+            tcp_port=self._args.tcp_port,
+            udp_port=self._args.udp_port,
+            audio_port=self._args.audio_port,
+            ble_service_uuid=self._args.ble_service_uuid,
+            ble_characteristic_uuid=self._args.ble_characteristic_uuid,
             )
             with self._connection_lock:
                 self._pending_connection = (request_id, transport, status, resolved_target)
@@ -448,6 +752,8 @@ class ControlStationBackend(QObject):
             self._set_state(serialStatus="Reconnecting", serialTarget=target)
             if not initial:
                 self._append_comm_log(f"RECONNECT failed target={target}: {status}")
+            else:
+                self._append_comm_log(f"CONNECT failed target={target}: {status}")
             return
 
         self._transport = transport
@@ -461,11 +767,26 @@ class ControlStationBackend(QObject):
         else:
             self._connected_device_name = self._args.device_name if self._args.device_name else None
 
+        if self._args.transport == "wifi":
+            resolved_host = extract_wifi_host_from_target(target) or self._args.wifi_host
+            save_connection_preferences(
+                self._prefs_path,
+                wifi_host=resolved_host,
+                wifi_local_ip=self._wifi_local_ip if self._wifi_local_ip and self._wifi_local_ip.lower() != "auto" else None,
+            )
+
         serial_status = "Connected"
         if self._connected_device_name:
             serial_status = f"Connected ({self._connected_device_name})"
         self._set_state(serialStatus=serial_status, serialTarget=target)
-        self._append_comm_log(f"RECONNECTED target={target}")
+        if self._args.transport == "wifi":
+            stop_result = send_text(self._transport, "CTRL STOP")
+            self._set_state(lastSendResult=stop_result, lastSentLine="CTRL STOP")
+            self._append_comm_log(f"TX CTRL STOP target={target}")
+        if initial:
+            self._append_comm_log(f"CONNECT success target={target}")
+        else:
+            self._append_comm_log(f"RECONNECTED target={target}")
 
     def _send_current_command(self) -> None:
         joystick_turn, joystick_thrust = read_axes(self._joystick, self._args.deadzone)
@@ -514,21 +835,22 @@ class ControlStationBackend(QObject):
                 self._append_comm_log(f"TX {text}")
             return
 
-        send_command_flag = False
-        if self._command != getattr(self, "_last_command", None):
-            send_command_flag = True
-        elif (now - self._last_send_time) >= min_send_interval and not (self._command.turn == 0 and self._command.thrust == 0):
-            send_command_flag = True
+        if self._dashboard_tab != "motors":
+            send_command_flag = False
+            if self._command != getattr(self, "_last_command", None):
+                send_command_flag = True
+            elif (now - self._last_send_time) >= min_send_interval and not (self._command.turn == 0 and self._command.thrust == 0):
+                send_command_flag = True
 
-        if send_command_flag and self._transport is not None:
-            result = send_command(self._transport, self._command)
-            self._set_state(lastSendResult=result, lastSentLine=self._command.to_line().strip())
-            self._last_send_time = now
-            self._last_command = self._command
-            if "failed" not in result.lower():
-                self._last_protocol_send_time = time.time()
-                self._awaiting_protocol_response = True
-            self._append_comm_log(f"TX {self._command.to_line().strip()}")
+            if send_command_flag and self._transport is not None:
+                result = send_command(self._transport, self._command)
+                self._set_state(lastSendResult=result, lastSentLine=self._command.to_line().strip())
+                self._last_send_time = now
+                self._last_command = self._command
+                if "failed" not in result.lower():
+                    self._last_protocol_send_time = time.time()
+                    self._awaiting_protocol_response = True
+                self._append_comm_log(f"TX {self._command.to_line().strip()}")
 
     def _process_text_line(self, response_text: str) -> None:
         self._set_state(lastResponse=response_text)
@@ -573,6 +895,41 @@ class ControlStationBackend(QObject):
                 self._set_state(imuGyro=_parse_vector3_text(" ".join(science_values), "dps"))
             elif science_key == "IMU_TEMP":
                 self._set_state(imuTemperature=_parse_science_value(science_values, "C"))
+
+        if response_text.startswith("TEL MOTOR CAL "):
+            payload = response_text[14:].strip()
+            parts = payload.split()
+            if len(parts) >= 8:
+                motor_name = parts[0].strip().lower()
+                direction = parts[1].strip().lower()
+                try:
+                    start_boost_pwm = int(parts[2])
+                    start_boost_ms = int(parts[3])
+                    sustain_min_pwm = int(parts[4])
+                    max_pwm = int(parts[5])
+                    curve = float(parts[6])
+                    ramp_seconds = float(parts[7])
+                    default_reversed = bool(int(parts[8])) if len(parts) >= 9 else False
+                except ValueError:
+                    start_boost_pwm = 0
+                    start_boost_ms = 0
+                    sustain_min_pwm = 0
+                    max_pwm = 0
+                    curve = 0.0
+                    ramp_seconds = 0.0
+                    default_reversed = False
+                self._set_state(
+                    motorConfigFetchId=int(self._state.get("motorConfigFetchId", 0)) + 1,
+                    motorConfigMotor=motor_name,
+                    motorConfigDirection=direction,
+                    motorConfigStartBoostPwm=start_boost_pwm,
+                    motorConfigStartBoostMs=start_boost_ms,
+                    motorConfigSustainMinPwm=sustain_min_pwm,
+                    motorConfigMaxPwm=max_pwm,
+                    motorConfigCurveTimes100=int(round(curve * 100.0)),
+                    motorConfigRampTenths=int(round(ramp_seconds * 10.0)),
+                    motorConfigDefaultReversed=default_reversed,
+                )
 
         if is_protocol_message(response_text):
             self._last_protocol_response_time = time.time()
@@ -770,11 +1127,13 @@ def run(args: argparse.Namespace) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     log_file = Path(args.comm_log_file) if args.comm_log_file else (log_dir / f"comm-{timestamp}.log")
+    prefs_path = log_dir / CONNECTION_PREFS_FILENAME
+    apply_connection_preferences(args, prefs_path)
     with log_file.open("a", encoding="utf-8") as handle:
         handle.write(f"{time.time()}: COMM LOG START file={log_file}\n")
 
     engine = QQmlApplicationEngine()
-    backend = ControlStationBackend(args, log_file)
+    backend = ControlStationBackend(args, log_file, prefs_path)
     engine.rootContext().setContextProperty("backend", backend)
 
     qml_path = app_dir / "qml" / "Main.qml"
@@ -788,3 +1147,4 @@ def run(args: argparse.Namespace) -> None:
     with log_file.open("a", encoding="utf-8") as handle:
         handle.write(f"{time.time()}: COMM LOG END\n")
     raise SystemExit(exit_code)
+

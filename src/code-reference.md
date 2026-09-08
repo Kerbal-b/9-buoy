@@ -14,7 +14,7 @@ This file explains what the main source files mean and what configuration decisi
   - scientific sensors should cover environmental and research measurements
   - telemetry/reporting should format and emit status from those subsystems
 - Update this reference file when the firmware structure, protocol, or subsystem responsibilities change.
-- Update the wiring diagram in this file whenever a new device is added or a connection changes.
+- Update the centralized wiring documentation in `docs/wiring/` whenever a device or connection changes; do not duplicate schematics in this file.
 
 ## Main Source Areas
 
@@ -108,6 +108,9 @@ Scientific telemetry:
 TEL SCI WATER_TEMP <c|UNKNOWN>
 TEL SCI AIR_TEMP <c|UNKNOWN>
 TEL SCI DEPTH <m|UNKNOWN>
+TEL SCI IMU_ACCEL <x_g|UNKNOWN> <y_g|UNKNOWN> <z_g|UNKNOWN>
+TEL SCI IMU_GYRO <x_dps|UNKNOWN> <y_dps|UNKNOWN> <z_dps|UNKNOWN>
+TEL SCI IMU_TEMP <c|UNKNOWN>
 ```
 
 ### Current Configuration
@@ -134,70 +137,9 @@ TEL SCI DEPTH <m|UNKNOWN>
 - Battery voltage sensor
   - `0-25V module OUT`: `A1`
 
-### Module-Based Wiring Diagram
+### Legacy Wiring Documentation
 
-#### Motor Drive
-
-```text
-[ Arduino Nano ]
-   |
-   |-- D3  (PWM) -> Rear motor driver speed input
-   |-- D8  (DIR) -> Rear motor driver direction input
-   |               direction reverse path uses 74HC14 inverter
-   |
-   |-- D5  (PWM) -> Front-left motor driver speed input
-   |-- D7  (DIR) -> Front-left motor driver direction input
-   |               direction reverse path uses 74HC14 inverter
-   |
-   |-- D6  (PWM) -> Front-right motor driver speed input
-   |-- D11 (DIR) -> Front-right motor driver direction input
-                   direction reverse path uses 74HC14 inverter
-```
-
-#### Communication
-
-```text
-[ Laptop Control Station ]
-   |
-   |  Bluetooth commands and telemetry
-   v
-[ Bluetooth Module ]
-   |
-   |-- TX -> Arduino D2  (SoftwareSerial RX)
-   |-- RX <- Arduino D10 (SoftwareSerial TX)
-   |-- VCC -> Arduino 5V   assumed
-   |-- GND -> Arduino GND  assumed
-```
-
-#### Operational Sensors
-
-```text
-[ ACS712 Current Sensor ]
-   |
-   |-- OUT -> Arduino A0
-   |-- VCC -> Arduino 5V
-   |-- GND -> Arduino GND
-
-[ 0-25V Battery Voltage Sensor ]
-   |
-   |-- OUT -> Arduino A1
-   |-- VCC -> Arduino 5V
-   |-- GND -> Arduino GND
-```
-
-These are the currently implemented operational sensors in firmware.
-
-#### Scientific Sensors
-
-```text
-Not wired in current firmware yet.
-
-Planned examples:
-- Water temperature sensor
-- Air temperature sensor
-- Depth / pressure sensor
-- Other environmental probes
-```
+The historical Nano, HC-05, motor, and sensor schematic is retained in `docs/wiring/legacy-nano-hc05-wiring.md`. The active ESP32 wiring starts at `docs/wiring/README.md`.
 
 ### Important Notes
 
@@ -216,136 +158,37 @@ Planned examples:
 - Keepalive `PING` responses should send a status snapshot so newly added operational sensors appear in normal telemetry without requiring a separate request.
 - The scientific-sensors and safety sections are placeholders for future expansion.
 
-## ESP32 Controller Wiring (Serial-Optimized Draft)
+## ESP32 Controller Wiring
 
-This is the draft wiring map for migrating functionality from Nano to ESP32 while using all three ESP32 UART controllers intentionally.
+The active firmware assigns UART1 to GPS, keeps UART0 for USB/debug, and leaves UART2 reserved. The former migration draft and duplicated pin list were removed so they cannot drift from the production firmware and centralized wiring documents.
 
-### UART Allocation Plan
+### ESP32 Wiring Documentation
 
-- `UART0` (`GPIO1` TX0, `GPIO3` RX0)
-  - Role: USB programming + serial monitor only.
-  - Keep free from external modules to avoid flashing/debug conflicts.
-- `UART1` (`GPIO17` TX1, `GPIO16` RX1)
-  - Role: GPS module (GT-U7 or equivalent).
-- `UART2` (`GPIO26` TX2, `GPIO25` RX2)
-  - Role: External serial peripheral channel (HC-05/HC-06, RS485 bridge, or future payload UART).
+All active-build schematics, device connection tables, physical verification notes, and the consolidated ESP32 pin map are maintained in `docs/wiring/`. Start with `docs/wiring/README.md`.
 
-### ESP32 Pin Map
-
-- Rear motor
-  - `PWM`: `GPIO18`
-  - `DIR`: `GPIO19`
-
-- Front-left motor
-  - `PWM`: `GPIO21`
-  - `DIR`: `GPIO22`
-
-- Front-right motor
-  - `PWM`: `GPIO23`
-  - `DIR`: `GPIO27`
-
-- UART0 USB debug/programming
-  - `TX0`: `GPIO1`
-  - `RX0`: `GPIO3`
-
-- UART1 GPS
-  - `ESP32 RX1 GPIO16` <- `GPS TX`
-  - `ESP32 TX1 GPIO17` -> `GPS RX` (optional for read-only GPS)
-
-- UART2 external serial device
-  - `ESP32 RX2 GPIO25` <- `Module TX`
-  - `ESP32 TX2 GPIO26` -> `Module RX`
-
-- Current sensor (ACS712 OUT)
-  - `GPIO34` (ADC1 input only)
-
-- Battery voltage sensor (0-25V module OUT)
-  - `GPIO35` (ADC1 input only)
-
-### ESP32 Wiring Diagram
-
-#### Motor Drive
-
-```text
-[ ESP32 ]
-   |
-   |-- GPIO18 (PWM) -> Rear motor driver speed input
-   |-- GPIO19 (DIR) -> Rear motor driver direction input
-   |                  direction reverse path uses 74HC14 inverter
-   |
-   |-- GPIO21 (PWM) -> Front-left motor driver speed input
-   |-- GPIO22 (DIR) -> Front-left motor driver direction input
-   |                  direction reverse path uses 74HC14 inverter
-   |
-   |-- GPIO23 (PWM) -> Front-right motor driver speed input
-   |-- GPIO27 (DIR) -> Front-right motor driver direction input
-                      direction reverse path uses 74HC14 inverter
-```
-
-#### UART0 (USB)
-
-```text
-[ Computer USB ]
-   |
-   v
-[ ESP32 UART0 ]
-   |
-   |-- TX0 GPIO1
-   |-- RX0 GPIO3
-```
-
-#### UART1 (GPS)
-
-```text
-[ GPS Module ]
-   |
-   |-- TX -> ESP32 GPIO16 (RX1)
-   |-- RX <- ESP32 GPIO17 (TX1)   optional for read-only mode
-   |-- VCC -> regulated supply matching module spec
-   |-- GND -> ESP32 GND
-```
-
-#### UART2 (External Serial Peripheral)
-
-```text
-[ External Serial Module ]
-   |
-   |-- TX -> ESP32 GPIO25 (RX2)
-   |-- RX <- ESP32 GPIO26 (TX2)
-   |-- VCC -> module supply rail
-   |-- GND -> ESP32 GND
-```
-
-#### Operational Sensors
-
-```text
-[ ACS712 Current Sensor ]
-   |
-   |-- OUT -> ESP32 GPIO34 (ADC1)
-   |-- VCC -> sensor supply
-   |-- GND -> ESP32 GND
-
-[ 0-25V Battery Voltage Sensor ]
-   |
-   |-- OUT -> ESP32 GPIO35 (ADC1)
-   |-- VCC -> sensor supply
-   |-- GND -> ESP32 GND
-```
+The production firmware remains the source of truth for active GPIO assignments. Do not add a second schematic here; update the device file and index in `docs/wiring/` instead.
 
 ### ESP32 Pin-Selection Notes
 
 - Avoid `GPIO6` to `GPIO11` (connected to onboard flash on most dev boards).
 - Avoid boot strap pins for critical outputs during reset (`GPIO0`, `GPIO2`, `GPIO12`, `GPIO15`).
-- Keep analog sensing on `ADC1` pins (`GPIO32` to `GPIO39`) so reads remain reliable when wireless is active.
+- Keep analog sensing on `ADC1` input-only pins when possible; the current plan uses `GPIO34` and `GPIO35` for sensors.
 - `GPIO34` and `GPIO35` are input-only, which is ideal for analog sensors.
-- Motor control is grouped on `GPIO18/19/21/22/23/27` to simplify loom routing and connector layout.
-- If onboard BLE is used as the primary control link, `UART2` remains available for GPS swap, secondary radio, or diagnostics.
+- `GPIO14` is used for the DS18B20 1-Wire data line in the current wiring plan.
+- `GPIO36` (`VP`) is used for the INMP441 microphone data line and is input-only, which matches the I2S microphone output.
+- `GPIO39` is input-only, which is ideal for the RCWL-1655 echo pulse.
+- `GPIO13` is reserved for the RCWL-1655 trigger pulse in the current wiring plan.
+- Motor control is currently assigned to `GPIO18/19/21/22/32/33` to match the latest wiring layout.
+- I2C is currently assigned to `GPIO23/27` so it does not conflict with the front-right motor on `GPIO21/22`.
+- The current control architecture uses onboard Wi-Fi for command and telemetry transport, so `UART2` remains available for GPS swap, secondary radio, or diagnostics.
+- The RCWL-1655 now feeds both periodic UDP `RANGE` packets and text `TEL SCI DEPTH` updates.
+- The ESP32 firmware uses `OneWire` + `DallasTemperature` on `GPIO14` for `TEL SCI WATER_TEMP` support.
 
 ## ESP32 Production Firmware
 
 ### File
 
-- `src/firmware/esp32/esp32-buoy-firmware.ino`
+- `src/firmware/esp32/esp32-buoy-firmware/esp32-buoy-firmware.ino`
 
 ### What It Does
 
@@ -353,8 +196,12 @@ This is the draft wiring map for migrating functionality from Nano to ESP32 whil
 - Uses all three ESP32 UART controllers with explicit roles:
   - `UART0`: USB programming/debug monitor
   - `UART1`: GPS
-  - `UART2`: control link serial channel
+  - `UART2`: reserved for future expansion
+- Joins the buoy Wi-Fi network as a station in the current build.
+- Accepts reliable control commands over TCP.
+- Streams fast telemetry over UDP using compact binary packets for IMU, range, power, state, GPS, and stereo audio data, and emits DS18B20 water-temperature text telemetry.
 - Uses grouped motor pins to simplify physical harness routing.
+- Inverts motor polarity in software to match the current water-tested buoy wiring and propeller orientation.
 - Keeps protocol compatibility with existing `CTRL ...`, `PING`, and `REQ STATUS ALL` command flow.
 
 ## ESP32 Bring-Up Test Firmware
@@ -402,7 +249,7 @@ This is the draft wiring map for migrating functionality from Nano to ESP32 whil
 - `src/control_station/station/geometry.py`
   - Converts movement inputs into buoy motor command values.
 - `src/control_station/station/serial_link.py`
-  - Handles Bluetooth serial communication to the buoy.
+  - Handles Wi-Fi, BLE, and serial communication to the buoy.
 - `src/control_station/station/ui.py`
   - Draws the main interface and the controller debug interface.
 - `src/control_station/station/models.py`
@@ -422,7 +269,9 @@ This is the draft wiring map for migrating functionality from Nano to ESP32 whil
 - Hello ping mode
   - optional repeated `hello world` messages for Bluetooth link testing
 - Bluetooth auto-discovery
-  - defaults to looking for the device name `DSD TECH`
+  - still available for the legacy Bluetooth serial path
+- Wi-Fi control target
+  - defaults to auto-discovery of the buoy host for the current ESP32 Wi-Fi link
 - Main interface
   - minimalist movement vector plus buoy layout
 - Debug interface
@@ -445,7 +294,7 @@ This is the draft wiring map for migrating functionality from Nano to ESP32 whil
   - front-left
   - front-right
 - The control station and firmware are being developed in parallel.
-- The control station is prepared for serial command-based control.
+- The control station is prepared for serial, BLE, and Wi-Fi command-based control.
 - The joystick logic and the Arduino motor-output logic are now being kept separate.
 - The Arduino firmware currently takes live `VECTOR` commands and computes motor thrust onboard.
 - Firmware changes should be scoped section-by-section to keep refactors controlled.

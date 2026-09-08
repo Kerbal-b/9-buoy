@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-import pygame
+try:
+    import pygame
+except ModuleNotFoundError:
+    pygame = None
 
 from .models import AnalogInput, ControllerSnapshot, DigitalInput
 
 
 def get_controller() -> pygame.joystick.Joystick | None:
+    if pygame is None:
+        return None
     if pygame.joystick.get_count() == 0:
         return None
 
@@ -27,7 +32,7 @@ def apply_deadzone(value: float, deadzone: float) -> float:
 def read_axes(
     joystick: pygame.joystick.Joystick | None, deadzone: float
 ) -> tuple[float, float]:
-    if joystick is None:
+    if joystick is None or pygame is None:
         return 0.0, 0.0
 
     pygame.event.pump()
@@ -53,7 +58,7 @@ def _get_button(joystick: pygame.joystick.Joystick, index: int) -> bool:
 def read_controller_snapshot(
     joystick: pygame.joystick.Joystick | None, deadzone: float
 ) -> ControllerSnapshot:
-    if joystick is None:
+    if joystick is None or pygame is None:
         return ControllerSnapshot(
             analog_inputs=(),
             digital_inputs=(),
