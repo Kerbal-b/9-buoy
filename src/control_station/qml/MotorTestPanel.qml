@@ -12,11 +12,6 @@ Item {
     property int testPowerPercent: 0
     property bool testRunning: false
 
-    property real idleVoltage: NaN
-    property real runVoltage: NaN
-    property real idleCurrent: NaN
-    property real runCurrent: NaN
-
     property int calibrationStartBoostPwm: 96
     property int calibrationStartBoostMs: 250
     property int calibrationSustainMinPwm: 72
@@ -57,26 +52,8 @@ Item {
         return matches ? Number(matches[0]) : NaN
     }
 
-    function captureSample(kind) {
-        const voltage = numericPrefix(backendState.batteryStatus)
-        const current = Math.abs(numericPrefix(backendState.currentDraw))
-        if (kind === "idle") {
-            idleVoltage = voltage
-            idleCurrent = current
-        } else {
-            runVoltage = voltage
-            runCurrent = current
-        }
-    }
-
     function formatValue(value, digits) {
         return Number.isFinite(value) ? value.toFixed(digits) : "N/A"
-    }
-
-    function formatDelta(first, second, digits) {
-        if (!Number.isFinite(first) || !Number.isFinite(second)) return "N/A"
-        const difference = second - first
-        return (difference > 0 ? "+" : "") + difference.toFixed(digits)
     }
 
     function normalizePwmValues() {
@@ -158,7 +135,7 @@ Item {
 
     function selectMotor(index) {
         if (selectedMotorIndex === index) return
-        stopTest(false)
+        stopTest()
         selectedMotorIndex = index
         configFetchIdSeen = 0
         requestConfiguration(false)
@@ -175,13 +152,11 @@ Item {
         }
 
         if (nextPower === 0) {
-            if (testRunning) captureSample("run")
             backendObject.stopMotorTest()
             testRunning = false
             return
         }
 
-        if (!testRunning) captureSample("idle")
         if (testRunning && ((previousPower < 0 && nextPower > 0) || (previousPower > 0 && nextPower < 0))) {
             backendObject.stopMotorTest()
         }
@@ -190,9 +165,8 @@ Item {
         testRunning = true
     }
 
-    function stopTest(captureRun) {
-        const shouldSendStop = captureRun || testRunning || testPowerPercent !== 0
-        if (captureRun && testRunning) captureSample("run")
+    function stopTest() {
+        const shouldSendStop = testRunning || testPowerPercent !== 0
         testPowerPercent = 0
         powerSlider.value = 0
         testRunning = false
@@ -278,30 +252,90 @@ Item {
                         ButtonGroup { id: motorButtonGroup }
 
                         Button {
+                            id: rearMotorButton
                             width: (parent.width - 92) / 3
+                            height: 38
                             text: "Rear"
                             checkable: true
                             checked: selectedMotorIndex === 0
                             ButtonGroup.group: motorButtonGroup
                             onClicked: selectMotor(0)
+
+                            contentItem: Text {
+                                text: rearMotorButton.text
+                                color: rearMotorButton.checked ? "#ffffff" : "#bdcad5"
+                                font.pixelSize: 13
+                                font.bold: rearMotorButton.checked
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+
+                            background: Rectangle {
+                                radius: 7
+                                color: rearMotorButton.checked
+                                    ? "#167a68"
+                                    : (rearMotorButton.hovered ? "#26394a" : "#1a2733")
+                                border.color: rearMotorButton.checked ? "#62e6bd" : "#40566a"
+                                border.width: rearMotorButton.checked ? 2 : 1
+                            }
                         }
 
                         Button {
+                            id: frontLeftMotorButton
                             width: (parent.width - 92) / 3
+                            height: 38
                             text: "Front Left"
                             checkable: true
                             checked: selectedMotorIndex === 1
                             ButtonGroup.group: motorButtonGroup
                             onClicked: selectMotor(1)
+
+                            contentItem: Text {
+                                text: frontLeftMotorButton.text
+                                color: frontLeftMotorButton.checked ? "#ffffff" : "#bdcad5"
+                                font.pixelSize: 13
+                                font.bold: frontLeftMotorButton.checked
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+
+                            background: Rectangle {
+                                radius: 7
+                                color: frontLeftMotorButton.checked
+                                    ? "#167a68"
+                                    : (frontLeftMotorButton.hovered ? "#26394a" : "#1a2733")
+                                border.color: frontLeftMotorButton.checked ? "#62e6bd" : "#40566a"
+                                border.width: frontLeftMotorButton.checked ? 2 : 1
+                            }
                         }
 
                         Button {
+                            id: frontRightMotorButton
                             width: (parent.width - 92) / 3
+                            height: 38
                             text: "Front Right"
                             checkable: true
                             checked: selectedMotorIndex === 2
                             ButtonGroup.group: motorButtonGroup
                             onClicked: selectMotor(2)
+
+                            contentItem: Text {
+                                text: frontRightMotorButton.text
+                                color: frontRightMotorButton.checked ? "#ffffff" : "#bdcad5"
+                                font.pixelSize: 13
+                                font.bold: frontRightMotorButton.checked
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+
+                            background: Rectangle {
+                                radius: 7
+                                color: frontRightMotorButton.checked
+                                    ? "#167a68"
+                                    : (frontRightMotorButton.hovered ? "#26394a" : "#1a2733")
+                                border.color: frontRightMotorButton.checked ? "#62e6bd" : "#40566a"
+                                border.width: frontRightMotorButton.checked ? 2 : 1
+                            }
                         }
                     }
 
@@ -401,7 +435,7 @@ Item {
                             width: 150
                             text: "Stop Motor"
                             enabled: isConnected()
-                            onClicked: stopTest(true)
+                            onClicked: stopTest()
                         }
 
                         Text {
@@ -610,97 +644,6 @@ Item {
                         text: "Estimated from battery telemetry and the configured PWM curve. The waveform shows motor-terminal voltage switching between 0 V and supply voltage; it is not a direct oscilloscope measurement."
                         color: "#8198aa"
                         font.pixelSize: 11
-                    }
-                }
-            }
-
-            Rectangle {
-                width: parent.width
-                height: measurementColumn.implicitHeight + 32
-                radius: 12
-                color: "#111923"
-                border.color: "#33485d"
-                border.width: 1
-
-                Column {
-                    id: measurementColumn
-                    x: 16
-                    y: 16
-                    width: parent.width - 32
-                    spacing: 10
-
-                    Text {
-                        text: "Voltage & Current Change"
-                        color: "#e6ecf2"
-                        font.pixelSize: 17
-                        font.bold: true
-                    }
-
-                    GridLayout {
-                        width: parent.width
-                        columns: 4
-                        columnSpacing: 12
-                        rowSpacing: 8
-
-                        Text { text: ""; Layout.preferredWidth: 78 }
-                        Text {
-                            text: "IDLE"
-                            color: "#7890a3"
-                            font.pixelSize: 11
-                            font.bold: true
-                            Layout.fillWidth: true
-                        }
-                        Text {
-                            text: testRunning ? "RUNNING" : "LAST RUN"
-                            color: testRunning ? "#79d3a6" : "#7890a3"
-                            font.pixelSize: 11
-                            font.bold: true
-                            Layout.fillWidth: true
-                        }
-                        Text {
-                            text: "CHANGE"
-                            color: "#7890a3"
-                            font.pixelSize: 11
-                            font.bold: true
-                            Layout.fillWidth: true
-                        }
-
-                        Text { text: "Voltage"; color: "#aebdca"; font.pixelSize: 13 }
-                        Text { text: formatValue(idleVoltage, 2) + " V"; color: "#dce6ee"; font.pixelSize: 15; font.bold: true }
-                        Text { text: formatValue(runVoltage, 2) + " V"; color: "#dce6ee"; font.pixelSize: 15; font.bold: true }
-                        Text {
-                            text: formatDelta(idleVoltage, runVoltage, 2) + " V"
-                            color: Number.isFinite(idleVoltage) && Number.isFinite(runVoltage) && runVoltage < idleVoltage
-                                ? "#efb76f" : "#79d3a6"
-                            font.pixelSize: 15
-                            font.bold: true
-                        }
-
-                        Text { text: "Current"; color: "#aebdca"; font.pixelSize: 13 }
-                        Text { text: formatValue(idleCurrent, 2) + " A"; color: "#dce6ee"; font.pixelSize: 15; font.bold: true }
-                        Text { text: formatValue(runCurrent, 2) + " A"; color: "#dce6ee"; font.pixelSize: 15; font.bold: true }
-                        Text {
-                            text: formatDelta(idleCurrent, runCurrent, 2) + " A"
-                            color: Number.isFinite(idleCurrent) && Number.isFinite(runCurrent) && runCurrent > idleCurrent
-                                ? "#65b9f2" : "#dce6ee"
-                            font.pixelSize: 15
-                            font.bold: true
-                        }
-                    }
-
-                    Row {
-                        spacing: 10
-
-                        Button { text: "Capture Idle"; onClicked: captureSample("idle") }
-                        Button { text: "Capture Run"; onClicked: captureSample("run") }
-                    }
-
-                    Text {
-                        width: parent.width
-                        wrapMode: Text.WordWrap
-                        text: "Last command: " + (backendState.lastSentLine || "None") + "\nLast response: " + (backendState.lastResponse || backendState.lastSendResult || "None")
-                        color: "#8198aa"
-                        font.pixelSize: 12
                     }
                 }
             }
@@ -1110,7 +1053,6 @@ Item {
 
         function onStateChanged() {
             const connected = isConnected()
-            if (testRunning) captureSample("run")
             if (connected && !configWasConnected) {
                 configConnectionGeneration += 1
                 configFetchIdSeen = 0
