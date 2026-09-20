@@ -66,6 +66,7 @@ Control commands:
 ```text
 CTRL STOP
 CTRL VECTOR <x> <y>
+CTRL MOTION <lateral> <thrust> <yaw>
 CTRL HOLD <ON|OFF>
 CTRL GOTO <lat> <lon>
 ```
@@ -82,6 +83,7 @@ Acknowledgements and errors:
 ```text
 ACK CTRL STOP
 ACK CTRL VECTOR <x> <y>
+ACK CTRL MOTION <lateral> <thrust> <yaw>
 ACK CTRL HOLD <ON|OFF>
 ACK CTRL GOTO <lat> <lon>
 ACK PING
@@ -203,6 +205,7 @@ The production firmware remains the source of truth for active GPIO assignments.
 - Uses grouped motor pins to simplify physical harness routing.
 - Inverts motor polarity in software to match the current water-tested buoy wiring and propeller orientation.
 - Keeps protocol compatibility with existing `CTRL ...`, `PING`, and `REQ STATUS ALL` command flow.
+- Supports `CTRL MOTION <lateral> <thrust> <yaw>` for independent translation and yaw control while retaining `CTRL VECTOR` for translation-only compatibility.
 
 ## ESP32 Bring-Up Test Firmware
 
@@ -247,7 +250,9 @@ The production firmware remains the source of truth for active GPIO assignments.
 - `src/control_station/station/controller.py`
   - Reads controller state from `pygame`.
 - `src/control_station/station/geometry.py`
-  - Converts movement inputs into buoy motor command values.
+  - Converts lateral, forward/reverse, and yaw inputs into buoy motor command values.
+- `src/control_station/station/navigation.py`
+  - Removes slowly changing gravity/tilt from horizontal IMU acceleration and applies bounded direction correction during navigation testing.
 - `src/control_station/station/serial_link.py`
   - Handles Wi-Fi, BLE, and serial communication to the buoy.
 - `src/control_station/station/ui.py`
@@ -266,6 +271,11 @@ The production firmware remains the source of truth for active GPIO assignments.
   - left stick Y for forward and reverse movement
 - Manual command format
   - `CTRL VECTOR <turn> <thrust>`
+  - `CTRL MOTION <lateral> <thrust> <yaw>` when independent yaw is nonzero
+- Navigation-test keyboard input
+  - `W/S`: forward/reverse
+  - `A/D`: left/right translation
+  - left/right arrows: yaw
 - Hello ping mode
   - optional repeated `hello world` messages for Bluetooth link testing
 - Bluetooth auto-discovery

@@ -9,7 +9,7 @@ from .models import ManualCommand
 MOTOR_OUTPUT_BOOST = 2.0
 
 
-def build_manual_command(turn: float, thrust: float) -> ManualCommand:
+def build_manual_command(turn: float, thrust: float, yaw: float = 0.0) -> ManualCommand:
     # Inputs are already -1 to 1 from controller
     raw_x = turn
     raw_y = thrust
@@ -22,25 +22,33 @@ def build_manual_command(turn: float, thrust: float) -> ManualCommand:
     
     desired_x = raw_x
     desired_y = raw_y
+    desired_yaw = clamp_unit(yaw)
 
     rear_axis = (0.0, 1.0)
-    front_left_axis = (-math.sqrt(3) / 2, -0.5)
-    front_right_axis = (math.sqrt(3) / 2, -0.5)
+    # Positive propeller drive pushes the hull away from the motor's radial
+    # vector. The front motors therefore use the opposite lateral sign from
+    # their physical left/right positions. Rear has no lateral component.
+    front_left_axis = (math.sqrt(3) / 2, -0.5)
+    front_right_axis = (-math.sqrt(3) / 2, -0.5)
 
-    rear_motor = (2.0 / 3.0) * (desired_x * rear_axis[0] + desired_y * rear_axis[1])
-    front_left_motor = (2.0 / 3.0) * (
+    rear_motor = ((2.0 / 3.0) * (desired_x * rear_axis[0] + desired_y * rear_axis[1]) * MOTOR_OUTPUT_BOOST) + desired_yaw
+    front_left_motor = ((2.0 / 3.0) * (
         desired_x * front_left_axis[0] + desired_y * front_left_axis[1]
-    )
-    front_right_motor = (2.0 / 3.0) * (
+    ) * MOTOR_OUTPUT_BOOST) + desired_yaw
+    front_right_motor = ((2.0 / 3.0) * (
         desired_x * front_right_axis[0] + desired_y * front_right_axis[1]
-    )
+    ) * MOTOR_OUTPUT_BOOST) + desired_yaw
+
+    max_motor_magnitude = max(abs(rear_motor), abs(front_left_motor), abs(front_right_motor))
+    motor_scale = 1.0 / max_motor_magnitude if desired_yaw != 0.0 and max_motor_magnitude > 1.0 else 1.0
 
     return ManualCommand(
         turn=int(round(desired_x * 100)),
         thrust=int(round(desired_y * 100)),
-        rear_motor=int(round(clamp_unit(rear_motor * MOTOR_OUTPUT_BOOST) * 100)),
-        front_left_motor=int(round(clamp_unit(front_left_motor * MOTOR_OUTPUT_BOOST) * 100)),
-        front_right_motor=int(round(clamp_unit(front_right_motor * MOTOR_OUTPUT_BOOST) * 100)),
+        rear_motor=int(round(clamp_unit(rear_motor * motor_scale) * 100)),
+        front_left_motor=int(round(clamp_unit(front_left_motor * motor_scale) * 100)),
+        front_right_motor=int(round(clamp_unit(front_right_motor * motor_scale) * 100)),
+        yaw=int(round(desired_yaw * 100)),
     )
 
 

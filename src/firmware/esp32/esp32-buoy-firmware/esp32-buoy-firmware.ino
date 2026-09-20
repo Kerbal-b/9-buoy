@@ -20,10 +20,12 @@
 // ---------------------------------------------------------------------------
 
 // Motor pins matched to the current ESP32 wiring plan.
-const int FRONT_LEFT_DIR_PIN = 18;
-const int FRONT_LEFT_PWM_PIN = 19;
-const int FRONT_RIGHT_DIR_PIN = 21;
-const int FRONT_RIGHT_PWM_PIN = 22;
+// Bench testing confirmed the two front motor channels are physically crossed:
+// GPIO21/22 drives the left motor and GPIO18/19 drives the right motor.
+const int FRONT_LEFT_DIR_PIN = 21;
+const int FRONT_LEFT_PWM_PIN = 22;
+const int FRONT_RIGHT_DIR_PIN = 18;
+const int FRONT_RIGHT_PWM_PIN = 19;
 const int REAR_DIR_PIN = 32;
 const int REAR_PWM_PIN = 33;
 
@@ -57,7 +59,7 @@ const int GPS_TX_PIN = 17;
 
 const long SERIAL_BAUDRATE = 115200;
 const long GPS_BAUDRATE = 9600;
-const char* const FIRMWARE_BANNER = "ESP32_FW_2026_05_16";
+const char* const FIRMWARE_BANNER = "ESP32_FW_2026_09_19";
 const char* const WIFI_STA_SSID = "Bouy";
 const char* const WIFI_STA_PASSWORD = "SuperMonkey";
 const uint16_t WIFI_TCP_PORT = 5000;
@@ -95,6 +97,7 @@ const uint32_t RANGE_STREAM_INTERVAL_MS = 250;
 const uint32_t WATER_TEMP_STREAM_INTERVAL_MS = 2000;
 const uint32_t POWER_STREAM_INTERVAL_MS = 500;
 const uint32_t STATE_STREAM_INTERVAL_MS = 500;
+const uint32_t MOTOR_OUTPUT_STREAM_INTERVAL_MS = 100;
 const uint32_t GPS_STREAM_INTERVAL_MS = 500;
 const uint32_t AUDIO_STREAM_INTERVAL_MS = 20;
 const size_t TCP_COMMAND_BUFFER_LIMIT = 96;
@@ -219,16 +222,18 @@ struct __attribute__((packed)) AudioPacketHeader {
 MotorChannel motors[] = {
   // Rear motor is the first tuning target. Adjust these values before
   // changing the front motors if the drivetrain is being balanced.
-  {REAR_PWM_PIN, REAR_DIR_PIN, REAR_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, false, 10, 150, 96, 260, 260, 150, 76, 255, 255, 2.00f, 1.25f, 1.00f, 1.00f, 0, 0, 10, 180},
-  {FRONT_LEFT_PWM_PIN, FRONT_LEFT_DIR_PIN, FRONT_LEFT_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, true, 10, 92, 92, 240, 240, 70, 70, 255, 255, 1.20f, 1.20f, 1.00f, 1.00f, 0, 0, 120, 190},
-  {FRONT_RIGHT_PWM_PIN, FRONT_RIGHT_DIR_PIN, FRONT_RIGHT_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, false, 10, 150, 150, 260, 260, 150, 150, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 10, 10},
+  {REAR_PWM_PIN, REAR_DIR_PIN, REAR_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, false, 0, 171, 171, 260, 260, 130, 130, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 125, 125},
+  {FRONT_LEFT_PWM_PIN, FRONT_LEFT_DIR_PIN, FRONT_LEFT_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, false, 0, 171, 171, 260, 260, 130, 130, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 125, 125},
+  {FRONT_RIGHT_PWM_PIN, FRONT_RIGHT_DIR_PIN, FRONT_RIGHT_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, true, 0, 171, 171, 260, 260, 130, 130, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 125, 125},
 };
 
 const int MOTOR_COUNT = sizeof(motors) / sizeof(motors[0]);
 
 const float rear_axis[2] = {0.0, 1.0};
-const float front_left_axis[2] = {-0.86602540378, -0.5};
-const float front_right_axis[2] = {0.86602540378, -0.5};
+// Positive drive pushes the buoy away from each motor's radial vector, so
+// only the angled motors' lateral coefficients oppose their hull positions.
+const float front_left_axis[2] = {0.86602540378, -0.5};
+const float front_right_axis[2] = {-0.86602540378, -0.5};
 const float* motor_axes[3] = {rear_axis, front_left_axis, front_right_axis};
 
 // ---------------------------------------------------------------------------
@@ -243,6 +248,7 @@ double gpsLongitude = 0.0;
 
 int driveValues[] = {0, 0, 0};
 int targetDriveValues[] = {0, 0, 0};
+int appliedMotorPwm[] = {0, 0, 0};
 bool motorPwmAttached[] = {false, false, false};
 bool motorStartBoostPending[] = {false, false, false};
 uint32_t motorStartBoostUntilMs[] = {0, 0, 0};
@@ -270,6 +276,7 @@ uint32_t lastRangeStreamMs = 0;
 uint32_t lastWaterTempStreamMs = 0;
 uint32_t lastPowerStreamMs = 0;
 uint32_t lastStateStreamMs = 0;
+uint32_t lastMotorOutputStreamMs = 0;
 uint32_t lastGpsStreamMs = 0;
 uint32_t lastAudioStreamMs = 0;
 uint32_t lastDs18b20RequestMs = 0;
@@ -301,6 +308,7 @@ void sendUdpImuTelemetry();
 void sendUdpRangeTelemetry();
 void sendUdpPowerTelemetry();
 void sendUdpStateTelemetry();
+void sendMotorOutputTelemetry();
 void sendUdpGpsTelemetry();
 void sendUdpAudioTelemetry();
 
@@ -412,6 +420,22 @@ bool motorsEnabled() {
     }
   }
   return false;
+}
+
+void sendMotorOutputTelemetry() {
+  if (!controlClientConnected()) {
+    return;
+  }
+  tcpClient.print("TEL MOTOR OUT ");
+  for (int i = 0; i < MOTOR_COUNT; i++) {
+    if (i > 0) {
+      tcpClient.print(" ");
+    }
+    tcpClient.print(driveValues[i]);
+    tcpClient.print(" ");
+    tcpClient.print(appliedMotorPwm[i]);
+  }
+  tcpClient.print("\n");
 }
 
 void sendStatusSnapshot() {
@@ -667,15 +691,26 @@ void processTcpControl() {
 // Motor Control
 // ---------------------------------------------------------------------------
 
-void computeMotorThrusts(float turn, float thrust, int* thrusts) {
+void computeMotorThrusts(float lateral, float thrust, float yaw, int* thrusts) {
+  float mixedThrusts[3];
+  float maxMagnitude = 0.0f;
   for (int i = 0; i < MOTOR_COUNT; i++) {
     const MotorChannel& motor = motors[i];
     float motorThrust = (2.0 / 3.0) * (
-      (turn * motor_axes[i][0] * motor.mixTurnGain) +
+      (lateral * motor_axes[i][0] * motor.mixTurnGain) +
       (thrust * motor_axes[i][1] * motor.mixThrustGain)
-    );
+    ) * MOTOR_OUTPUT_BOOST;
+    // Equal signed thrust produces the rotational component in the
+    // three-channel 120-degree layout while translation forces cancel.
+    motorThrust += yaw;
     motorThrust += motor.mixBias;
-    motorThrust = clampf(motorThrust, -1.0, 1.0);
+    mixedThrusts[i] = motorThrust;
+    maxMagnitude = max(maxMagnitude, abs(motorThrust));
+  }
+
+  float outputScale = (yaw != 0.0f && maxMagnitude > 1.0f) ? (1.0f / maxMagnitude) : 1.0f;
+  for (int i = 0; i < MOTOR_COUNT; i++) {
+    float motorThrust = clampf(mixedThrusts[i] * outputScale, -1.0f, 1.0f);
     thrusts[i] = round(motorThrust * MOTOR_OUTPUT_LIMIT);
   }
 }
@@ -734,6 +769,7 @@ void applyMotorOutput(const MotorChannel& motor, int driveValue) {
   }
 
   int pwmValue = computeMotorPwm(motorIndex, motor, driveValue);
+  appliedMotorPwm[motorIndex] = pwmValue;
 
   if (pwmValue == 0) {
     if (motorPwmAttached[motor.pwmChannel]) {
@@ -807,26 +843,35 @@ void setMotorDrive(int motorIndex, int driveValue) {
   if (constrainedDrive == 0) {
     motorStartBoostPending[motorIndex] = false;
     motorStartBoostUntilMs[motorIndex] = 0;
-  } else if (driveValues[motorIndex] == 0) {
+  } else if (
+    driveValues[motorIndex] == 0 ||
+    ((driveValues[motorIndex] > 0) != (constrainedDrive > 0))
+  ) {
     motorStartBoostPending[motorIndex] = true;
+    motorStartBoostUntilMs[motorIndex] = 0;
   }
 }
 
-void applyVectorCommand(int turn, int thrust) {
-  float turnf = turn / static_cast<float>(VECTOR_SCALE);
+void applyMotionCommand(int lateral, int thrust, int yaw) {
+  float lateralf = lateral / static_cast<float>(VECTOR_SCALE);
   float thrustf = thrust / static_cast<float>(VECTOR_SCALE);
+  float yawf = yaw / static_cast<float>(VECTOR_SCALE);
 
-  if (turn == 0 && thrust == 0) {
+  if (lateral == 0 && thrust == 0 && yaw == 0) {
     stopAllMotors();
     return;
   }
 
   int thrusts[3];
-  computeMotorThrusts(turnf, thrustf, thrusts);
+  computeMotorThrusts(lateralf, thrustf, yawf, thrusts);
 
   for (int i = 0; i < MOTOR_COUNT; i++) {
     setMotorDrive(i, thrusts[i]);
   }
+}
+
+void applyVectorCommand(int turn, int thrust) {
+  applyMotionCommand(turn, thrust, 0);
 }
 
 void stopAllMotors() {
@@ -857,6 +902,13 @@ void updateMotorRamps() {
     int currentDrive = driveValues[i];
     int targetDrive = targetDriveValues[i];
     if (currentDrive == targetDrive) {
+      // Re-apply the steady-state curve when a short move reaches its target
+      // before the start boost expires. Otherwise the last boost PWM can stay
+      // latched indefinitely even though the configured boost time elapsed.
+      if (motorStartBoostUntilMs[i] != 0 && nowMs >= motorStartBoostUntilMs[i]) {
+        motorStartBoostUntilMs[i] = 0;
+        applyMotorOutput(motors[i], currentDrive);
+      }
       continue;
     }
 
@@ -874,7 +926,11 @@ void updateMotorRamps() {
     }
 
     driveValues[i] = currentDrive;
-    if (currentDrive != 0 && motorStartBoostPending[i]) {
+    if (
+      motorStartBoostPending[i] &&
+      abs(currentDrive) > motor.commandDeadband &&
+      ((currentDrive > 0) == (targetDrive > 0))
+    ) {
       activateMotorStartBoost(i);
     }
     applyMotorOutput(motors[i], currentDrive);
@@ -1202,14 +1258,7 @@ void applyDirectMotorDrive(int motorIndex, int driveValue) {
 
   for (int i = 0; i < MOTOR_COUNT; i++) {
     int appliedDrive = i == motorIndex ? clampedDriveValue : 0;
-    targetDriveValues[i] = appliedDrive;
-    driveValues[i] = appliedDrive;
-    motorStartBoostPending[i] = false;
-    motorStartBoostUntilMs[i] = 0;
-    if (appliedDrive != 0) {
-      activateMotorStartBoost(i);
-    }
-    applyMotorOutput(motors[i], appliedDrive);
+    setMotorDrive(i, appliedDrive);
   }
 }
 
@@ -1219,14 +1268,7 @@ void applyDirectMotorDriveAll(int driveValue) {
   holdPositionEnabled = false;
 
   for (int i = 0; i < MOTOR_COUNT; i++) {
-    targetDriveValues[i] = clampedDriveValue;
-    driveValues[i] = clampedDriveValue;
-    motorStartBoostPending[i] = false;
-    motorStartBoostUntilMs[i] = 0;
-    if (clampedDriveValue != 0) {
-      activateMotorStartBoost(i);
-    }
-    applyMotorOutput(motors[i], clampedDriveValue);
+    setMotorDrive(i, clampedDriveValue);
   }
 }
 
@@ -1397,6 +1439,47 @@ void handleControlCommand(String command) {
     return;
   }
 
+  if (command.startsWith("CTRL MOTOR PERCENT ")) {
+    String payload = command.substring(19);
+    payload.trim();
+
+    char motorName[20];
+    int powerPercent = 0;
+    if (sscanf(payload.c_str(), "%19s %d", motorName, &powerPercent) != 2) {
+      emitLine("ERR BAD CTRL MOTOR PERCENT");
+      return;
+    }
+    if (powerPercent < -100 || powerPercent > 100) {
+      emitLine("ERR RANGE CTRL MOTOR PERCENT");
+      return;
+    }
+
+    String motorNameText = String(motorName);
+    int motorIndex = motorIndexFromName(motorNameText);
+    if (motorIndex < 0) {
+      emitLine("ERR BAD CTRL MOTOR NAME");
+      return;
+    }
+
+    int drive = static_cast<int>(round(powerPercent * MOTOR_OUTPUT_LIMIT / 100.0f));
+    if (motorIndex == MOTOR_COUNT) {
+      if (drive == 0) {
+        stopAllMotors();
+        controlMode = CONTROL_MODE_IDLE;
+        holdPositionEnabled = false;
+      } else {
+        applyDirectMotorDriveAll(drive);
+      }
+    } else {
+      applyDirectMotorDrive(motorIndex, drive);
+    }
+    emitLine(
+      "ACK CTRL MOTOR PERCENT " + motorNameText + " " + String(powerPercent) +
+      " DRIVE " + String(drive)
+    );
+    return;
+  }
+
   if (command.startsWith("CTRL MOTOR ")) {
     String payload = command.substring(11);
     payload.trim();
@@ -1474,19 +1557,40 @@ void handleControlCommand(String command) {
     return;
   }
 
-  int turn = 0;
+  int lateral = 0;
   int thrust = 0;
-  int vectorMatched = sscanf(command.c_str(), "CTRL VECTOR %d %d", &turn, &thrust);
+  int yaw = 0;
+  int motionMatched = sscanf(command.c_str(), "CTRL MOTION %d %d %d", &lateral, &thrust, &yaw);
+  if (motionMatched == 3) {
+    if (
+      lateral < -100 || lateral > 100 ||
+      thrust < -100 || thrust > 100 ||
+      yaw < -100 || yaw > 100
+    ) {
+      emitLine("ERR RANGE CTRL MOTION");
+      return;
+    }
+
+    applyMotionCommand(lateral, thrust, yaw);
+    controlMode = CONTROL_MODE_MANUAL;
+    holdPositionEnabled = false;
+    emitLine(
+      "ACK CTRL MOTION " + String(lateral) + " " + String(thrust) + " " + String(yaw)
+    );
+    return;
+  }
+
+  int vectorMatched = sscanf(command.c_str(), "CTRL VECTOR %d %d", &lateral, &thrust);
   if (vectorMatched == 2) {
-    if (turn < -100 || turn > 100 || thrust < -100 || thrust > 100) {
+    if (lateral < -100 || lateral > 100 || thrust < -100 || thrust > 100) {
       emitLine("ERR RANGE CTRL VECTOR");
       return;
     }
 
-    applyVectorCommand(turn, thrust);
+    applyVectorCommand(lateral, thrust);
     controlMode = CONTROL_MODE_MANUAL;
     holdPositionEnabled = false;
-    emitLine("ACK CTRL VECTOR " + String(turn) + " " + String(thrust));
+    emitLine("ACK CTRL VECTOR " + String(lateral) + " " + String(thrust));
     return;
   }
 
@@ -1591,6 +1695,10 @@ void loop() {
   if (controlClientConnected() && (nowMs - lastStateStreamMs >= STATE_STREAM_INTERVAL_MS)) {
     lastStateStreamMs = nowMs;
     sendUdpStateTelemetry();
+  }
+  if (controlClientConnected() && (nowMs - lastMotorOutputStreamMs >= MOTOR_OUTPUT_STREAM_INTERVAL_MS)) {
+    lastMotorOutputStreamMs = nowMs;
+    sendMotorOutputTelemetry();
   }
   if (controlClientConnected() && (nowMs - lastGpsStreamMs >= GPS_STREAM_INTERVAL_MS)) {
     lastGpsStreamMs = nowMs;

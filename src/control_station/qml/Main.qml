@@ -39,6 +39,7 @@ ApplicationWindow {
         if (tab === "map") return 2
         if (tab === "analysis") return 3
         if (tab === "motors") return 4
+        if (tab === "navigation") return 5
         return 0
     }
 
@@ -47,6 +48,7 @@ ApplicationWindow {
         if (index === 2) return "map"
         if (index === 3) return "analysis"
         if (index === 4) return "motors"
+        if (index === 5) return "navigation"
         return "science"
     }
 
@@ -179,6 +181,9 @@ ApplicationWindow {
     }
 
     function handleKey(event, pressed) {
+        if (!Boolean(s.keyboardDriveEnabled)) {
+            return false
+        }
         const name = keyName(event.key)
         if (!name) {
             return false
@@ -218,91 +223,349 @@ ApplicationWindow {
             x: 20
             y: 16
             text: "Buoy View"
-            color: "#e6ecf2"
-            font.pixelSize: 28
+            color: "#f4f8fb"
+            font.pixelSize: 27
             font.bold: true
         }
 
         Text {
             x: 20
             y: 50
-            text: "Turn " + s.turn + "%  Thrust " + s.thrust + "%"
-            color: "#9eb5c7"
-            font.pixelSize: 14
+            text: "LATERAL  " + s.turn + "%    |    THRUST  " + s.thrust + "%    |    YAW  " + (s.yaw || 0) + "%"
+            color: "#7f99ad"
+            font.pixelSize: 11
+            font.bold: true
+        }
+
+        Rectangle {
+            x: parent.width - 116
+            y: 18
+            width: 96
+            height: 24
+            radius: 12
+            color: "#132b2a"
+            border.color: "#285c51"
+
+            Rectangle {
+                x: 10
+                anchors.verticalCenter: parent.verticalCenter
+                width: 6
+                height: 6
+                radius: 3
+                color: "#3ddc97"
+            }
+
+            Text {
+                x: 23
+                anchors.verticalCenter: parent.verticalCenter
+                text: "MOTOR MIX"
+                color: "#8ce7c1"
+                font.pixelSize: 9
+                font.bold: true
+            }
         }
 
         Canvas {
             id: buoyCanvas
-            anchors.fill: parent
-            anchors.margins: 40
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.leftMargin: 24
+            anchors.rightMargin: 24
+            anchors.topMargin: 82
+            anchors.bottomMargin: 18
             onPaint: {
                 const ctx = getContext("2d")
                 ctx.reset()
                 ctx.clearRect(0, 0, width, height)
 
                 const cx = width / 2
-                const cy = height / 2 + 10
-                const scale = 120
+                const hullCy = height * 0.45
                 const turn = clamp(s.turn / 100.0, -1, 1)
                 const thrust = clamp(s.thrust / 100.0, -1, 1)
+                const yaw = clamp((Number(s.yaw) || 0) / 100.0, -1, 1)
+                const frontOffsetX = Math.min(100, width * 0.23)
+                const frontOffsetY = 40
+                const rearOffsetY = 95
+                const frontLeft = [cx - frontOffsetX, hullCy - frontOffsetY]
+                const frontRight = [cx + frontOffsetX, hullCy - frontOffsetY]
+                const rear = [cx, hullCy + rearOffsetY]
+                const motorRadius = 28
 
-                ctx.lineWidth = 1
-                ctx.strokeStyle = "#3a4d61"
-                ctx.beginPath()
-                ctx.arc(cx, cy, 110, 0, Math.PI * 2)
-                ctx.stroke()
-
-                ctx.beginPath()
-                ctx.moveTo(cx - 110, cy)
-                ctx.lineTo(cx + 110, cy)
-                ctx.moveTo(cx, cy - 110)
-                ctx.lineTo(cx, cy + 110)
-                ctx.stroke()
-
-                const points = [
-                    [cx, cy + 72],
-                    [cx - 66, cy - 38],
-                    [cx + 66, cy - 38]
-                ]
-
-                ctx.fillStyle = "#3d4c5f"
-                ctx.strokeStyle = "#3a4d61"
-                ctx.lineWidth = 2
-                ctx.beginPath()
-                ctx.moveTo(points[0][0], points[0][1])
-                ctx.lineTo(points[1][0], points[1][1])
-                ctx.lineTo(points[2][0], points[2][1])
-                ctx.closePath()
-                ctx.fill()
-                ctx.stroke()
-
-                function motor(x, y, value) {
-                    const radius = 16 + Math.abs(value) * 0.12
-                    ctx.beginPath()
-                    ctx.fillStyle = value >= 0 ? "#3ddc97" : "#ffaa46"
-                    ctx.arc(x, y, radius, 0, Math.PI * 2)
-                    ctx.fill()
-                    ctx.strokeStyle = "#e6ecf2"
-                    ctx.lineWidth = 2
-                    ctx.stroke()
+                function signedValue(value) {
+                    const numericValue = Number(value) || 0
+                    return (numericValue > 0 ? "+" : "") + Math.round(numericValue)
                 }
 
-                motor(points[0][0], points[0][1], s.rearMotor || 0)
-                motor(points[1][0], points[1][1], s.frontLeftMotor || 0)
-                motor(points[2][0], points[2][1], s.frontRightMotor || 0)
+                function usageColor(value) {
+                    if (value > 0) return "#3ddc97"
+                    if (value < 0) return "#ffaa46"
+                    return "#60788d"
+                }
 
-                ctx.strokeStyle = "#50aaff"
-                ctx.lineWidth = 6
+                function roundedRect(x, y, rectWidth, rectHeight, radius) {
+                    const r = Math.min(radius, rectWidth / 2, rectHeight / 2)
+                    ctx.beginPath()
+                    ctx.moveTo(x + r, y)
+                    ctx.lineTo(x + rectWidth - r, y)
+                    ctx.quadraticCurveTo(x + rectWidth, y, x + rectWidth, y + r)
+                    ctx.lineTo(x + rectWidth, y + rectHeight - r)
+                    ctx.quadraticCurveTo(x + rectWidth, y + rectHeight, x + rectWidth - r, y + rectHeight)
+                    ctx.lineTo(x + r, y + rectHeight)
+                    ctx.quadraticCurveTo(x, y + rectHeight, x, y + rectHeight - r)
+                    ctx.lineTo(x, y + r)
+                    ctx.quadraticCurveTo(x, y, x + r, y)
+                    ctx.closePath()
+                }
+
+                function drawVerticalUsageBar(x, y, barHeight, value) {
+                    const magnitude = clamp(Math.abs(Number(value) || 0) / 100.0, 0, 1)
+                    const barWidth = 10
+                    roundedRect(x, y, barWidth, barHeight, 5)
+                    ctx.fillStyle = "#0a121b"
+                    ctx.fill()
+                    ctx.strokeStyle = "#31485a"
+                    ctx.lineWidth = 1
+                    ctx.stroke()
+                    if (magnitude > 0) {
+                        const fillHeight = (barHeight - 4) * magnitude
+                        roundedRect(x + 2, y + barHeight - fillHeight - 2, barWidth - 4, fillHeight, 3)
+                        ctx.fillStyle = usageColor(value)
+                        ctx.fill()
+                    }
+                    ctx.fillStyle = "#466075"
+                    ctx.fillRect(x + 2, y + barHeight / 2, barWidth - 4, 1)
+                }
+
+                function drawHorizontalUsageBar(x, y, barWidth, value) {
+                    const magnitude = clamp(Math.abs(Number(value) || 0) / 100.0, 0, 1)
+                    const barHeight = 10
+                    roundedRect(x, y, barWidth, barHeight, 5)
+                    ctx.fillStyle = "#0a121b"
+                    ctx.fill()
+                    ctx.strokeStyle = "#31485a"
+                    ctx.lineWidth = 1
+                    ctx.stroke()
+                    if (magnitude > 0) {
+                        const fillWidth = (barWidth - 4) * magnitude
+                        roundedRect(x + 2, y + 2, fillWidth, barHeight - 4, 3)
+                        ctx.fillStyle = usageColor(value)
+                        ctx.fill()
+                    }
+                    ctx.fillStyle = "#466075"
+                    ctx.fillRect(x + barWidth / 2, y + 2, 1, barHeight - 4)
+                }
+
+                function drawMotor(point, value, pwm, label, labelX, labelY) {
+                    const magnitude = clamp(Math.abs(Number(value) || 0) / 100.0, 0, 1)
+                    const color = usageColor(value)
+
+                    ctx.save()
+                    ctx.shadowColor = value === 0 ? "transparent" : color
+                    ctx.shadowBlur = value === 0 ? 0 : 9
+                    ctx.beginPath()
+                    ctx.fillStyle = "#0b141e"
+                    ctx.arc(point[0], point[1], motorRadius + 2, 0, Math.PI * 2)
+                    ctx.fill()
+                    ctx.restore()
+
+                    ctx.beginPath()
+                    ctx.strokeStyle = "#385064"
+                    ctx.lineWidth = 3
+                    ctx.arc(point[0], point[1], motorRadius, 0, Math.PI * 2)
+                    ctx.stroke()
+
+                    if (magnitude > 0) {
+                        ctx.beginPath()
+                        ctx.strokeStyle = color
+                        ctx.lineWidth = 4
+                        ctx.lineCap = "round"
+                        ctx.arc(point[0], point[1], motorRadius, -Math.PI / 2,
+                                -Math.PI / 2 + Math.PI * 2 * magnitude)
+                        ctx.stroke()
+                        ctx.lineCap = "butt"
+                    }
+
+                    const motorGradient = ctx.createRadialGradient(
+                        point[0] - 7, point[1] - 9, 2,
+                        point[0], point[1], motorRadius - 5
+                    )
+                    motorGradient.addColorStop(0, "#203346")
+                    motorGradient.addColorStop(1, "#101b27")
+                    ctx.beginPath()
+                    ctx.fillStyle = motorGradient
+                    ctx.arc(point[0], point[1], motorRadius - 6, 0, Math.PI * 2)
+                    ctx.fill()
+
+                    ctx.fillStyle = "#f4f8fb"
+                    ctx.font = "bold 12px sans-serif"
+                    ctx.textAlign = "center"
+                    ctx.textBaseline = "middle"
+                    ctx.fillText(signedValue(value) + "%", point[0], point[1] - 6)
+
+                    ctx.fillStyle = value === 0 ? "#6f8799" : color
+                    ctx.font = "bold 8px sans-serif"
+                    const pwmNumber = Number(pwm)
+                    const pwmText = Number.isFinite(pwmNumber) && pwmNumber >= 0 ? Math.round(pwmNumber) : "--"
+                    ctx.fillText("PWM A " + pwmText, point[0], point[1] + 10)
+
+                    ctx.fillStyle = "#8ca3b5"
+                    ctx.font = "bold 9px sans-serif"
+                    ctx.textBaseline = "alphabetic"
+                    ctx.fillText(label, labelX, labelY)
+                }
+
+                // Hull outline and motor arms follow the measured current layout:
+                // front centers are approximately +/-97 mm by -42 mm, rear is +100 mm.
+                const hullGradient = ctx.createRadialGradient(cx - 20, hullCy - 24, 5, cx, hullCy, 72)
+                hullGradient.addColorStop(0, "#20364a")
+                hullGradient.addColorStop(0.65, "#152534")
+                hullGradient.addColorStop(1, "#0f1b27")
                 ctx.beginPath()
-                ctx.moveTo(cx, cy)
-                ctx.lineTo(cx + turn * scale, cy - thrust * scale)
+                ctx.fillStyle = hullGradient
+                ctx.arc(cx, hullCy, 68, 0, Math.PI * 2)
+                ctx.fill()
+                ctx.strokeStyle = "#3b5a70"
+                ctx.lineWidth = 2
                 ctx.stroke()
-                ctx.fillStyle = "#50aaff"
+
                 ctx.beginPath()
-                ctx.arc(cx + turn * scale, cy - thrust * scale, 8, 0, Math.PI * 2)
+                ctx.strokeStyle = "#263f52"
+                ctx.lineWidth = 1
+                ctx.arc(cx, hullCy, 58, 0, Math.PI * 2)
+                ctx.stroke()
+
+                ctx.strokeStyle = "#476176"
+                ctx.lineWidth = 6
+                ctx.lineCap = "round"
+                ctx.beginPath()
+                ctx.moveTo(cx - 34, hullCy - 45)
+                ctx.lineTo(frontLeft[0] + 16, frontLeft[1] + 10)
+                ctx.moveTo(cx + 34, hullCy - 45)
+                ctx.lineTo(frontRight[0] - 16, frontRight[1] + 10)
+                ctx.moveTo(cx, hullCy + 58)
+                ctx.lineTo(rear[0], rear[1] - 22)
+                ctx.stroke()
+                ctx.lineCap = "butt"
+
+                // Yaw is rotational, so visualize it independently from the
+                // blue translation vector as a direction-aware arc on the hull.
+                const yawMagnitude = Math.abs(yaw)
+                const yawRadius = 51
+                const yawStartAngle = -Math.PI * 0.75
+                if (yawMagnitude > 0.005) {
+                    const yawSweep = yawMagnitude * Math.PI * 1.5
+                    const yawEndAngle = yawStartAngle + (yaw > 0 ? yawSweep : -yawSweep)
+                    const yawColor = "#c58cff"
+
+                    ctx.save()
+                    ctx.shadowColor = yawColor
+                    ctx.shadowBlur = 8
+                    ctx.beginPath()
+                    ctx.strokeStyle = yawColor
+                    ctx.lineWidth = 5
+                    ctx.lineCap = "round"
+                    ctx.arc(cx, hullCy, yawRadius, yawStartAngle, yawEndAngle, yaw < 0)
+                    ctx.stroke()
+                    ctx.restore()
+
+                    const yawEndX = cx + Math.cos(yawEndAngle) * yawRadius
+                    const yawEndY = hullCy + Math.sin(yawEndAngle) * yawRadius
+                    const tangentAngle = yawEndAngle + (yaw > 0 ? Math.PI / 2 : -Math.PI / 2)
+                    ctx.fillStyle = yawColor
+                    ctx.beginPath()
+                    ctx.moveTo(yawEndX, yawEndY)
+                    ctx.lineTo(
+                        yawEndX - 10 * Math.cos(tangentAngle - 0.48),
+                        yawEndY - 10 * Math.sin(tangentAngle - 0.48)
+                    )
+                    ctx.lineTo(
+                        yawEndX - 10 * Math.cos(tangentAngle + 0.48),
+                        yawEndY - 10 * Math.sin(tangentAngle + 0.48)
+                    )
+                    ctx.closePath()
+                    ctx.fill()
+                }
+
+                // Requested movement vector remains centered on the hull.
+                const vectorScale = 58
+                const vectorEndX = cx + turn * vectorScale
+                const vectorEndY = hullCy - thrust * vectorScale
+                const vectorDx = vectorEndX - cx
+                const vectorDy = vectorEndY - hullCy
+                const vectorMagnitude = Math.sqrt(vectorDx * vectorDx + vectorDy * vectorDy)
+                ctx.strokeStyle = "#55b7ff"
+                ctx.lineWidth = 4
+                if (vectorMagnitude > 2) {
+                    ctx.beginPath()
+                    ctx.moveTo(cx, hullCy)
+                    ctx.lineTo(vectorEndX, vectorEndY)
+                    ctx.stroke()
+
+                    const angle = Math.atan2(vectorDy, vectorDx)
+                    ctx.fillStyle = "#55b7ff"
+                    ctx.beginPath()
+                    ctx.moveTo(vectorEndX, vectorEndY)
+                    ctx.lineTo(vectorEndX - 10 * Math.cos(angle - 0.5), vectorEndY - 10 * Math.sin(angle - 0.5))
+                    ctx.lineTo(vectorEndX - 10 * Math.cos(angle + 0.5), vectorEndY - 10 * Math.sin(angle + 0.5))
+                    ctx.closePath()
+                    ctx.fill()
+                }
+
+                ctx.fillStyle = "#55b7ff"
+                ctx.beginPath()
+                ctx.arc(cx, hullCy, 5, 0, Math.PI * 2)
+                ctx.fill()
+
+                ctx.textAlign = "center"
+                ctx.textBaseline = "middle"
+                ctx.font = "bold 9px sans-serif"
+                ctx.fillStyle = yawMagnitude > 0.005 ? "#d8b8ff" : "#60788d"
+                ctx.fillText("YAW " + signedValue(Number(s.yaw) || 0) + "%", cx, hullCy + 41)
+
+                drawVerticalUsageBar(frontLeft[0] - 45, frontLeft[1] - 39, 78, s.frontLeftMotor || 0)
+                drawVerticalUsageBar(frontRight[0] + 35, frontRight[1] - 39, 78, s.frontRightMotor || 0)
+                drawHorizontalUsageBar(rear[0] - 70, rear[1] + 37, 140, s.rearMotor || 0)
+
+                drawMotor(frontLeft, s.frontLeftMotor || 0, s.frontLeftMotorPwm || 0,
+                          "FRONT LEFT", frontLeft[0], frontLeft[1] + 43)
+                drawMotor(frontRight, s.frontRightMotor || 0, s.frontRightMotorPwm || 0,
+                          "FRONT RIGHT", frontRight[0], frontRight[1] + 43)
+                drawMotor(rear, s.rearMotor || 0, s.rearMotorPwm || 0,
+                          "REAR", rear[0] + 48, rear[1] + 4)
+
+                const rearPwm = Math.max(0, Math.round(Number(s.rearMotorPwm) || 0))
+                const leftPwm = Math.max(0, Math.round(Number(s.frontLeftMotorPwm) || 0))
+                const rightPwm = Math.max(0, Math.round(Number(s.frontRightMotorPwm) || 0))
+                const activeMotors = (rearPwm > 0 ? 1 : 0) + (leftPwm > 0 ? 1 : 0) + (rightPwm > 0 ? 1 : 0)
+                const totalPwm = rearPwm + leftPwm + rightPwm
+                const measuredCurrent = currentDrawValue()
+
+                ctx.font = "bold 8px sans-serif"
+                ctx.textAlign = "left"
+                ctx.textBaseline = "middle"
+                ctx.fillStyle = "#71899b"
+                let demandText = Boolean(s.motorOutputTelemetry)
+                    ? activeMotors + " ACTIVE  |  ACTUAL PWM " + totalPwm
+                    : "WAITING FOR MOTOR OUTPUT"
+                if (Number.isFinite(measuredCurrent)) demandText += "  |  " + Math.abs(measuredCurrent).toFixed(1) + " A"
+                ctx.fillText(demandText, 2, height - 5)
+
+                ctx.textAlign = "right"
+                ctx.fillStyle = "#7890a3"
+                ctx.fillText("FWD", width - 62, height - 5)
+                ctx.fillStyle = "#3ddc97"
+                ctx.beginPath()
+                ctx.arc(width - 86, height - 5, 3, 0, Math.PI * 2)
+                ctx.fill()
+                ctx.fillStyle = "#7890a3"
+                ctx.fillText("REV", width - 4, height - 5)
+                ctx.fillStyle = "#ffaa46"
+                ctx.beginPath()
+                ctx.arc(width - 29, height - 5, 3, 0, Math.PI * 2)
                 ctx.fill()
             }
-
         }
 
     }
@@ -450,15 +713,71 @@ ApplicationWindow {
                         font.bold: true
                     }            }
         }
+
+        Rectangle {
+            width: parent.width
+            height: 54
+            radius: 10
+            color: "#0f1722"
+            border.color: "#395166"
+
+            Text {
+                x: 12
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Control"
+                color: "#9eb5c7"
+                font.pixelSize: 13
+            }
+
+            Row {
+                x: 102
+                y: 8
+                width: parent.width - 112
+                height: 38
+                spacing: 6
+
+                Repeater {
+                    model: [
+                        { key: "keyboard", label: "Keyboard" },
+                        { key: "controller", label: "Controller" },
+                        { key: "auto", label: "Auto" }
+                    ]
+
+                    delegate: Rectangle {
+                        required property var modelData
+                        width: (parent.width - 12) / 3
+                        height: parent.height
+                        radius: 8
+                        color: s.controlInputMode === modelData.key ? "#1d5270" : "#172331"
+                        border.color: s.controlInputMode === modelData.key ? "#50aaff" : "#31475a"
+                        border.width: s.controlInputMode === modelData.key ? 2 : 1
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: backend.setControlInputMode(modelData.key)
+                        }
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: modelData.label
+                            color: s.controlInputMode === modelData.key ? "#f4f8fb" : "#9eb5c7"
+                            font.pixelSize: 12
+                            font.bold: s.controlInputMode === modelData.key
+                        }
+                    }
+                }
+            }
+        }
+
         Repeater {
                 model: [
                     { label: "Connection", value: s.serialStatus },
                     { label: "Battery", value: s.batteryStatus },
-                    { label: "Mode", value: s.controllerMode || "idle" },
                     { label: "Location", value: s.currentLocation },
                     { label: "Target", value: s.targetLocation },
                     { label: "Hold", value: s.holdPosition ? "ON" : "OFF" },
-                    { label: "Vector", value: s.turn + ", " + s.thrust },
+                    { label: "Motion", value: s.turn + ", " + s.thrust + ", yaw " + (s.yaw || 0) },
                     { label: "Ack", value: s.ackVector || "N/A" }
                 ]
 
@@ -827,6 +1146,7 @@ ApplicationWindow {
             TabButton { text: "Map" }
             TabButton { text: "Bottom Mesh" }
             TabButton { text: "Motor Test" }
+            TabButton { text: "Navigation Test" }
         }
 
         StackLayout {
@@ -843,33 +1163,11 @@ ApplicationWindow {
                 backendState: s
             }
 
-            Item {
-                ListView {
-                    id: logList
-                    anchors.fill: parent
-                    clip: true
-                    model: backend.commLog
-                    spacing: 6
-                    boundsBehavior: Flickable.StopAtBounds
-                    onCountChanged: positionViewAtEnd()
-
-                    delegate: Rectangle {
-                        width: logList.width
-                        color: "transparent"
-                        implicitHeight: logText.implicitHeight + 10
-
-                        Text {
-                            id: logText
-                            x: 8
-                            y: 4
-                            width: parent.width - 16
-                            text: modelData
-                            color: "#e6ecf2"
-                            font.pixelSize: 13
-                            wrapMode: Text.Wrap
-                        }            }
-        }
-        }
+            LogsPanel {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                backendObject: backend
+            }
 
             Item {
                 Rectangle {
@@ -1195,6 +1493,13 @@ ApplicationWindow {
         }
             MotorTestPanel {
                 id: motorTestPanel
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                backendObject: backend
+                backendState: s
+            }
+
+            NavigationTestPanel {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 backendObject: backend

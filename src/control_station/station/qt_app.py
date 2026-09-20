@@ -4,6 +4,7 @@ import argparse
 from array import array
 from collections import deque
 from dataclasses import asdict
+import math
 from pathlib import Path
 import sys
 import time
@@ -13,13 +14,21 @@ try:
     import pygame
 except ModuleNotFoundError:
     pygame = None
-from PySide6.QtCore import QObject, Property, QTimer, Signal, Slot, QUrl
+from PySide6.QtCore import QEvent, QObject, Property, QTimer, Qt, Signal, Slot, QUrl
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 
-from .controller import get_controller, read_axes
+from .controller import get_controller, read_motion_axes
 from .geometry import build_manual_command
 from .models import ScienceSample
+from .navigation import GpsSpeedTracker, NavigationAssist
+from .log_categories import (
+    NAVIGATION_LOG,
+    SCIENTIFIC_LOG,
+    classify_log_entry,
+    display_timestamp,
+    interpret_log_entry,
+)
 from .protocol import is_protocol_message, parse_acknowledgement, parse_error, parse_science_update, parse_status_update
 from .serial_link import (
     CONNECTION_PREFS_FILENAME,
@@ -37,6 +46,10 @@ from .serial_link import (
     send_command,
     send_text,
 )
+from .test_session import PersistentTestSession
+from .telemetry_quality import ImuStreamQuality
+
+DEFAULT_MIXER_POWER_LIMIT = 0.50
 
 
 def parse_args() -> argparse.Namespace:
@@ -214,6 +227,121 @@ def _clamp_axis(value: float) -> float:
     return max(-1.0, min(1.0, value))
 
 
+def _select_manual_input(
+    input_mode: str,
+    joystick_turn: float,
+    joystick_thrust: float,
+    keyboard_turn: float,
+    keyboard_thrust: float,
+    keyboard_yaw: float,
+    joystick_yaw: float = 0.0,
+) -> tuple[float, float, float]:
+    if input_mode == "controller":
+        return (
+            _clamp_axis(joystick_turn),
+            _clamp_axis(joystick_thrust),
+            _clamp_axis(joystick_yaw),
+        )
+    if input_mode == "keyboard":
+        return _clamp_axis(keyboard_turn), _clamp_axis(keyboard_thrust), _clamp_axis(keyboard_yaw)
+    return 0.0, 0.0, 0.0
+
+
+def _limit_motion_to_motor_output(
+    lateral: float,
+    thrust: float,
+    yaw: float,
+    maximum: float = DEFAULT_MIXER_POWER_LIMIT,
+) -> tuple[float, float, float]:
+    """Scale a motion vector so no mixed motor exceeds the safety limit."""
+    lateral = _clamp_axis(lateral)
+    thrust = _clamp_axis(thrust)
+    yaw = _clamp_axis(yaw)
+    translation_scale = (2.0 / 3.0) * 2.0
+    front_x = math.sqrt(3.0) / 2.0
+    mixed = (
+        (translation_scale * thrust) + yaw,
+        (translation_scale * ((lateral * front_x) - (thrust * 0.5))) + yaw,
+        (translation_scale * ((-lateral * front_x) - (thrust * 0.5))) + yaw,
+    )
+    peak = max(abs(value) for value in mixed)
+    bounded_maximum = max(0.0, min(1.0, float(maximum)))
+    if peak <= bounded_maximum or peak == 0.0:
+        return lateral, thrust, yaw
+    scale = bounded_maximum / peak
+    return lateral * scale, thrust * scale, yaw * scale
+
+
+def _motor_percent_command(motor: str, power_percent: int) -> str:
+    """Build an explicit percentage command for firmware-side calibration."""
+    normalized_motor = (motor or "").strip().lower().replace("-", "_")
+    bounded_percent = max(-100, min(100, int(power_percent)))
+    return f"CTRL MOTOR PERCENT {normalized_motor} {bounded_percent:+d}"
+
+
+def _calibrated_motor_pwm(power_percent: int, minimum_pwm: int, maximum_pwm: int, curve: float) -> int:
+    """Calculate steady PWM from a signed logical motor percentage."""
+    magnitude = max(0.0, min(1.0, abs(float(power_percent)) / 100.0))
+    if magnitude == 0.0:
+        return 0
+    minimum = max(0, min(255, int(minimum_pwm)))
+    maximum = max(minimum, min(255, int(maximum_pwm)))
+    shaped = math.pow(magnitude, max(0.1, float(curve)))
+    return int(math.floor(minimum + ((maximum - minimum) * shaped) + 0.5))
+
+
+def _parse_motor_output_telemetry(
+    response_text: str,
+) -> tuple[int, int, int, int, int, int] | None:
+    prefix = "TEL MOTOR OUT "
+    if not response_text.startswith(prefix):
+        return None
+    parts = response_text[len(prefix):].strip().split()
+    if len(parts) < 6:
+        return None
+    try:
+        return tuple(int(value) for value in parts[:6])
+    except ValueError:
+        return None
+
+
+class KeyboardDriveFilter(QObject):
+    KEY_TO_DIRECTION = {
+        Qt.Key.Key_A: "left",
+        Qt.Key.Key_D: "right",
+        Qt.Key.Key_W: "up",
+        Qt.Key.Key_S: "down",
+        Qt.Key.Key_Left: "yaw_left",
+        Qt.Key.Key_Right: "yaw_right",
+    }
+
+    def __init__(self, backend: "ControlStationBackend") -> None:
+        super().__init__(backend)
+        self._backend = backend
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        del watched
+        if not self._backend.keyboard_drive_enabled:
+            return False
+        if event.type() not in {QEvent.Type.KeyPress, QEvent.Type.KeyRelease}:
+            return False
+
+        key = event.key()
+        if key == Qt.Key.Key_Space:
+            if event.type() == QEvent.Type.KeyPress and not event.isAutoRepeat():
+                self._backend.stopNavigationTest()
+            return True
+
+        direction = self.KEY_TO_DIRECTION.get(key)
+        if direction is None:
+            # Consume vertical arrows while Keyboard Drive is active so Qt
+            # controls cannot unexpectedly navigate or change values.
+            return key in {Qt.Key.Key_Up, Qt.Key.Key_Down}
+        if not event.isAutoRepeat():
+            self._backend.setKeyboardInput(direction, event.type() == QEvent.Type.KeyPress)
+        return True
+
+
 class ControlStationBackend(QObject):
     stateChanged = Signal()
     dashboardTabChanged = Signal()
@@ -228,6 +356,9 @@ class ControlStationBackend(QObject):
             "controllerStatus": "Not connected",
             "controllerName": "Connect Xbox controller",
             "controllerMode": "idle",
+            "controlInputMode": "controller",
+            "controlInputModeDetail": "Left stick movement + right stick yaw",
+            "mixerPowerPercent": int(round(DEFAULT_MIXER_POWER_LIMIT * 100.0)),
             "serialStatus": "Disconnected",
             "serialTarget": "No port selected",
             "lastSendResult": "Waiting for first command",
@@ -236,9 +367,20 @@ class ControlStationBackend(QObject):
             "ackVector": "N/A",
             "turn": 0,
             "thrust": 0,
+            "yaw": 0,
             "rearMotor": 0,
             "frontLeftMotor": 0,
             "frontRightMotor": 0,
+            "rearMotorActualDrive": 0,
+            "frontLeftMotorActualDrive": 0,
+            "frontRightMotorActualDrive": 0,
+            "rearMotorPwm": -1,
+            "frontLeftMotorPwm": -1,
+            "frontRightMotorPwm": -1,
+            "rearMotorTargetPwm": 0,
+            "frontLeftMotorTargetPwm": 0,
+            "frontRightMotorTargetPwm": 0,
+            "motorOutputTelemetry": False,
             "batteryStatus": "N/A",
             "currentLocation": "Unknown",
             "targetLocation": "Not set",
@@ -262,10 +404,81 @@ class ControlStationBackend(QObject):
             "motorConfigMaxPwm": 0,
             "motorConfigCurveTimes100": 0,
             "motorConfigRampTenths": 0,
+            "navigationAssistEnabled": False,
+            "navigationAssistActive": False,
+            "navigationImuReady": False,
+            "navigationStatus": "Zero the IMU while the buoy is stationary",
+            "navigationRequestedTurn": 0,
+            "navigationRequestedThrust": 0,
+            "navigationRequestedYaw": 0,
+            "navigationCorrectedTurn": 0,
+            "navigationCorrectedThrust": 0,
+            "navigationCorrectedYaw": 0,
+            "navigationMeasuredXG": 0.0,
+            "navigationMeasuredYG": 0.0,
+            "navigationMeasuredMagnitudeG": 0.0,
+            "navigationMeasuredYawDps": 0.0,
+            "navigationRollDeg": 0.0,
+            "navigationPitchDeg": 0.0,
+            "navigationEstimatedVelocityXMps": 0.0,
+            "navigationEstimatedVelocityYMps": 0.0,
+            "navigationEstimatedSpeedMps": 0.0,
+            "navigationSpeedConfidencePercent": 0,
+            "navigationTiltCompensating": False,
+            "navigationTiltRateDps": 0.0,
+            "navigationGpsSpeedAvailable": False,
+            "navigationGpsSpeedMps": 0.0,
+            "navigationBestSpeedMps": 0.0,
+            "navigationSpeedSource": "IMU estimate",
+            "navigationTestEnvironment": "dry",
+            "testSessionActive": False,
+            "testSessionStatus": "Not recording",
+            "testSessionFile": "",
+            "testSessionSampleCount": 0,
+            "testSessionImuRateHz": 0.0,
+            "testSessionImuLossPercent": 0.0,
+            "navigationDirectionErrorDeg": 0.0,
+            "navigationCorrectionDeg": 0.0,
+            "navigationGainPercent": 35,
+            "navigationMaxCorrectionDeg": 20,
+            "navigationInvertX": True,
+            "navigationInvertY": False,
+            "navigationSwapXY": True,
+            "navigationReleaseRequired": False,
+            "keyboardDriveEnabled": False,
+            "keyboardInputSummary": "Idle",
+            "navigationRequestedRearMotor": 0,
+            "navigationRequestedFrontLeftMotor": 0,
+            "navigationRequestedFrontRightMotor": 0,
+            "navigationCorrectedRearMotor": 0,
+            "navigationCorrectedFrontLeftMotor": 0,
+            "navigationCorrectedFrontRightMotor": 0,
         }
         self._comm_log: list[str] = []
+        self._categorized_log: list[dict[str, str]] = []
+        self._system_log: list[dict[str, str]] = []
+        self._navigation_log: list[dict[str, str]] = []
+        self._scientific_log: list[dict[str, str]] = []
         self._science_history: list[dict[str, object]] = []
         self._audio_waveform: list[float] = [0.0] * 480
+        default_profile = {"minimum": 130, "maximum": 255, "curve": 2.0}
+        self._motor_calibrations: dict[str, dict[str, object]] = {
+            "rear": {
+                "forward": dict(default_profile),
+                "reverse": dict(default_profile),
+                "default_reversed": False,
+            },
+            "front_left": {
+                "forward": dict(default_profile),
+                "reverse": dict(default_profile),
+                "default_reversed": False,
+            },
+            "front_right": {
+                "forward": dict(default_profile),
+                "reverse": dict(default_profile),
+                "default_reversed": True,
+            },
+        }
         self._dashboard_tab = "logs"
         self._audio_muted = False
         self._network_interfaces = list_wifi_interfaces()
@@ -285,6 +498,9 @@ class ControlStationBackend(QObject):
         self._command = build_manual_command(0.0, 0.0)
         self._keyboard_turn = 0.0
         self._keyboard_thrust = 0.0
+        self._keyboard_yaw = 0.0
+        self._keyboard_keys: set[str] = set()
+        self._mixer_power_limit = DEFAULT_MIXER_POWER_LIMIT
         self._last_send_time = 0.0
         self._last_hello_time = 0.0
         self._last_ping_time = 0.0
@@ -298,10 +514,26 @@ class ControlStationBackend(QObject):
         self._reconnect_interval = 2.0
         self._ping_interval = 5.0
         self._link_timeout = 3.0
-        self._imu_last_sequence: int | None = None
-        self._imu_received_count = 0
-        self._imu_missing_count = 0
+        self._imu_quality = ImuStreamQuality(expected_interval_ms=50)
+        self._last_imu_gyro = (0.0, 0.0, 0.0)
         self._last_science_sample_time = 0.0
+        self._navigation = NavigationAssist()
+        self._gps_speed = GpsSpeedTracker()
+        # The installed MPU6050 is rotated 90 degrees clockwise: body-right is
+        # sensor -Y and body-forward is sensor +X.
+        self._navigation.set_axis_signs(True, False, True)
+        self._last_navigation_log_time = 0.0
+        self._navigation_requires_center = False
+        self._test_session: PersistentTestSession | None = None
+        self._test_imu_quality: ImuStreamQuality | None = None
+        self._latest_power: dict[str, float | int | None] = {
+            "battery_voltage_v": None,
+            "current_a": None,
+            "battery_percent": None,
+        }
+        self._last_recorded_imu_arrival_at: float | None = None
+        self._last_motor_output_at: float | None = None
+        self._last_power_at: float | None = None
 
         self._timer = QTimer(self)
         self._timer.setInterval(33)
@@ -314,6 +546,22 @@ class ControlStationBackend(QObject):
     @Property(list, notify=stateChanged)
     def commLog(self) -> list[str]:
         return self._comm_log
+
+    @Property(list, notify=stateChanged)
+    def categorizedLog(self) -> list[dict[str, str]]:
+        return self._categorized_log
+
+    @Property(list, notify=stateChanged)
+    def systemLog(self) -> list[dict[str, str]]:
+        return self._system_log
+
+    @Property(list, notify=stateChanged)
+    def navigationLog(self) -> list[dict[str, str]]:
+        return self._navigation_log
+
+    @Property(list, notify=stateChanged)
+    def scientificLog(self) -> list[dict[str, str]]:
+        return self._scientific_log
 
     @Property(list, notify=stateChanged)
     def scienceHistory(self) -> list[dict[str, object]]:
@@ -350,16 +598,35 @@ class ControlStationBackend(QObject):
             return "Disconnect"
         return "Reconnect"
 
+    @property
+    def keyboard_drive_enabled(self) -> bool:
+        return self._state.get("controlInputMode") == "keyboard"
+
     @Slot(str)
     def setDashboardTab(self, tab: str) -> None:
-        if tab not in {"science", "logs", "map", "analysis", "motors"}:
+        if tab not in {"science", "logs", "map", "analysis", "motors", "navigation"}:
             return
         if self._dashboard_tab != tab:
             leaving_motor_debug = self._dashboard_tab == "motors" and tab != "motors"
+            leaving_navigation_test = self._dashboard_tab == "navigation" and tab != "navigation"
             self._dashboard_tab = tab
             self.dashboardTabChanged.emit()
             if leaving_motor_debug:
                 self.stopAllMotors()
+            if leaving_navigation_test:
+                was_enabled = self._navigation.enabled
+                self._navigation.set_enabled(False, time.monotonic())
+                navigation_was_active = was_enabled
+                self._navigation_requires_center = navigation_was_active
+                self._set_state(
+                    navigationAssistEnabled=False,
+                    navigationAssistActive=False,
+                    navigationReleaseRequired=navigation_was_active,
+                    navigationStatus=("Center controller to resume" if navigation_was_active else "Assist off"),
+                    navigationCorrectionDeg=0.0,
+                )
+                if navigation_was_active:
+                    self.stopAllMotors()
 
     @Slot()
     def toggleAudioMute(self) -> None:
@@ -400,10 +667,8 @@ class ControlStationBackend(QObject):
                 self._transport.close()
             except Exception:
                 pass
-            self._transport = None
             self._connection_request_id += 1
-            self._set_state(serialStatus="Disconnected", serialTarget="No port selected")
-            self.stateChanged.emit()
+            self._set_transport_disconnected("Disconnected")
             return
 
         self._queue_transport_connection(initial=False)
@@ -424,6 +689,230 @@ class ControlStationBackend(QObject):
     @Slot()
     def stopMotorTest(self) -> None:
         self.stopAllMotors()
+
+    @Slot()
+    def zeroNavigationImu(self) -> None:
+        if self._navigation.zero():
+            self._set_state(
+                navigationImuReady=self._navigation.measurement_is_fresh(time.monotonic()),
+                navigationStatus="IMU zero captured; assist ready",
+                navigationMeasuredXG=0.0,
+                navigationMeasuredYG=0.0,
+                navigationMeasuredMagnitudeG=0.0,
+            )
+            self._append_comm_log("NAV IMU ZERO")
+        else:
+            self._set_state(navigationStatus="Cannot zero: waiting for IMU telemetry")
+
+    @Slot(bool)
+    def setNavigationAssist(self, enabled: bool) -> None:
+        if enabled and self._transport is None:
+            self._set_state(navigationStatus="Cannot enable: buoy is disconnected")
+            return
+
+        was_enabled = self._navigation.enabled
+        is_enabled = self._navigation.set_enabled(bool(enabled), time.monotonic())
+        if enabled and not is_enabled:
+            self._set_state(
+                navigationAssistEnabled=False,
+                navigationAssistActive=False,
+                navigationStatus="Cannot enable: zero the IMU and wait for fresh telemetry",
+            )
+            return
+
+        self._set_state(
+            navigationAssistEnabled=is_enabled,
+            navigationAssistActive=False,
+            navigationStatus=("Assist armed; waiting for controller input" if is_enabled else "Assist off"),
+            navigationCorrectionDeg=0.0,
+        )
+        self._append_comm_log(f"NAV ASSIST {'ON' if is_enabled else 'OFF'}")
+        if was_enabled and not is_enabled:
+            self.stopAllMotors()
+
+    @Slot()
+    def stopNavigationTest(self) -> None:
+        self._navigation.set_enabled(False, time.monotonic())
+        self._navigation_requires_center = True
+        self._keyboard_keys.clear()
+        self._keyboard_turn = 0.0
+        self._keyboard_thrust = 0.0
+        self._keyboard_yaw = 0.0
+        self._set_state(
+            navigationAssistEnabled=False,
+            navigationAssistActive=False,
+            navigationReleaseRequired=True,
+            navigationStatus="Stopped; center controller to resume",
+            navigationCorrectionDeg=0.0,
+            keyboardInputSummary="Idle",
+        )
+        self._append_comm_log("NAV STOP")
+        self.stopAllMotors()
+
+    @Slot(bool)
+    def setKeyboardDriveEnabled(self, enabled: bool) -> None:
+        self.setControlInputMode("keyboard" if enabled else "controller")
+
+    @Slot(str)
+    def setControlInputMode(self, mode: str) -> None:
+        normalized_mode = (mode or "").strip().lower()
+        if normalized_mode not in {"keyboard", "controller", "auto"}:
+            return
+        if normalized_mode == self._state.get("controlInputMode"):
+            return
+
+        self._keyboard_keys.clear()
+        self._keyboard_turn = 0.0
+        self._keyboard_thrust = 0.0
+        self._keyboard_yaw = 0.0
+        self._navigation_requires_center = normalized_mode == "controller"
+        detail = {
+            "keyboard": "WASD movement + arrow-key yaw",
+            "controller": "Left stick movement + right stick yaw",
+            "auto": "Program execution coming later",
+        }[normalized_mode]
+        self._set_state(
+            controlInputMode=normalized_mode,
+            controlInputModeDetail=detail,
+            keyboardDriveEnabled=(normalized_mode == "keyboard"),
+            keyboardInputSummary=(
+                "Ready: WASD translation + arrows yaw" if normalized_mode == "keyboard" else "Idle"
+            ),
+            navigationReleaseRequired=(normalized_mode == "controller"),
+        )
+        self._append_comm_log(f"CONTROL SOURCE {normalized_mode.upper()}")
+        self.stopAllMotors()
+
+    @Slot(float)
+    def setMixerPowerLimit(self, power_percent: float) -> None:
+        power_percent = max(10.0, min(100.0, float(power_percent)))
+        self._mixer_power_limit = power_percent / 100.0
+        self._set_state(mixerPowerPercent=int(round(power_percent)))
+        self._append_comm_log(f"MIXER POWER LIMIT {int(round(power_percent))}%")
+
+    @Slot(float)
+    def setNavigationGain(self, gain_percent: float) -> None:
+        self._navigation.set_gain(float(gain_percent) / 100.0)
+        self._set_state(navigationGainPercent=int(round(self._navigation.gain * 100.0)))
+
+    @Slot(float)
+    def setNavigationMaxCorrection(self, degrees: float) -> None:
+        self._navigation.set_max_correction(degrees)
+        self._set_state(navigationMaxCorrectionDeg=int(round(self._navigation.max_correction_deg)))
+
+    @Slot(bool, bool, bool)
+    def setNavigationAxisSigns(self, invert_x: bool, invert_y: bool, swap_xy: bool) -> None:
+        was_enabled = self._navigation.enabled
+        self._navigation.set_axis_signs(invert_x, invert_y, swap_xy)
+        self._set_state(
+            navigationAssistEnabled=False,
+            navigationAssistActive=False,
+            navigationImuReady=False,
+            navigationInvertX=bool(invert_x),
+            navigationInvertY=bool(invert_y),
+            navigationSwapXY=bool(swap_xy),
+            navigationStatus="Axis mapping changed; zero the IMU again",
+            navigationCorrectionDeg=0.0,
+        )
+        self._append_comm_log(
+            f"NAV AXES invert_x={int(bool(invert_x))} invert_y={int(bool(invert_y))} "
+            f"swap_xy={int(bool(swap_xy))}"
+        )
+        if was_enabled:
+            self.stopAllMotors()
+
+    @Slot(str)
+    def setNavigationTestEnvironment(self, environment: str) -> None:
+        if self._test_session is not None and self._test_session.active:
+            self._set_state(testSessionStatus="Stop recording before changing test environment")
+            return
+        normalized = str(environment).strip().lower()
+        if normalized not in {"dry", "water"}:
+            return
+        if normalized == self._state.get("navigationTestEnvironment"):
+            return
+        self._set_state(navigationTestEnvironment=normalized)
+        self._append_comm_log(f"NAV ENVIRONMENT {normalized.upper()}")
+
+    @Slot()
+    def startTestSession(self) -> None:
+        if self._test_session is not None and self._test_session.active:
+            return
+        if self._transport is None:
+            self._set_state(testSessionStatus="Connect to the buoy before recording")
+            return
+
+        environment = str(self._state.get("navigationTestEnvironment", "water"))
+        metadata = {
+            "source": "buoy-control-station",
+            "test_kind": "water_imu_calibration" if environment == "water" else "dry_land_baseline",
+            "serial_target": str(self._state.get("serialTarget", "")),
+            "control_input_mode": str(self._state.get("controlInputMode", "controller")),
+            "controller_name": str(self._state.get("controllerName", "")),
+            "send_rate_hz": float(self._args.send_rate),
+            "controller_deadzone": float(self._args.deadzone),
+            "mixer_power_limit_percent": int(round(self._mixer_power_limit * 100.0)),
+            "navigation_axis_mapping": {
+                "invert_x": bool(self._state.get("navigationInvertX", False)),
+                "invert_y": bool(self._state.get("navigationInvertY", False)),
+                "swap_xy": bool(self._state.get("navigationSwapXY", False)),
+            },
+            "motor_calibration": self._motor_calibrations,
+            "notes": "Motor PWM is commanded duty, not measured propeller RPM.",
+        }
+        try:
+            self._test_session = PersistentTestSession(
+                self._log_file.parent / "tests",
+                environment,
+                metadata,
+            )
+        except OSError as exc:
+            self._test_session = None
+            self._set_state(testSessionStatus=f"Could not start recorder: {exc}")
+            return
+
+        self._test_imu_quality = ImuStreamQuality(expected_interval_ms=50)
+        self._last_recorded_imu_arrival_at = None
+        self._set_state(
+            testSessionActive=True,
+            testSessionStatus="Recording synchronized telemetry",
+            testSessionFile=str(self._test_session.path),
+            testSessionSampleCount=0,
+            testSessionImuRateHz=0.0,
+            testSessionImuLossPercent=0.0,
+        )
+        self._append_comm_log(f"TEST RECORD START file={self._test_session.path}")
+
+    def _close_test_session(self, reason: str) -> None:
+        session = self._test_session
+        if session is None:
+            return
+        path = session.path
+        sample_count = session.sample_count
+        close_error: OSError | None = None
+        try:
+            session.close(reason, self._test_session_summary())
+        except OSError as exc:
+            close_error = exc
+        finally:
+            self._test_session = None
+            self._test_imu_quality = None
+        self._set_state(
+            testSessionActive=False,
+            testSessionStatus=(
+                f"Saved {sample_count} samples" if close_error is None else f"Recorder close error: {close_error}"
+            ),
+            testSessionFile=str(path),
+            testSessionSampleCount=sample_count,
+        )
+        self._append_comm_log(
+            f"TEST RECORD STOP samples={sample_count} file={path}"
+            + (f" error={close_error}" if close_error is not None else "")
+        )
+
+    @Slot()
+    def stopTestSession(self) -> None:
+        self._close_test_session("operator_stop")
 
     @Slot(str)
     def sendText(self, text: str) -> None:
@@ -497,20 +986,13 @@ class ControlStationBackend(QObject):
         normalized_motor = (motor or "").strip().lower().replace("-", "_")
         normalized_direction = (direction or "").strip().lower()
         throttle_value = max(0, min(100, int(throttle_percent)))
-        curve_value = max(0.1, float(curve))
-        drive_floor = 11
-
-        if throttle_value <= 0:
-            drive_value = 0
-        else:
-            drive_fraction = pow(throttle_value / 100.0, 1.0 / curve_value)
-            drive_value = int(round(drive_floor + ((255 - drive_floor) * drive_fraction)))
-            drive_value = max(drive_floor, min(255, drive_value))
-
+        # All calibration belongs to firmware. Send the requested percentage
+        # without converting it to a raw drive or applying the curve here.
+        del curve
         if normalized_direction == "reverse":
-            drive_value = -drive_value
+            throttle_value = -throttle_value
 
-        command = f"CTRL MOTOR {normalized_motor} {drive_value:+d}"
+        command = _motor_percent_command(normalized_motor, throttle_value)
         result = send_text(self._transport, command)
         self._set_state(lastSendResult=result, lastSentLine=command)
         if "failed" not in result.lower():
@@ -525,15 +1007,7 @@ class ControlStationBackend(QObject):
 
         normalized_motor = (motor or "").strip().lower().replace("-", "_")
         power_value = max(-100, min(100, int(power_percent)))
-        drive_floor = 11
-
-        if power_value == 0:
-            drive_value = 0
-        else:
-            drive_magnitude = int(round(drive_floor + ((255 - drive_floor) * (abs(power_value) / 100.0))))
-            drive_value = -drive_magnitude if power_value < 0 else drive_magnitude
-
-        command = f"CTRL MOTOR {normalized_motor} {drive_value:+d}"
+        command = _motor_percent_command(normalized_motor, power_value)
         result = send_text(self._transport, command)
         self._set_state(lastSendResult=result, lastSentLine=command)
         if "failed" not in result.lower():
@@ -621,33 +1095,108 @@ class ControlStationBackend(QObject):
 
     @Slot(str, bool)
     def setKeyboardInput(self, key: str, pressed: bool) -> None:
-        value = 1.0 if pressed else 0.0
-        if key == "left":
-            self._keyboard_turn = -value if pressed else (1.0 if self._keyboard_turn > 0 else 0.0)
-        elif key == "right":
-            self._keyboard_turn = value if pressed else (-1.0 if self._keyboard_turn < 0 else 0.0)
-        elif key == "up":
-            self._keyboard_thrust = value if pressed else (-1.0 if self._keyboard_thrust < 0 else 0.0)
-        elif key == "down":
-            self._keyboard_thrust = -value if pressed else (1.0 if self._keyboard_thrust > 0 else 0.0)
-        else:
+        if not self.keyboard_drive_enabled or self._transport is None:
             return
-        self.stateChanged.emit()
+        if key not in {"left", "right", "up", "down", "yaw_left", "yaw_right"}:
+            return
+        if pressed:
+            self._keyboard_keys.add(key)
+        else:
+            self._keyboard_keys.discard(key)
+
+        self._keyboard_turn = float(
+            ("right" in self._keyboard_keys) - ("left" in self._keyboard_keys)
+        )
+        self._keyboard_thrust = float(
+            ("up" in self._keyboard_keys) - ("down" in self._keyboard_keys)
+        )
+        self._keyboard_yaw = float(
+            ("yaw_right" in self._keyboard_keys) - ("yaw_left" in self._keyboard_keys)
+        )
+        labels = {
+            "up": "FORWARD",
+            "down": "REVERSE",
+            "left": "MOVE LEFT",
+            "right": "MOVE RIGHT",
+            "yaw_left": "YAW LEFT",
+            "yaw_right": "YAW RIGHT",
+        }
+        active_keys = [labels[name] for name in labels if name in self._keyboard_keys]
+        self._set_state(
+            keyboardInputSummary=(" + ".join(active_keys) if active_keys else "Ready: WASD translation + arrows yaw")
+        )
 
     def _append_comm_log(self, entry: str) -> None:
+        timestamp = time.time()
+        category = classify_log_entry(entry)
+        display_entry = {
+            "timestamp": display_timestamp(timestamp),
+            "message": entry,
+            "category": category,
+            "interpretation": interpret_log_entry(entry),
+        }
         self._comm_log = (self._comm_log + [entry])[-120:]
+        self._categorized_log = (self._categorized_log + [display_entry])[-360:]
+        if category == NAVIGATION_LOG:
+            self._navigation_log = (self._navigation_log + [display_entry])[-120:]
+        elif category == SCIENTIFIC_LOG:
+            self._scientific_log = (self._scientific_log + [display_entry])[-120:]
+        else:
+            self._system_log = (self._system_log + [display_entry])[-120:]
         with self._log_file.open("a", encoding="utf-8") as handle:
-            handle.write(f"{time.time()}: {entry}\n")
+            handle.write(f"{timestamp}: {entry}\n")
         self.stateChanged.emit()
 
     def _set_state(self, **updates: object) -> None:
         self._state = {**self._state, **updates}
         self.stateChanged.emit()
 
+    def _motor_pwm_for_percent(self, motor_name: str, power_percent: int) -> int:
+        calibration = self._motor_calibrations[motor_name]
+        logical_forward = power_percent > 0
+        physical_forward = logical_forward != bool(calibration["default_reversed"])
+        profile = calibration["forward" if physical_forward else "reverse"]
+        return _calibrated_motor_pwm(
+            power_percent,
+            int(profile["minimum"]),
+            int(profile["maximum"]),
+            float(profile["curve"]),
+        )
+
     def _set_transport_disconnected(self, status: str = "Disconnected") -> None:
         self._transport = None
         self._connected_device_name = None
-        self._set_state(serialStatus=status, serialTarget="No port selected", currentDraw="N/A")
+        self._gps_speed.invalidate()
+        self._navigation.set_enabled(False, time.monotonic())
+        self._navigation_requires_center = False
+        self._keyboard_keys.clear()
+        self._keyboard_turn = 0.0
+        self._keyboard_thrust = 0.0
+        self._keyboard_yaw = 0.0
+        self._set_state(
+            serialStatus=status,
+            serialTarget="No port selected",
+            currentDraw="N/A",
+            navigationAssistEnabled=False,
+            navigationAssistActive=False,
+            navigationStatus="Assist off: buoy disconnected",
+            navigationReleaseRequired=False,
+            navigationCorrectionDeg=0.0,
+            keyboardDriveEnabled=(self._state.get("controlInputMode") == "keyboard"),
+            keyboardInputSummary="Idle",
+            rearMotorActualDrive=0,
+            frontLeftMotorActualDrive=0,
+            frontRightMotorActualDrive=0,
+            rearMotorPwm=-1,
+            frontLeftMotorPwm=-1,
+            frontRightMotorPwm=-1,
+            motorOutputTelemetry=False,
+            navigationGpsSpeedAvailable=False,
+            navigationGpsSpeedMps=0.0,
+            navigationBestSpeedMps=0.0,
+            navigationSpeedSource="IMU estimate",
+            navigationSpeedConfidencePercent=0,
+        )
 
     def start(self) -> None:
         if pygame is not None:
@@ -667,6 +1216,7 @@ class ControlStationBackend(QObject):
 
     def shutdown(self) -> None:
         self._timer.stop()
+        self._close_test_session("application_exit")
         if self._transport is not None:
             try:
                 self._transport.close()
@@ -789,17 +1339,102 @@ class ControlStationBackend(QObject):
             self._append_comm_log(f"RECONNECTED target={target}")
 
     def _send_current_command(self) -> None:
-        joystick_turn, joystick_thrust = read_axes(self._joystick, self._args.deadzone)
-        turn = _clamp_axis(joystick_turn + self._keyboard_turn)
-        thrust = _clamp_axis(joystick_thrust + self._keyboard_thrust)
-        self._command = build_manual_command(turn, thrust)
+        input_mode = str(self._state.get("controlInputMode", "controller"))
+        if input_mode == "controller":
+            joystick_turn, joystick_thrust, joystick_yaw = read_motion_axes(
+                self._joystick, self._args.deadzone
+            )
+        else:
+            joystick_turn, joystick_thrust, joystick_yaw = 0.0, 0.0, 0.0
+        turn, thrust, yaw = _select_manual_input(
+            input_mode,
+            joystick_turn,
+            joystick_thrust,
+            self._keyboard_turn,
+            self._keyboard_thrust,
+            self._keyboard_yaw,
+            joystick_yaw,
+        )
+        if self._navigation_requires_center:
+            if turn == 0.0 and thrust == 0.0 and yaw == 0.0:
+                self._navigation_requires_center = False
+                self._set_state(navigationReleaseRequired=False)
+            else:
+                turn = 0.0
+                thrust = 0.0
+                yaw = 0.0
+        requested_command = build_manual_command(turn, thrust, yaw)
+        navigation_now = time.monotonic()
+        navigation_solution = self._navigation.solve(turn, thrust, navigation_now)
+        corrected_turn = navigation_solution.corrected_x
+        corrected_thrust = navigation_solution.corrected_y
+        corrected_yaw = yaw
+        corrected_turn, corrected_thrust, corrected_yaw = _limit_motion_to_motor_output(
+            corrected_turn,
+            corrected_thrust,
+            corrected_yaw,
+            self._mixer_power_limit,
+        )
+        self._command = build_manual_command(corrected_turn, corrected_thrust, corrected_yaw)
+
+        navigation_status = navigation_solution.status
+        if not self._navigation.zeroed:
+            navigation_status = "Zero the IMU while the buoy is stationary"
+        elif self._navigation_requires_center:
+            navigation_status = "Stopped; center controller to resume"
+        elif not self._navigation.enabled and not navigation_status.startswith("Assist stopped"):
+            navigation_status = "IMU zeroed; assist off"
+
         self._set_state(
             turn=self._command.turn,
             thrust=self._command.thrust,
+            yaw=self._command.yaw,
             rearMotor=self._command.rear_motor,
             frontLeftMotor=self._command.front_left_motor,
             frontRightMotor=self._command.front_right_motor,
+            rearMotorTargetPwm=self._motor_pwm_for_percent("rear", self._command.rear_motor),
+            frontLeftMotorTargetPwm=self._motor_pwm_for_percent("front_left", self._command.front_left_motor),
+            frontRightMotorTargetPwm=self._motor_pwm_for_percent("front_right", self._command.front_right_motor),
+            navigationAssistEnabled=self._navigation.enabled,
+            navigationAssistActive=navigation_solution.active,
+            navigationReleaseRequired=self._navigation_requires_center,
+            navigationImuReady=(
+                self._navigation.zeroed and self._navigation.measurement_is_fresh(navigation_now)
+            ),
+            navigationStatus=navigation_status,
+            navigationRequestedTurn=requested_command.turn,
+            navigationRequestedThrust=requested_command.thrust,
+            navigationRequestedYaw=requested_command.yaw,
+            navigationCorrectedTurn=self._command.turn,
+            navigationCorrectedThrust=self._command.thrust,
+            navigationCorrectedYaw=self._command.yaw,
+            navigationMeasuredXG=round(self._navigation.measured_x_g, 4),
+            navigationMeasuredYG=round(self._navigation.measured_y_g, 4),
+            navigationMeasuredMagnitudeG=round(self._navigation.measured_magnitude_g, 4),
+            navigationDirectionErrorDeg=round(navigation_solution.direction_error_deg, 1),
+            navigationCorrectionDeg=round(navigation_solution.correction_deg, 1),
+            navigationRequestedRearMotor=requested_command.rear_motor,
+            navigationRequestedFrontLeftMotor=requested_command.front_left_motor,
+            navigationRequestedFrontRightMotor=requested_command.front_right_motor,
+            navigationCorrectedRearMotor=self._command.rear_motor,
+            navigationCorrectedFrontLeftMotor=self._command.front_left_motor,
+            navigationCorrectedFrontRightMotor=self._command.front_right_motor,
         )
+
+        if (
+            navigation_solution.active
+            and navigation_now - self._last_navigation_log_time >= 0.25
+        ):
+            self._last_navigation_log_time = navigation_now
+            self._append_comm_log(
+                "NAV "
+                f"requested={requested_command.turn:+d},{requested_command.thrust:+d},yaw={requested_command.yaw:+d} "
+                f"corrected={self._command.turn:+d},{self._command.thrust:+d},yaw={self._command.yaw:+d} "
+                f"measured_g={navigation_solution.measured_x_g:+.3f},{navigation_solution.measured_y_g:+.3f} "
+                f"yaw_dps={float(self._state.get('navigationMeasuredYawDps', 0.0)):+.1f} "
+                f"error_deg={navigation_solution.direction_error_deg:+.1f} "
+                f"correction_deg={navigation_solution.correction_deg:+.1f}"
+            )
 
         now = time.monotonic()
         min_send_interval = 1.0 / max(self._args.send_rate, 0.1)
@@ -809,6 +1444,7 @@ class ControlStationBackend(QObject):
             and not self._args.send_text
             and self._command.turn == 0
             and self._command.thrust == 0
+            and self._command.yaw == 0
             and not self._awaiting_protocol_response
         )
 
@@ -839,7 +1475,9 @@ class ControlStationBackend(QObject):
             send_command_flag = False
             if self._command != getattr(self, "_last_command", None):
                 send_command_flag = True
-            elif (now - self._last_send_time) >= min_send_interval and not (self._command.turn == 0 and self._command.thrust == 0):
+            elif (now - self._last_send_time) >= min_send_interval and not (
+                self._command.turn == 0 and self._command.thrust == 0 and self._command.yaw == 0
+            ):
                 send_command_flag = True
 
             if send_command_flag and self._transport is not None:
@@ -852,8 +1490,97 @@ class ControlStationBackend(QObject):
                     self._awaiting_protocol_response = True
                 self._append_comm_log(f"TX {self._command.to_line().strip()}")
 
+    def _update_navigation_imu(
+        self,
+        accel_x_g: float,
+        accel_y_g: float,
+        accel_z_g: float = 1.0,
+        gyro_x_dps: float | None = None,
+        gyro_y_dps: float | None = None,
+        gyro_z_dps: float | None = None,
+    ) -> None:
+        if gyro_x_dps is not None and gyro_y_dps is not None and gyro_z_dps is not None:
+            self._last_imu_gyro = (float(gyro_x_dps), float(gyro_y_dps), float(gyro_z_dps))
+        active_gyro_x, active_gyro_y, active_gyro_z = self._last_imu_gyro
+        requested_turn = int(self._state.get("navigationRequestedTurn", 0))
+        requested_thrust = int(self._state.get("navigationRequestedThrust", 0))
+        requested_yaw = int(self._state.get("navigationRequestedYaw", 0))
+        stationary = abs(requested_turn) < 5 and abs(requested_thrust) < 5 and abs(requested_yaw) < 5
+        now = time.monotonic()
+        self._navigation.update_measurement(
+            accel_x_g,
+            accel_y_g,
+            now,
+            accel_z_g=accel_z_g,
+            gyro_x_dps=active_gyro_x,
+            gyro_y_dps=active_gyro_y,
+            stationary=stationary,
+        )
+        updates: dict[str, object] = {
+            "navigationImuReady": self._navigation.zeroed and self._navigation.measurement_is_fresh(now),
+            "navigationMeasuredXG": round(self._navigation.measured_x_g, 4),
+            "navigationMeasuredYG": round(self._navigation.measured_y_g, 4),
+            "navigationMeasuredMagnitudeG": round(self._navigation.measured_magnitude_g, 4),
+            "navigationRollDeg": round(self._navigation.roll_deg, 1),
+            "navigationPitchDeg": round(self._navigation.pitch_deg, 1),
+            "navigationEstimatedVelocityXMps": round(self._navigation.estimated_velocity_x_mps, 3),
+            "navigationEstimatedVelocityYMps": round(self._navigation.estimated_velocity_y_mps, 3),
+            "navigationEstimatedSpeedMps": round(self._navigation.estimated_speed_mps, 3),
+            "navigationTiltCompensating": self._navigation.tilt_compensating,
+            "navigationTiltRateDps": round(self._navigation.tilt_rate_dps, 1),
+        }
+        if gyro_z_dps is not None:
+            updates["navigationMeasuredYawDps"] = round(active_gyro_z, 1)
+        self._set_state(**updates)
+        self._refresh_speed_source()
+
+    def _update_gps_fix(self, latitude: float, longitude: float) -> None:
+        self._gps_speed.update(latitude, longitude, time.time())
+        self._refresh_speed_source()
+
+    def _refresh_speed_source(self) -> None:
+        gps_speed = self._gps_speed.speed_mps(time.time())
+        if gps_speed is not None:
+            updates: dict[str, object] = {
+                "navigationGpsSpeedAvailable": True,
+                "navigationGpsSpeedMps": round(gps_speed, 3),
+                "navigationBestSpeedMps": round(gps_speed, 3),
+                "navigationSpeedSource": "GPS ground speed",
+                "navigationSpeedConfidencePercent": 90,
+            }
+        else:
+            imu_confidence = self._navigation.velocity_confidence_percent(time.monotonic())
+            if self._state.get("navigationTestEnvironment") == "dry":
+                imu_confidence = min(imu_confidence, 25)
+            updates = {
+                "navigationGpsSpeedAvailable": False,
+                "navigationGpsSpeedMps": 0.0,
+                "navigationBestSpeedMps": round(self._navigation.estimated_speed_mps, 3),
+                "navigationSpeedSource": "IMU estimate",
+                "navigationSpeedConfidencePercent": imu_confidence,
+            }
+        changed = {key: value for key, value in updates.items() if self._state.get(key) != value}
+        if changed:
+            self._set_state(**changed)
+
     def _process_text_line(self, response_text: str) -> None:
         self._set_state(lastResponse=response_text)
+        if response_text.startswith("TEL MOTOR OUT "):
+            output = _parse_motor_output_telemetry(response_text)
+            if output is not None:
+                self._last_motor_output_at = time.time()
+                rear_drive, rear_pwm, left_drive, left_pwm, right_drive, right_pwm = output
+                self._set_state(
+                    rearMotorActualDrive=rear_drive,
+                    frontLeftMotorActualDrive=left_drive,
+                    frontRightMotorActualDrive=right_drive,
+                    rearMotorPwm=rear_pwm,
+                    frontLeftMotorPwm=left_pwm,
+                    frontRightMotorPwm=right_pwm,
+                    motorOutputTelemetry=True,
+                )
+                self._last_protocol_response_time = time.time()
+            return
         self._append_comm_log(f"RX {response_text}")
 
         ack = parse_acknowledgement(response_text)
@@ -861,6 +1588,8 @@ class ControlStationBackend(QObject):
             ack_kind, ack_values = ack
             if ack_kind == "CTRL" and len(ack_values) >= 3 and ack_values[0] == "VECTOR":
                 self._set_state(ackVector=f"{ack_values[1]},{ack_values[2]}")
+            elif ack_kind == "CTRL" and len(ack_values) >= 4 and ack_values[0] == "MOTION":
+                self._set_state(ackVector=f"{ack_values[1]},{ack_values[2]}, yaw {ack_values[3]}")
             elif ack_kind == "CTRL" and len(ack_values) >= 2 and ack_values[0] == "HOLD":
                 self._set_state(holdPosition=(ack_values[1] == "ON"))
 
@@ -871,6 +1600,14 @@ class ControlStationBackend(QObject):
                 self._set_state(controllerMode=status_values[0].lower())
             elif status_key == "POS":
                 self._set_state(currentLocation=_format_location(status_values))
+                if len(status_values) >= 2 and "UNKNOWN" not in {value.upper() for value in status_values[:2]}:
+                    try:
+                        self._update_gps_fix(float(status_values[0]), float(status_values[1]))
+                    except ValueError:
+                        self._gps_speed.invalidate()
+                else:
+                    self._gps_speed.invalidate()
+                    self._refresh_speed_source()
             elif status_key == "TARGET":
                 self._set_state(targetLocation=_format_location(status_values))
             elif status_key == "HOLD" and status_values:
@@ -891,8 +1628,23 @@ class ControlStationBackend(QObject):
                 self._set_state(currentDepth=_parse_science_value(science_values, "m"))
             elif science_key == "IMU_ACCEL":
                 self._set_state(imuAccel=_parse_vector3_text(" ".join(science_values), "g"))
+                if len(science_values) >= 2:
+                    try:
+                        self._update_navigation_imu(
+                            float(science_values[0]),
+                            float(science_values[1]),
+                            float(science_values[2]) if len(science_values) >= 3 else 1.0,
+                        )
+                    except ValueError:
+                        pass
             elif science_key == "IMU_GYRO":
                 self._set_state(imuGyro=_parse_vector3_text(" ".join(science_values), "dps"))
+                if len(science_values) >= 3:
+                    try:
+                        self._last_imu_gyro = tuple(float(value) for value in science_values[:3])
+                        self._set_state(navigationMeasuredYawDps=round(self._last_imu_gyro[2], 1))
+                    except ValueError:
+                        pass
             elif science_key == "IMU_TEMP":
                 self._set_state(imuTemperature=_parse_science_value(science_values, "C"))
 
@@ -918,6 +1670,14 @@ class ControlStationBackend(QObject):
                     curve = 0.0
                     ramp_seconds = 0.0
                     default_reversed = False
+                if motor_name in self._motor_calibrations and direction in {"forward", "reverse"}:
+                    calibration = self._motor_calibrations[motor_name]
+                    calibration[direction] = {
+                        "minimum": sustain_min_pwm,
+                        "maximum": max_pwm,
+                        "curve": curve,
+                    }
+                    calibration["default_reversed"] = default_reversed
                 self._set_state(
                     motorConfigFetchId=int(self._state.get("motorConfigFetchId", 0)) + 1,
                     motorConfigMotor=motor_name,
@@ -929,6 +1689,13 @@ class ControlStationBackend(QObject):
                     motorConfigCurveTimes100=int(round(curve * 100.0)),
                     motorConfigRampTenths=int(round(ramp_seconds * 10.0)),
                     motorConfigDefaultReversed=default_reversed,
+                    rearMotorTargetPwm=self._motor_pwm_for_percent("rear", int(self._state.get("rearMotor", 0))),
+                    frontLeftMotorTargetPwm=self._motor_pwm_for_percent(
+                        "front_left", int(self._state.get("frontLeftMotor", 0))
+                    ),
+                    frontRightMotorTargetPwm=self._motor_pwm_for_percent(
+                        "front_right", int(self._state.get("frontRightMotor", 0))
+                    ),
                 )
 
         if is_protocol_message(response_text):
@@ -944,6 +1711,171 @@ class ControlStationBackend(QObject):
         if error_text is not None:
             self._set_state(lastSendResult=f"ERR {error_text}")
 
+    def _record_test_sample(
+        self,
+        sequence: int,
+        firmware_timestamp_ms: int,
+        accel_x_g: float,
+        accel_y_g: float,
+        accel_z_g: float,
+        gyro_x_dps: float,
+        gyro_y_dps: float,
+        gyro_z_dps: float,
+        temperature_c: float,
+    ) -> None:
+        session = self._test_session
+        if session is None or not session.active:
+            return
+
+        captured_at = time.time()
+        quality = self._test_imu_quality
+        if quality is None:
+            return
+        session_received = quality.received_count
+        session_missing = quality.missing_count
+        session_duplicates = quality.duplicate_count
+        session_out_of_order = quality.out_of_order_count
+        session_restarts = quality.restart_count
+        session_elapsed_ms = quality.elapsed_firmware_ms
+        session_total = session_received + session_missing
+        session_loss_pct = (session_missing / session_total * 100.0) if session_total > 0 else 0.0
+        session_rate_hz = (
+            (session_received - 1 - session_restarts) / (session_elapsed_ms / 1000.0)
+            if session_received - 1 - session_restarts > 0 and session_elapsed_ms > 0
+            else 0.0
+        )
+        arrival_interval_ms = (
+            None
+            if self._last_recorded_imu_arrival_at is None
+            else round(max(0.0, captured_at - self._last_recorded_imu_arrival_at) * 1000.0, 1)
+        )
+        self._last_recorded_imu_arrival_at = captured_at
+
+        def age_ms(last_update: float | None) -> float | None:
+            if last_update is None:
+                return None
+            return round(max(0.0, captured_at - last_update) * 1000.0, 1)
+
+        sample = {
+            "environment": str(self._state.get("navigationTestEnvironment", "")),
+            "link_status": str(self._state.get("serialStatus", "")),
+            "imu": {
+                "sequence": sequence,
+                "firmware_timestamp_ms": firmware_timestamp_ms,
+                "firmware_interval_ms": quality.last_interval_ms,
+                "arrival_interval_ms": arrival_interval_ms,
+                "accel_g": {"x": accel_x_g, "y": accel_y_g, "z": accel_z_g},
+                "gyro_dps": {"x": gyro_x_dps, "y": gyro_y_dps, "z": gyro_z_dps},
+                "temperature_c": temperature_c,
+                "session_received": session_received,
+                "session_missing": session_missing,
+                "session_duplicates": session_duplicates,
+                "session_out_of_order": session_out_of_order,
+                "session_restarts": session_restarts,
+                "session_loss_percent": round(session_loss_pct, 3),
+                "session_effective_hz": round(session_rate_hz, 3),
+            },
+            "motion": {
+                "input_mode": str(self._state.get("controlInputMode", "")),
+                "requested_percent": {
+                    "lateral": int(self._state.get("navigationRequestedTurn", 0)),
+                    "thrust": int(self._state.get("navigationRequestedThrust", 0)),
+                    "yaw": int(self._state.get("navigationRequestedYaw", 0)),
+                },
+                "output_percent": {
+                    "lateral": int(self._state.get("turn", 0)),
+                    "thrust": int(self._state.get("thrust", 0)),
+                    "yaw": int(self._state.get("yaw", 0)),
+                },
+            },
+            "motors": {
+                "telemetry_age_ms": age_ms(self._last_motor_output_at),
+                "rear": {
+                    "mixed_percent": int(self._state.get("rearMotor", 0)),
+                    "target_pwm": int(self._state.get("rearMotorTargetPwm", 0)),
+                    "actual_drive": int(self._state.get("rearMotorActualDrive", 0)),
+                    "applied_pwm": int(self._state.get("rearMotorPwm", -1)),
+                },
+                "front_left": {
+                    "mixed_percent": int(self._state.get("frontLeftMotor", 0)),
+                    "target_pwm": int(self._state.get("frontLeftMotorTargetPwm", 0)),
+                    "actual_drive": int(self._state.get("frontLeftMotorActualDrive", 0)),
+                    "applied_pwm": int(self._state.get("frontLeftMotorPwm", -1)),
+                },
+                "front_right": {
+                    "mixed_percent": int(self._state.get("frontRightMotor", 0)),
+                    "target_pwm": int(self._state.get("frontRightMotorTargetPwm", 0)),
+                    "actual_drive": int(self._state.get("frontRightMotorActualDrive", 0)),
+                    "applied_pwm": int(self._state.get("frontRightMotorPwm", -1)),
+                },
+            },
+            "power": {
+                **self._latest_power,
+                "telemetry_age_ms": age_ms(self._last_power_at),
+            },
+            "navigation": {
+                "measured_linear_accel_g": {
+                    "x": float(self._state.get("navigationMeasuredXG", 0.0)),
+                    "y": float(self._state.get("navigationMeasuredYG", 0.0)),
+                    "magnitude": float(self._state.get("navigationMeasuredMagnitudeG", 0.0)),
+                },
+                "roll_deg": float(self._state.get("navigationRollDeg", 0.0)),
+                "pitch_deg": float(self._state.get("navigationPitchDeg", 0.0)),
+                "tilt_rate_dps": float(self._state.get("navigationTiltRateDps", 0.0)),
+                "tilt_compensating": bool(self._state.get("navigationTiltCompensating", False)),
+                "estimated_speed_mps": float(self._state.get("navigationEstimatedSpeedMps", 0.0)),
+                "direction_error_deg": float(self._state.get("navigationDirectionErrorDeg", 0.0)),
+                "correction_deg": float(self._state.get("navigationCorrectionDeg", 0.0)),
+                "assist_active": bool(self._state.get("navigationAssistActive", False)),
+            },
+        }
+        try:
+            session.write_sample(sample, captured_at)
+        except (OSError, ValueError) as exc:
+            try:
+                session.close("write_error")
+            except OSError:
+                pass
+            self._test_session = None
+            self._test_imu_quality = None
+            self._set_state(
+                testSessionActive=False,
+                testSessionStatus=f"Recorder stopped: {exc}",
+            )
+            return
+        self._set_state(
+            testSessionSampleCount=session.sample_count,
+            testSessionImuRateHz=session_rate_hz,
+            testSessionImuLossPercent=session_loss_pct,
+        )
+
+    def _test_session_summary(self) -> dict[str, object]:
+        quality = self._test_imu_quality
+        if quality is None:
+            return {"imu_stream": {"target_hz": 20.0, "received": 0}}
+        received = quality.received_count
+        missing = quality.missing_count
+        elapsed_ms = quality.elapsed_firmware_ms
+        expected = received + missing
+        effective_hz = (
+            (received - 1 - quality.restart_count) / (elapsed_ms / 1000.0)
+            if received - 1 - quality.restart_count > 0 and elapsed_ms > 0
+            else 0.0
+        )
+        return {
+            "imu_stream": {
+                "target_hz": 20.0,
+                "received": received,
+                "missing": missing,
+                "duplicates": quality.duplicate_count,
+                "out_of_order": quality.out_of_order_count,
+                "firmware_restarts": quality.restart_count,
+                "loss_percent": round((missing / expected * 100.0) if expected else 0.0, 3),
+                "effective_hz": round(effective_hz, 3),
+                "elapsed_firmware_ms": elapsed_ms,
+            }
+        }
+
     def _process_binary_telemetry(self) -> None:
         packets = read_telemetry_packets(self._transport)
         if not packets:
@@ -957,24 +1889,42 @@ class ControlStationBackend(QObject):
 
         for packet in packets:
             if packet.packet_type == "IMU":
-                if self._imu_last_sequence is not None:
-                    expected_next = (self._imu_last_sequence + 1) & 0xFFFF
-                    if packet.sequence != expected_next:
-                        gap = (packet.sequence - expected_next) & 0xFFFF
-                        self._imu_missing_count += gap
-                self._imu_last_sequence = packet.sequence
-                self._imu_received_count += 1
-                total_imu = self._imu_received_count + self._imu_missing_count
-                loss_pct = (self._imu_missing_count / total_imu * 100.0) if total_imu > 0 else 0.0
+                if not self._imu_quality.observe(packet.sequence, packet.timestamp_ms):
+                    continue
+                quality = self._imu_quality
+                if self._test_imu_quality is not None:
+                    self._test_imu_quality.observe(packet.sequence, packet.timestamp_ms)
                 ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, temperature_c = packet.values
+                self._update_navigation_imu(ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps)
                 self._set_state(
                     imuAccel=f"{ax_g:.3f}, {ay_g:.3f}, {az_g:.3f} g",
                     imuGyro=f"{gx_dps:.1f}, {gy_dps:.1f}, {gz_dps:.1f} dps",
                     imuTemperature=f"{temperature_c:.2f} C",
-                    imuUdpLoss=f"{loss_pct:.1f}% ({self._imu_missing_count}/{total_imu})",
+                    imuUdpLoss=(
+                        f"{quality.loss_percent:.1f}% "
+                        f"({quality.missing_count} missing / {quality.expected_count} expected; "
+                        f"{quality.effective_hz:.1f} Hz)"
+                    ),
+                )
+                self._record_test_sample(
+                    packet.sequence,
+                    packet.timestamp_ms,
+                    ax_g,
+                    ay_g,
+                    az_g,
+                    gx_dps,
+                    gy_dps,
+                    gz_dps,
+                    temperature_c,
                 )
             elif packet.packet_type == "POWER":
                 battery_volts, current_amps, battery_pct = packet.values
+                self._last_power_at = time.time()
+                self._latest_power = {
+                    "battery_voltage_v": battery_volts,
+                    "current_a": current_amps,
+                    "battery_percent": battery_pct,
+                }
                 self._set_state(
                     batteryStatus=_format_udp_battery_status(battery_volts, current_amps, battery_pct),
                     currentDraw=f"{current_amps:.3f} A",
@@ -982,6 +1932,9 @@ class ControlStationBackend(QObject):
             elif packet.packet_type == "STATE":
                 mode_value, hold_enabled, gps_valid, _motors_enabled = packet.values
                 current_location = str(self._state.get("currentLocation", "Unknown")) if gps_valid else "Unknown"
+                if not gps_valid:
+                    self._gps_speed.invalidate()
+                    self._refresh_speed_source()
                 self._set_state(
                     controllerMode=_decode_control_mode(mode_value),
                     holdPosition=bool(hold_enabled),
@@ -990,6 +1943,7 @@ class ControlStationBackend(QObject):
             elif packet.packet_type == "GPS":
                 latitude, longitude = packet.values
                 self._set_state(currentLocation=_format_udp_position(latitude, longitude))
+                self._update_gps_fix(latitude, longitude)
             elif packet.packet_type == "RANGE":
                 distance_mm, valid = packet.values
                 self._set_state(currentDepth=(f"{distance_mm / 1000.0:.3f} m" if valid else "N/A"))
@@ -1025,6 +1979,7 @@ class ControlStationBackend(QObject):
         self.stateChanged.emit()
 
     def _tick(self) -> None:
+        self._refresh_speed_source()
         if self._joystick is None:
             self._joystick = get_controller()
             if self._joystick is not None:
@@ -1134,6 +2089,8 @@ def run(args: argparse.Namespace) -> None:
 
     engine = QQmlApplicationEngine()
     backend = ControlStationBackend(args, log_file, prefs_path)
+    keyboard_drive_filter = KeyboardDriveFilter(backend)
+    app.installEventFilter(keyboard_drive_filter)
     engine.rootContext().setContextProperty("backend", backend)
 
     qml_path = app_dir / "qml" / "Main.qml"

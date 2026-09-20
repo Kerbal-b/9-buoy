@@ -5,6 +5,10 @@ def format_vector_command(turn: int, thrust: int) -> str:
     return f"CTRL VECTOR {turn:+d} {thrust:+d}\n"
 
 
+def format_motion_command(lateral: int, thrust: int, yaw: int) -> str:
+    return f"CTRL MOTION {lateral:+d} {thrust:+d} {yaw:+d}\n"
+
+
 def is_protocol_message(text: str) -> bool:
     return text.startswith(("ACK ", "ERR ", "TEL "))
 

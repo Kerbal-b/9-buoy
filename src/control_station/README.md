@@ -26,7 +26,7 @@ Review this section after each control station update and confirm that the code 
 - Main movement input: left stick X for horizontal movement and left stick Y for forward and reverse movement
 - Deadzone behavior: ignore small stick movement near center
 - Buoy layout: one rear motor and two front motors arranged with 120 degree spacing
-- Output command format: `CTRL VECTOR <turn> <thrust>`
+- Output command formats: `CTRL VECTOR <lateral> <thrust>` and `CTRL MOTION <lateral> <thrust> <yaw>`
 - Hello ping mode: optional repeated `hello world` messages for link testing
 - Default transport path: Wi-Fi TCP for reliable commands plus UDP for fast telemetry
 - Alternate paths: HM-10 BLE or serial when explicitly selected
@@ -43,7 +43,7 @@ The main control-station window uses three stable panel regions:
 
 - Top-left: `Buoy Visualization` — the buoy shape, motor arrangement, and movement vector.
 - Bottom-left: `Buoy Operational` — connection, Wi-Fi, navigation, movement, power, and operational telemetry.
-- Full-height right: `Dashboard` — a tabbed area for Science & Audio, logs, maps/science views, motor testing, and future subtabs.
+- Full-height right: `Dashboard` — a tabbed area for Science & Audio, logs, maps/science views, motor testing, navigation testing, and future subtabs.
 
 Future control-station changes must preserve these three regions and their responsibilities. New right-side features should be added as Dashboard subtabs. Change this layout only when the project owner explicitly requests a design change.
 
@@ -80,6 +80,8 @@ Future control-station changes must preserve these three regions and their respo
 - `qml/Main.qml` main three-region window layout and dashboard tabs
 - `qml/ScienceAudioPanel.qml` Science & Audio dashboard tab
 - `qml/MotorTestPanel.qml` motor testing, output visualization, and calibration dashboard tab
+- `qml/NavigationTestPanel.qml` requested-versus-measured movement visualization and opt-in navigation balance-assist controls
+- `station/navigation.py` filtered IMU direction comparison and bounded real-time correction algorithm
 - `requirements.txt` Python dependencies for the laptop program
 - `setup_env.sh` create the local virtual environment and install dependencies
 - `activate_env.sh` activate the local virtual environment in the current shell
@@ -108,6 +110,32 @@ Value meaning:
 - Magnitude 0 stops all motors
 
 The Arduino buoy firmware receives the `CTRL VECTOR` command, computes the required motor thrusts using the same geometry model, and applies them to the motors.
+
+Independent yaw uses the three-axis command:
+
+```text
+CTRL MOTION <lateral> <thrust> <yaw>
+```
+
+All three values range from `-100` to `+100`. Translation-only commands continue using `CTRL VECTOR` for compatibility. When yaw is combined with translation, the firmware scales the complete three-motor mix together if necessary so no motor exceeds its allowed command range.
+
+## Navigation Test Mode
+
+The `Navigation Test` dashboard tab compares three body-frame vectors:
+
+- the operator's requested controller vector
+- horizontal linear acceleration from the MPU6050 after low-frequency gravity and hull tilt are removed
+- the corrected vector actually sent to the buoy
+
+Balance assist is opt-in. Zero the IMU while the buoy is stationary, verify the measured-axis direction with short low-power inputs, and only then enable assist. The algorithm preserves requested magnitude and applies a smoothed angular correction limited by the configured maximum. It automatically disengages when IMU telemetry becomes stale, the connection drops, or the operator leaves the Navigation Test tab. Active corrections are recorded as `NAV` entries in the communication log.
+
+The installed MPU6050 is mounted 90 degrees clockwise. Navigation Test therefore defaults to swapping X/Y and inverting the mapped X axis: buoy-right is sensor `-Y`, and buoy-forward is sensor `+X`.
+
+Navigation Test includes cockpit-style movement instruments for roll, pitch, linear acceleration, yaw rate, and speed. Speed uses fresh multi-fix GPS ground speed when available and falls back gracefully to a low-confidence, short-term IMU integration when GPS is missing or stale. Select `Dry land` or `In water` before testing. Dry-land mode intentionally caps speed confidence because propeller response in air does not predict thrust or drag in water; a water-response model requires matched water trials with motor command, acceleration, current, yaw, and GPS data.
+
+Enable `Keyboard Drive` in Navigation Test to capture the keyboard globally instead of letting focused controls use it for interface navigation. `W/S` move forward and reverse, `A/D` translate left and right, and the Left/Right arrows command independent yaw. Combined movement is supported. Space stops all motors, and both Space and leaving the tab require the physical controller to return to center before movement can resume.
+
+The accelerometer measures transient acceleration rather than steady thrust, velocity, or course over water. This mode is intended for low-speed motor-balance experiments; reliable steady-course navigation will require GPS, heading, or water-speed feedback in a later control layer.
 
 Responses from the buoy should use:
 

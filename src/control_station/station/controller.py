@@ -29,18 +29,39 @@ def apply_deadzone(value: float, deadzone: float) -> float:
     return clamp_unit(value)
 
 
+def _map_controller_motion(
+    raw_left_x: float,
+    raw_left_y: float,
+    raw_right_x: float,
+    deadzone: float,
+) -> tuple[float, float, float]:
+    """Map standard SDL Xbox axes to lateral, thrust, and yaw commands."""
+    lateral = apply_deadzone(raw_left_x, deadzone)
+    thrust = apply_deadzone(-raw_left_y, deadzone)
+    yaw = apply_deadzone(raw_right_x, deadzone)
+    return lateral, thrust, yaw
+
+
+def read_motion_axes(
+    joystick: pygame.joystick.Joystick | None, deadzone: float
+) -> tuple[float, float, float]:
+    if joystick is None or pygame is None:
+        return 0.0, 0.0, 0.0
+
+    pygame.event.pump()
+    return _map_controller_motion(
+        _get_axis(joystick, 0),
+        _get_axis(joystick, 1),
+        _get_axis(joystick, 2),
+        deadzone,
+    )
+
+
 def read_axes(
     joystick: pygame.joystick.Joystick | None, deadzone: float
 ) -> tuple[float, float]:
-    if joystick is None or pygame is None:
-        return 0.0, 0.0
-
-    pygame.event.pump()
-    raw_turn = joystick.get_axis(0)
-    raw_thrust = -joystick.get_axis(1)
-    turn = apply_deadzone(raw_turn, deadzone)
-    thrust = apply_deadzone(raw_thrust, deadzone)
-    return turn, thrust
+    lateral, thrust, _yaw = read_motion_axes(joystick, deadzone)
+    return lateral, thrust
 
 
 def _get_axis(joystick: pygame.joystick.Joystick, index: int) -> float:

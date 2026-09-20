@@ -10,8 +10,11 @@ class ManualCommand:
     rear_motor: int
     front_left_motor: int
     front_right_motor: int
+    yaw: int = 0
 
     def to_line(self) -> str:
+        if self.yaw != 0:
+            return f"CTRL MOTION {self.turn:+d} {self.thrust:+d} {self.yaw:+d}\n"
         return f"CTRL VECTOR {self.turn:+d} {self.thrust:+d}\n"
 
 

@@ -12,11 +12,11 @@ Item {
     property int testPowerPercent: 0
     property bool testRunning: false
 
-    property int calibrationStartBoostPwm: 96
+    property int calibrationStartBoostPwm: 170
     property int calibrationStartBoostMs: 250
-    property int calibrationSustainMinPwm: 72
+    property int calibrationSustainMinPwm: 170
     property int calibrationMaxPwm: 255
-    property int calibrationCurveTimes100: 125
+    property int calibrationCurveTimes100: 200
     property int calibrationRampTenths: 20
     property bool calibrationDefaultReversed: false
 
@@ -69,7 +69,7 @@ Item {
     function steadyPwmForPercent(percent) {
         const magnitude = clamp(Math.abs(Number(percent) || 0), 0, 100)
         if (magnitude <= 0) return 0
-        const drive = 11 + ((255 - 11) * magnitude / 100.0)
+        const drive = 255 * magnitude / 100.0
         const normalizedDrive = drive / 255.0
         const curve = Math.max(0.1, calibrationCurveTimes100 / 100.0)
         return calibrationSustainMinPwm +
@@ -108,6 +108,7 @@ Item {
 
         configLastRequestedKey = requestKey
         backendObject.requestMotorConfiguration(motorKey(selectedMotorIndex), "forward")
+        backendObject.requestMotorConfiguration(motorKey(selectedMotorIndex), "reverse")
     }
 
     function syncConfiguration() {
