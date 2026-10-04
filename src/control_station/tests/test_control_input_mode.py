@@ -17,8 +17,9 @@ class ControlInputModeTests(unittest.TestCase):
         limited = _limit_motion_to_motor_output(0.0, 1.0, 0.0)
         command = build_manual_command(*limited)
 
-        self.assertEqual(command.rear_motor, 50)
-        self.assertLessEqual(max(abs(command.front_left_motor), abs(command.front_right_motor)), 50)
+        self.assertEqual(command.rear_motor, 0)
+        self.assertEqual(command.front_left_motor, 50)
+        self.assertEqual(command.front_right_motor, 50)
 
     def test_combined_motion_cannot_saturate_any_motor(self) -> None:
         limited = _limit_motion_to_motor_output(1.0, 1.0, 1.0)

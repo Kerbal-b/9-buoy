@@ -34,11 +34,23 @@ Item {
             width: navigationScroll.availableWidth - 36
             spacing: 14
 
-            Text {
-                text: "Navigation Test"
-                color: "#e6ecf2"
-                font.pixelSize: 22
-                font.bold: true
+            Row {
+                width: parent.width
+                height: 36
+                Text {
+                    text: "Navigation Test"
+                    color: "#e6ecf2"
+                    font.pixelSize: 22
+                    font.bold: true
+                    width: parent.width - 190
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                Button {
+                    text: backendState.imuStreamEnabled ? "Stop IMU stream" : "Start IMU stream"
+                    enabled: root.connected()
+                    onClicked: if (backendObject) backendObject.setImuStreamEnabled(!backendState.imuStreamEnabled)
+                    anchors.verticalCenter: parent.verticalCenter
+                }
             }
 
             Text {

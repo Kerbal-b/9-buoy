@@ -14,7 +14,7 @@ This file explains what the main source files mean and what configuration decisi
   - scientific sensors should cover environmental and research measurements
   - telemetry/reporting should format and emit status from those subsystems
 - Update this reference file when the firmware structure, protocol, or subsystem responsibilities change.
-- Update the centralized wiring documentation in `docs/wiring/` whenever a device or connection changes; do not duplicate schematics in this file.
+- Update the centralized wiring documentation in `docs/hardware/wiring/` whenever a device or connection changes; do not duplicate schematics in this file.
 
 ## Main Source Areas
 
@@ -141,7 +141,7 @@ TEL SCI IMU_TEMP <c|UNKNOWN>
 
 ### Legacy Wiring Documentation
 
-The historical Nano, HC-05, motor, and sensor schematic is retained in `docs/wiring/legacy-nano-hc05-wiring.md`. The active ESP32 wiring starts at `docs/wiring/README.md`.
+The historical Nano, HC-05, motor, and sensor schematic is retained in `docs/archive/hardware/wiring/legacy-nano-hc05-wiring.md`. The active ESP32 wiring starts at `docs/hardware/wiring/README.md`.
 
 ### Important Notes
 
@@ -162,28 +162,28 @@ The historical Nano, HC-05, motor, and sensor schematic is retained in `docs/wir
 
 ## ESP32 Controller Wiring
 
-The active firmware assigns UART1 to GPS, keeps UART0 for USB/debug, and leaves UART2 reserved. The former migration draft and duplicated pin list were removed so they cannot drift from the production firmware and centralized wiring documents.
+The active firmware uses UART1 receive-only for GPS. `GPIO1`, normally UART0 TX, is repurposed as the microSD chip-select line, so ordinary USB-serial output is unavailable while this SD wiring is active. UART2 has no active peripheral.
 
 ### ESP32 Wiring Documentation
 
-All active-build schematics, device connection tables, physical verification notes, and the consolidated ESP32 pin map are maintained in `docs/wiring/`. Start with `docs/wiring/README.md`.
+All active-build schematics, device connection tables, physical verification notes, and the consolidated ESP32 pin map are maintained in `docs/hardware/wiring/`. Start with `docs/hardware/wiring/README.md`.
 
-The production firmware remains the source of truth for active GPIO assignments. Do not add a second schematic here; update the device file and index in `docs/wiring/` instead.
+The production firmware remains the source of truth for active GPIO assignments. Do not add a second schematic here; update the device file and index in `docs/hardware/wiring/` instead.
 
 ### ESP32 Pin-Selection Notes
 
 - Avoid `GPIO6` to `GPIO11` (connected to onboard flash on most dev boards).
 - Avoid boot strap pins for critical outputs during reset (`GPIO0`, `GPIO2`, `GPIO12`, `GPIO15`).
-- Keep analog sensing on `ADC1` input-only pins when possible; the current plan uses `GPIO34` and `GPIO35` for sensors.
-- `GPIO34` and `GPIO35` are input-only, which is ideal for analog sensors.
+- Analog sensors use an external ADS1115 on I2C. Its channels are `A0` current, `A1` battery, `A2` TDS, and `A3` turbidity.
+- `GPIO35` is an input-only microSD `MISO` line. `GPIO34` is not assigned by the active firmware.
 - `GPIO14` is used for the DS18B20 1-Wire data line in the current wiring plan.
 - `GPIO36` (`VP`) is used for the INMP441 microphone data line and is input-only, which matches the I2S microphone output.
-- `GPIO39` is input-only, which is ideal for the RCWL-1655 echo pulse.
-- `GPIO13` is reserved for the RCWL-1655 trigger pulse in the current wiring plan.
-- Motor control is currently assigned to `GPIO18/19/21/22/32/33` to match the latest wiring layout.
-- I2C is currently assigned to `GPIO23/27` so it does not conflict with the front-right motor on `GPIO21/22`.
-- The current control architecture uses onboard Wi-Fi for command and telemetry transport, so `UART2` remains available for GPS swap, secondary radio, or diagnostics.
-- The RCWL-1655 now feeds both periodic UDP `RANGE` packets and text `TEL SCI DEPTH` updates.
+- `GPIO39` is input-only and receives the JSN-SR04T V3.0 echo pulse.
+- `GPIO13` sends the JSN-SR04T V3.0 trigger pulse.
+- Motor control is assigned to `GPIO18/19/21/22/32/33`; all six are hardware-PWM outputs for the three dual-input H-bridges.
+- I2C is assigned to `GPIO23/27` so it does not conflict with either front motor pair.
+- The current control architecture uses onboard Wi-Fi for command and telemetry transport. ExpressLRS/CRSF is not implemented in the active firmware.
+- The JSN-SR04T V3.0 feeds both periodic UDP `RANGE` packets and text `TEL SCI DEPTH` updates.
 - The ESP32 firmware uses `OneWire` + `DallasTemperature` on `GPIO14` for `TEL SCI WATER_TEMP` support.
 
 ## ESP32 Production Firmware
@@ -195,17 +195,21 @@ The production firmware remains the source of truth for active GPIO assignments.
 ### What It Does
 
 - Implements buoy motor control and telemetry protocol directly on ESP32.
-- Uses all three ESP32 UART controllers with explicit roles:
-  - `UART0`: USB programming/debug monitor
-  - `UART1`: GPS
-  - `UART2`: reserved for future expansion
+- Uses UART1 receive-only for GPS at `9600 baud`.
+- Repurposes the normal UART0 TX pin (`GPIO1`) as microSD chip select; ordinary USB-serial runtime logging is therefore unavailable with the active SD wiring.
+- Does not currently implement ExpressLRS/CRSF or another UART2 peripheral.
 - Joins the buoy Wi-Fi network as a station in the current build.
 - Accepts reliable control commands over TCP.
 - Streams fast telemetry over UDP using compact binary packets for IMU, range, power, state, GPS, and stereo audio data, and emits DS18B20 water-temperature text telemetry.
 - Uses grouped motor pins to simplify physical harness routing.
+- Drives one `IN1`/`IN2` PWM input per motor direction, holds both inputs low for stop, and pauses at zero before reversing.
+- Stops all propulsion on Wi-Fi/TCP loss and enforces a `1000 ms` control-command watchdog; the motor-test panel refreshes an active test every `250 ms`.
 - Inverts motor polarity in software to match the current water-tested buoy wiring and propeller orientation.
 - Keeps protocol compatibility with existing `CTRL ...`, `PING`, and `REQ STATUS ALL` command flow.
 - Supports `CTRL MOTION <lateral> <thrust> <yaw>` for independent translation and yaw control while retaining `CTRL VECTOR` for translation-only compatibility.
+- Uses the external tangential motor profile for the rebuilt hull:
+  rear `(1, 0)`, front-left `(0.5, 0.866)`, front-right `(-0.5, 0.866)`,
+  with pure-yaw gains `(+1, -1, +1)`.
 
 ## ESP32 Bring-Up Test Firmware
 

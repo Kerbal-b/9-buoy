@@ -4,8 +4,10 @@ import argparse
 from array import array
 from collections import deque
 from dataclasses import asdict
+from datetime import datetime, timezone
 import math
 from pathlib import Path
+import queue
 import sys
 import time
 import threading
@@ -14,12 +16,12 @@ try:
     import pygame
 except ModuleNotFoundError:
     pygame = None
-from PySide6.QtCore import QEvent, QObject, Property, QTimer, Qt, Signal, Slot, QUrl
+from PySide6.QtCore import QEvent, QObject, Property, QStandardPaths, QTimer, Qt, Signal, Slot, QUrl
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 
 from .controller import get_controller, read_motion_axes
-from .geometry import build_manual_command
+from .geometry import ACTIVE_MOTOR_MIX, MOTOR_OUTPUT_BOOST, build_manual_command
 from .models import ScienceSample
 from .navigation import GpsSpeedTracker, NavigationAssist
 from .log_categories import (
@@ -46,6 +48,7 @@ from .serial_link import (
     send_command,
     send_text,
 )
+from .sd_card_client import delete_sd_session, download_sd_file, download_sd_session, list_sd_files, list_sd_session
 from .test_session import PersistentTestSession
 from .telemetry_quality import ImuStreamQuality
 
@@ -223,6 +226,54 @@ def _update_audio_waveform_buffer(waveform_buffer: deque[float], samples: array,
     return normalized_peak
 
 
+def _update_channel_waveforms(
+    left_buffer: deque[float], right_buffer: deque[float], samples: array, channels: int
+) -> tuple[float, float | None]:
+    if channels <= 0:
+        return 0.0, None
+    left_values: list[int] = []
+    right_values: list[int] = []
+    for index in range(0, len(samples) - channels + 1, channels):
+        left_values.append(int(samples[index]))
+        if channels > 1:
+            right_values.append(int(samples[index + 1]))
+    if not left_values:
+        return 0.0, (0.0 if channels > 1 else None)
+
+    def append_centered(values: list[int], buffer: deque[float]) -> float:
+        offset = sum(values) / len(values)
+        centered = [value - offset for value in values]
+        peak = max(abs(value) for value in centered) / 32768.0
+        gain = min(100.0, 0.75 / peak) if peak > 0.0 else 1.0
+        for value in centered:
+            buffer.append(max(-1.0, min(1.0, (value / 32768.0) * gain)))
+        return peak * 100.0
+
+    left_peak = append_centered(left_values, left_buffer)
+    right_peak = append_centered(right_values, right_buffer) if channels > 1 else None
+    return left_peak, right_peak
+
+
+def _audio_channel_rms_percent(samples: array, channels: int) -> tuple[float, float | None]:
+    if channels <= 0:
+        return 0.0, None
+    values = ([], [])
+    for index in range(0, len(samples) - channels + 1, channels):
+        values[0].append(int(samples[index]))
+        if channels > 1:
+            values[1].append(int(samples[index + 1]))
+
+    def rms_percent(channel_samples: list[int]) -> float:
+        if not channel_samples:
+            return 0.0
+        mean = sum(channel_samples) / len(channel_samples)
+        mean_square = sum(value * value for value in channel_samples) / len(channel_samples)
+        centered_rms = math.sqrt(max(0.0, mean_square - mean * mean))
+        return centered_rms / 32768.0 * 100.0
+
+    return rms_percent(values[0]), (rms_percent(values[1]) if channels > 1 else None)
+
+
 def _clamp_axis(value: float) -> float:
     return max(-1.0, min(1.0, value))
 
@@ -257,12 +308,10 @@ def _limit_motion_to_motor_output(
     lateral = _clamp_axis(lateral)
     thrust = _clamp_axis(thrust)
     yaw = _clamp_axis(yaw)
-    translation_scale = (2.0 / 3.0) * 2.0
-    front_x = math.sqrt(3.0) / 2.0
-    mixed = (
-        (translation_scale * thrust) + yaw,
-        (translation_scale * ((lateral * front_x) - (thrust * 0.5))) + yaw,
-        (translation_scale * ((-lateral * front_x) - (thrust * 0.5))) + yaw,
+    translation_scale = (2.0 / 3.0) * MOTOR_OUTPUT_BOOST
+    mixed = tuple(
+        translation_scale * ((lateral * axis[0]) + (thrust * axis[1])) + (yaw * yaw_gain)
+        for axis, yaw_gain in zip(ACTIVE_MOTOR_MIX.axes, ACTIVE_MOTOR_MIX.yaw_gains)
     )
     peak = max(abs(value) for value in mixed)
     bounded_maximum = max(0.0, min(1.0, float(maximum)))
@@ -361,6 +410,7 @@ class ControlStationBackend(QObject):
             "mixerPowerPercent": int(round(DEFAULT_MIXER_POWER_LIMIT * 100.0)),
             "serialStatus": "Disconnected",
             "serialTarget": "No port selected",
+            "firmwareVersion": "Unknown",
             "lastSendResult": "Waiting for first command",
             "lastSentLine": "Nothing sent yet",
             "lastResponse": "No response yet",
@@ -395,6 +445,35 @@ class ControlStationBackend(QObject):
             "imuUdpLoss": "N/A",
             "audioStream": "N/A",
             "audioLevel": "N/A",
+            "audioChannelCount": 0,
+            "audioCaptureChannel": "BOTH",
+            "audioRecordingEnabled": False,
+            "audioSdStatus": "Unknown",
+            "audioSampleRateHz": 16000,
+            "audioQuality": "DEFAULT",
+            "audioQualityLocked": False,
+            "sdFiles": [],
+            "sdCardCapacity": {},
+            "sdSessions": [],
+            "scienceExperimentState": "IDLE",
+            "scienceSessionPath": "",
+            "serviceMode": False,
+            "sdDownloadActive": False,
+            "sdDownloadSessionPath": "",
+            "audioStreamEnabled": False,
+            "imuStreamEnabled": False,
+            "sdCardStatus": "Connect over Wi-Fi, then refresh to browse the card",
+            "sdTransferStatus": "Idle",
+            "sdTransferProgress": 0.0,
+            "sdTransferBytes": 0,
+            "sdTransferTotalBytes": 0,
+            "sdTransferSpeedBytesPerSecond": 0.0,
+            "sdTransferElapsedSeconds": 0.0,
+            "sdTransferEtaSeconds": -1.0,
+            "sdTransferFileName": "",
+            "sdBusy": False,
+            "sdSelectedPath": "",
+            "audioPacketLossStatus": "Packet loss unavailable until the audio firmware is updated",
             "motorConfigFetchId": 0,
             "motorConfigMotor": "",
             "motorConfigDirection": "",
@@ -455,12 +534,38 @@ class ControlStationBackend(QObject):
             "navigationCorrectedFrontRightMotor": 0,
         }
         self._comm_log: list[str] = []
+        self._command_trace_pending: list[str] = []
+        self._last_command_trace_flush = time.monotonic()
         self._categorized_log: list[dict[str, str]] = []
         self._system_log: list[dict[str, str]] = []
         self._navigation_log: list[dict[str, str]] = []
         self._scientific_log: list[dict[str, str]] = []
         self._science_history: list[dict[str, object]] = []
         self._audio_waveform: list[float] = [0.0] * 480
+        self._audio_left_waveform: list[float] = [0.0] * 480
+        self._audio_right_waveform: list[float] = [0.0] * 480
+        self._audio_left_level = "N/A"
+        self._audio_right_level = "N/A"
+        self._audio_left_rms_percent = 0.0
+        self._audio_right_rms_percent = 0.0
+        self._audio_sample_rate = 0
+        self._audio_channels = 0
+        self._audio_packet_version = 0
+        self._audio_last_sequence: int | None = None
+        self._audio_packets_received = 0
+        self._audio_packets_lost = 0
+        self._audio_packets_out_of_order = 0
+        self._audio_playback_drops = 0
+        self._last_audio_ui_update = 0.0
+        self._audio_high_pass = True
+        self._audio_high_pass_hz = 80.0
+        self._audio_low_pass = True
+        self._audio_low_pass_hz = 6000.0
+        self._audio_noise_gate = False
+        self._audio_noise_gate_percent = 2.5
+        self._audio_filter_previous_x = [0.0, 0.0]
+        self._audio_filter_previous_y = [0.0, 0.0]
+        self._audio_filter_low_pass_y = [0.0, 0.0]
         default_profile = {"minimum": 130, "maximum": 255, "curve": 2.0}
         self._motor_calibrations: dict[str, dict[str, object]] = {
             "rear": {
@@ -471,7 +576,7 @@ class ControlStationBackend(QObject):
             "front_left": {
                 "forward": dict(default_profile),
                 "reverse": dict(default_profile),
-                "default_reversed": False,
+                "default_reversed": True,
             },
             "front_right": {
                 "forward": dict(default_profile),
@@ -484,8 +589,25 @@ class ControlStationBackend(QObject):
         self._network_interfaces = list_wifi_interfaces()
         self._wifi_local_ip = getattr(args, "wifi_local_ip", "auto") or "auto"
         self._waveform_buffer: deque[float] = deque([0.0] * 480, maxlen=480)
+        self._audio_left_buffer: deque[float] = deque([0.0] * 480, maxlen=480)
+        self._audio_right_buffer: deque[float] = deque([0.0] * 480, maxlen=480)
+        self._audio_debug_channel = "both"
+        self._audio_debug_gain = 100.0
         self._audio_channel = None
         self._mixer_ready = False
+        self._audio_playback_queue: queue.Queue[object] = queue.Queue(maxsize=8)
+        self._audio_playback_pending = bytearray()
+        self._audio_playback_wake = threading.Event()
+        self._audio_playback_running = False
+        self._audio_playback_thread: threading.Thread | None = None
+        self._audio_output_status = "Audio output has not started"
+        self._audio_output_device = "System default"
+        self._audio_output_devices = ["System default"]
+        self._audio_output_device = "System default"
+        self._audio_output_devices = ["System default"]
+        self._audio_playback_error = ""
+        self._audio_sounds_submitted = 0
+        self._audio_sounds_scheduled = 0
 
         self._transport = None
         self._connection_thread: threading.Thread | None = None
@@ -493,6 +615,14 @@ class ControlStationBackend(QObject):
         self._connection_in_flight = False
         self._pending_connection: tuple[int, LinkTransport | None, str, str] | None = None
         self._connection_request_id = 0
+        self._sd_operation_lock = threading.Lock()
+        self._sd_pending_result: tuple[str, object] | None = None
+        self._sd_progress_pending: tuple[int, int, str] | None = None
+        self._sd_operation_thread: threading.Thread | None = None
+        self._sd_operation_busy = False
+        self._sd_transfer_started_at = 0.0
+        self._sd_cancel_event = threading.Event()
+        self._sd_service_requested = False
         self._joystick = None
         self._rx_buffer = bytearray()
         self._command = build_manual_command(0.0, 0.0)
@@ -571,6 +701,161 @@ class ControlStationBackend(QObject):
     def audioWaveform(self) -> list[float]:
         return self._audio_waveform
 
+    @Property(list, notify=stateChanged)
+    def audioLeftWaveform(self) -> list[float]:
+        return self._audio_left_waveform
+
+    @Property(list, notify=stateChanged)
+    def audioRightWaveform(self) -> list[float]:
+        return self._audio_right_waveform
+
+    @Property(str, notify=stateChanged)
+    def audioLeftLevel(self) -> str:
+        return self._audio_left_level
+
+    @Property(str, notify=stateChanged)
+    def audioRightLevel(self) -> str:
+        return self._audio_right_level
+
+    @Property(float, notify=stateChanged)
+    def audioLeftRmsPercent(self) -> float:
+        return self._audio_left_rms_percent
+
+    @Property(float, notify=stateChanged)
+    def audioRightRmsPercent(self) -> float:
+        return self._audio_right_rms_percent
+
+    @Property(str, notify=stateChanged)
+    def audioDebugChannel(self) -> str:
+        return self._audio_debug_channel
+
+    @Property(str, notify=stateChanged)
+    def audioCaptureChannel(self) -> str:
+        return str(self._state.get("audioCaptureChannel", "BOTH"))
+
+    @Property(bool, notify=stateChanged)
+    def audioRecordingEnabled(self) -> bool:
+        return bool(self._state.get("audioRecordingEnabled", False))
+
+    @Property(str, notify=stateChanged)
+    def audioSdStatus(self) -> str:
+        return str(self._state.get("audioSdStatus", "Unknown"))
+
+    @Property(int, notify=stateChanged)
+    def audioSampleRateHz(self) -> int:
+        return int(self._state.get("audioSampleRateHz", 16000))
+
+    @Property(str, notify=stateChanged)
+    def audioQuality(self) -> str:
+        return str(self._state.get("audioQuality", "DEFAULT"))
+
+    @Property(bool, notify=stateChanged)
+    def audioQualityLocked(self) -> bool:
+        return bool(self._state.get("audioQualityLocked", False))
+
+    @Property(list, notify=stateChanged)
+    def sdFiles(self) -> list[dict[str, object]]:
+        return list(self._state.get("sdFiles", []))
+
+    @Property(str, notify=stateChanged)
+    def sdCardStatus(self) -> str:
+        return str(self._state.get("sdCardStatus", "Unknown"))
+
+    @Property(str, notify=stateChanged)
+    def sdTransferStatus(self) -> str:
+        return str(self._state.get("sdTransferStatus", "Idle"))
+
+    @Property(float, notify=stateChanged)
+    def sdTransferProgress(self) -> float:
+        return float(self._state.get("sdTransferProgress", 0.0))
+
+    @Property(bool, notify=stateChanged)
+    def sdBusy(self) -> bool:
+        return bool(self._state.get("sdBusy", False))
+
+    @Property(QUrl, notify=stateChanged)
+    def sdDownloadSuggestedUrl(self) -> QUrl:
+        destination_dir = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation))
+        remote_path = str(self._state.get("sdSelectedPath", ""))
+        file_name = Path(remote_path).name or "sd-card-file.bin"
+        return QUrl.fromLocalFile(str(destination_dir / file_name))
+
+    @Property(QUrl, notify=stateChanged)
+    def sdDownloadFolderUrl(self) -> QUrl:
+        return QUrl.fromLocalFile(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation))
+
+    @Property(float, notify=stateChanged)
+    def audioDebugGain(self) -> float:
+        return self._audio_debug_gain
+
+    @Property(bool, notify=stateChanged)
+    def audioHighPassEnabled(self) -> bool:
+        return self._audio_high_pass
+
+    @Property(float, notify=stateChanged)
+    def audioHighPassHz(self) -> float:
+        return self._audio_high_pass_hz
+
+    @Property(bool, notify=stateChanged)
+    def audioLowPassEnabled(self) -> bool:
+        return self._audio_low_pass
+
+    @Property(float, notify=stateChanged)
+    def audioLowPassHz(self) -> float:
+        return self._audio_low_pass_hz
+
+    @Property(bool, notify=stateChanged)
+    def audioNoiseGateEnabled(self) -> bool:
+        return self._audio_noise_gate
+
+    @Property(float, notify=stateChanged)
+    def audioNoiseGatePercent(self) -> float:
+        return self._audio_noise_gate_percent
+
+    @Property(int, notify=stateChanged)
+    def audioPacketsReceived(self) -> int:
+        return self._audio_packets_received
+
+    @Property(int, notify=stateChanged)
+    def audioPacketsLost(self) -> int:
+        return self._audio_packets_lost
+
+    @Property(int, notify=stateChanged)
+    def audioPacketsOutOfOrder(self) -> int:
+        return self._audio_packets_out_of_order
+
+    @Property(int, notify=stateChanged)
+    def audioPlaybackDrops(self) -> int:
+        return self._audio_playback_drops
+
+    @Property(int, notify=stateChanged)
+    def audioPlaybackQueuedPackets(self) -> int:
+        return self._audio_playback_queue.qsize()
+
+    @Property(str, notify=stateChanged)
+    def audioOutputStatus(self) -> str:
+        return self._audio_output_status
+
+    @Property(list, notify=stateChanged)
+    def audioOutputDevices(self) -> list[str]:
+        return list(self._audio_output_devices)
+
+    @Property(str, notify=stateChanged)
+    def audioOutputDevice(self) -> str:
+        return self._audio_output_device
+
+    @Property(str, notify=stateChanged)
+    def audioPacketLossStatus(self) -> str:
+        if self._audio_packet_version < 2:
+            return "Exact loss tracking requires the updated audio firmware"
+        return (
+            f"{self._audio_packets_received} packets received | "
+            f"{self._audio_packets_lost} missing | "
+            f"{self._audio_packets_out_of_order} duplicate/out of order | "
+            f"{self._audio_playback_drops} local playback drops | "
+            f"{self._audio_playback_queue.qsize()} queued"
+        )
+
     @Property(str, notify=dashboardTabChanged)
     def dashboardTab(self) -> str:
         return self._dashboard_tab
@@ -604,7 +889,7 @@ class ControlStationBackend(QObject):
 
     @Slot(str)
     def setDashboardTab(self, tab: str) -> None:
-        if tab not in {"science", "logs", "map", "analysis", "motors", "navigation"}:
+        if tab not in {"science", "logs", "map", "analysis", "motors", "navigation", "instrument_debug", "sd_debug"}:
             return
         if self._dashboard_tab != tab:
             leaving_motor_debug = self._dashboard_tab == "motors" and tab != "motors"
@@ -629,8 +914,249 @@ class ControlStationBackend(QObject):
                     self.stopAllMotors()
 
     @Slot()
+    def refreshSdFiles(self) -> None:
+        self._start_sd_card_operation("list")
+
+    @Slot(str)
+    def loadSdSession(self, session_path: str) -> None:
+        self._start_sd_card_operation("session", remote_path=session_path)
+
+    @Slot(str)
+    def deleteSdSession(self, session_path: str) -> None:
+        if self._state.get("scienceExperimentState") != "IDLE":
+            self._set_state(sdTransferStatus="Save and close the mission before deleting a session")
+            return
+        self._start_sd_card_operation("delete", remote_path=session_path)
+
+    @Slot()
+    def startScienceExperiment(self) -> None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self._send_audio_firmware_command(f"CTRL SCIENCE START {stamp}")
+
+    @Slot()
+    def stopScienceExperiment(self) -> None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self._send_audio_firmware_command(f"CTRL SCIENCE STOP {stamp}")
+
+    @Slot()
+    def saveScienceExperiment(self) -> None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self._send_audio_firmware_command(f"CTRL SCIENCE SAVE {stamp}")
+
+    @Slot(bool)
+    def setAudioStreamEnabled(self, enabled: bool) -> None:
+        self._send_audio_firmware_command(f"CTRL STREAM AUDIO {'START' if enabled else 'STOP'}")
+
+    @Slot(bool)
+    def setImuStreamEnabled(self, enabled: bool) -> None:
+        self._send_audio_firmware_command(f"CTRL STREAM IMU {'START' if enabled else 'STOP'}")
+
+    @Slot(str)
+    def prepareSdDownload(self, remote_path: str) -> None:
+        self._set_state(sdSelectedPath=remote_path)
+
+    @Slot(str, str)
+    def downloadSdFile(self, remote_path: str, destination: str) -> None:
+        if not destination:
+            return
+        self._set_state(sdSelectedPath=remote_path)
+        self._start_sd_card_operation("download", remote_path=remote_path, destination=destination)
+
+    @Slot(str, QUrl)
+    def downloadSdFileFromUrl(self, remote_path: str, destination_url: QUrl) -> None:
+        self.downloadSdFile(remote_path, destination_url.toLocalFile())
+
+    @Slot(str, QUrl)
+    def downloadSdSessionFromUrl(self, session_path: str, destination_url: QUrl) -> None:
+        destination = destination_url.toLocalFile()
+        if destination:
+            self._start_sd_card_operation("session_download", remote_path=session_path, destination=destination)
+
+    @Slot()
+    def cancelSdDownload(self) -> None:
+        if self._state.get("sdDownloadActive"):
+            self._sd_cancel_event.set()
+            self._set_state(sdTransferStatus="Cancelling download...")
+
+    def _start_sd_card_operation(
+        self,
+        operation: str,
+        *,
+        remote_path: str = "",
+        destination: str = "",
+    ) -> None:
+        if self._args.transport != "wifi" or self._transport is None or not self._transport.is_open:
+            self._set_state(sdCardStatus="SD browsing requires an active Wi-Fi connection")
+            return
+        is_download = operation in {"download", "session_download"}
+        requires_service_mode = is_download or operation == "delete"
+        if requires_service_mode and self._state.get("scienceExperimentState") != "IDLE":
+            action = "deleting" if operation == "delete" else "downloading"
+            self._set_state(sdTransferStatus=f"Save and close the mission before {action}")
+            return
+        with self._sd_operation_lock:
+            if self._sd_operation_busy:
+                return
+            self._sd_operation_busy = True
+            self._sd_pending_result = None
+            self._sd_progress_pending = None
+        host = getattr(self._transport, "host", "")
+        local_ip = self._wifi_local_ip
+        self._sd_cancel_event.clear()
+        self._sd_service_requested = requires_service_mode
+        if requires_service_mode:
+            self._navigation_requires_center = True
+            self._set_state(navigationReleaseRequired=True)
+            self._send_audio_firmware_command("CTRL SERVICE START")
+            if "failed" in str(self._state.get("lastSendResult", "")).lower():
+                with self._sd_operation_lock:
+                    self._sd_operation_busy = False
+                self._sd_service_requested = False
+                self._set_state(sdTransferStatus="Could not enter service mode")
+                return
+        self._sd_transfer_started_at = time.monotonic()
+        self._set_state(
+            sdBusy=True,
+            sdTransferProgress=0.0,
+            sdTransferBytes=0,
+            sdTransferTotalBytes=0,
+            sdTransferSpeedBytesPerSecond=0.0,
+            sdTransferElapsedSeconds=0.0,
+            sdTransferEtaSeconds=-1.0,
+            sdTransferFileName="",
+            sdDownloadActive=is_download,
+            sdDownloadSessionPath=(remote_path if operation == "session_download" else str(Path(remote_path).parent).replace("\\", "/")) if is_download else "",
+            sdTransferStatus=(
+                f"Downloading {remote_path}" if operation in {"download", "session_download"}
+                else (f"Deleting {remote_path}" if operation == "delete" else f"Reading {remote_path or 'SD sessions'}")
+            ),
+        )
+
+        def worker() -> None:
+            try:
+                if operation == "list":
+                    result: object = list_sd_files(host, local_ip)
+                elif operation == "session":
+                    result = {"path": remote_path, **list_sd_session(host, remote_path, local_ip)}
+                elif operation == "delete":
+                    deleted_path = delete_sd_session(host, remote_path, local_ip)
+                    result = {"deletedPath": deleted_path, **list_sd_files(host, local_ip)}
+                elif operation == "session_download":
+                    def update_session_progress(received: int, total: int, file_name: str) -> None:
+                        with self._sd_operation_lock:
+                            self._sd_progress_pending = (received, total, file_name)
+
+                    result = str(download_sd_session(host, remote_path, destination, local_ip, update_session_progress, self._sd_cancel_event.is_set))
+                else:
+                    def update_progress(received: int, total: int) -> None:
+                        with self._sd_operation_lock:
+                            self._sd_progress_pending = (received, total, Path(remote_path).name)
+
+                    result = str(download_sd_file(host, remote_path, destination, local_ip, update_progress, self._sd_cancel_event.is_set))
+                payload: tuple[str, object] = (operation, result)
+            except Exception as exc:
+                payload = ("error", str(exc))
+            with self._sd_operation_lock:
+                self._sd_pending_result = payload
+
+        self._sd_operation_thread = threading.Thread(target=worker, name="sd-card-transfer", daemon=True)
+        self._sd_operation_thread.start()
+
+    def _drain_sd_card_operation(self) -> None:
+        with self._sd_operation_lock:
+            progress = self._sd_progress_pending
+            self._sd_progress_pending = None
+            pending = self._sd_pending_result
+            self._sd_pending_result = None
+        if progress is not None:
+            received, total, file_name = progress
+            percent = 100.0 if total <= 0 else 100.0 * received / total
+            elapsed = max(0.001, time.monotonic() - self._sd_transfer_started_at)
+            speed = received / elapsed
+            eta = (total - received) / speed if speed > 0 and total > received else (0.0 if total <= received else -1.0)
+            self._set_state(
+                sdTransferProgress=percent,
+                sdTransferBytes=received,
+                sdTransferTotalBytes=total,
+                sdTransferSpeedBytesPerSecond=speed,
+                sdTransferElapsedSeconds=elapsed,
+                sdTransferEtaSeconds=eta,
+                sdTransferFileName=file_name,
+                sdTransferStatus=f"Downloading {file_name}: {received:,} / {total:,} bytes ({percent:.0f}%)",
+            )
+        if pending is None:
+            return
+        with self._sd_operation_lock:
+            self._sd_operation_busy = False
+        result_kind, result = pending
+        if self._sd_service_requested:
+            self._send_audio_firmware_command("CTRL SERVICE STOP")
+            self._sd_service_requested = False
+        self._set_state(sdDownloadActive=False)
+        if result_kind == "error":
+            status = "Download cancelled" if str(result) == "Download cancelled" else f"SD operation failed: {result}"
+            self._set_state(sdBusy=False, sdTransferStatus=status)
+            return
+        if result_kind in {"list", "delete"} and isinstance(result, dict):
+            files = result["files"]
+            capacity = result.get("capacity", {})
+            sessions: dict[str, dict[str, object]] = {}
+            for entry in files:
+                path = str(entry.get("path", ""))
+                parts = path.strip("/").split("/")
+                if entry.get("isDirectory") and len(parts) == 1 and parts[0].lower().startswith("session"):
+                    sessions[parts[0]] = {"name": parts[0], "path": path, "size": int(entry.get("size", 0)), "files": [], "loaded": False}
+            session_rows = [
+                sessions[name] for name in sorted(sessions, reverse=True)
+            ]
+            self._set_state(
+                sdFiles=files,
+                sdSessions=session_rows,
+                sdCardCapacity=capacity,
+                sdCardStatus=f"{len(session_rows)} science sessions",
+                sdBusy=False,
+                sdTransferStatus=(
+                    f"Deleted {result['deletedPath'].rsplit('/', 1)[-1]}"
+                    if result_kind == "delete" else "SD listing refreshed"
+                ),
+                sdTransferProgress=0.0,
+            )
+        elif result_kind == "session" and isinstance(result, dict):
+            categories = {
+                "audio.wav": ("AUDIO", "Stereo microphone recording"),
+                "audio.idx": ("AUDIO INDEX", "Recording index"),
+                "science.csv": ("SCIENCE", "Sensor measurements"),
+                "telemetry.csv": ("TELEMETRY", "GPS, control, and system readings"),
+                "manifest.txt": ("SESSION INFO", "Experiment timestamps and details"),
+            }
+            session_files = []
+            for entry in result["files"]:
+                name = str(entry.get("name", ""))
+                if name.lower() in categories and not entry.get("isDirectory"):
+                    category, description = categories[name.lower()]
+                    session_files.append({**entry, "category": category, "description": description})
+            rows = []
+            for row in self._state.get("sdSessions", []):
+                if row["path"] == result["path"]:
+                    rows.append({**row, "files": sorted(session_files, key=lambda item: str(item["name"]).lower()), "loaded": True,
+                                 "size": sum(int(item["size"]) for item in result["files"] if not item.get("isDirectory"))})
+                else:
+                    rows.append(row)
+            self._set_state(sdSessions=rows, sdBusy=False, sdTransferStatus=f"Loaded {result['path']}")
+        elif result_kind in {"download", "session_download"}:
+            self._set_state(
+                sdBusy=False,
+                sdTransferStatus=f"Saved locally: {result}",
+                sdTransferProgress=100.0,
+                sdTransferElapsedSeconds=time.monotonic() - self._sd_transfer_started_at,
+                sdTransferEtaSeconds=0.0,
+            )
+
+    @Slot()
     def toggleAudioMute(self) -> None:
         self._audio_muted = not self._audio_muted
+        if self._audio_muted:
+            self._clear_audio_playback_queue()
         if self._audio_muted and self._audio_channel is not None:
             try:
                 self._audio_channel.stop()
@@ -638,6 +1164,328 @@ class ControlStationBackend(QObject):
                 pass
         self.audioMutedChanged.emit()
         self.stateChanged.emit()
+
+    def _clear_audio_playback_queue(self) -> None:
+        self._audio_playback_pending.clear()
+        while True:
+            try:
+                self._audio_playback_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _queue_audio_playback(self, sound: object) -> None:
+        try:
+            self._audio_playback_queue.put_nowait(sound)
+        except queue.Full:
+            try:
+                self._audio_playback_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._audio_playback_queue.put_nowait(sound)
+            self._audio_playback_drops += 1
+            self.stateChanged.emit()
+        self._audio_sounds_submitted += 1
+        self._audio_playback_wake.set()
+
+    def _audio_playback_loop(self) -> None:
+        while self._audio_playback_running:
+            if self._audio_muted or self._audio_channel is None:
+                self._clear_audio_playback_queue()
+                self._audio_playback_wake.wait(0.02)
+                self._audio_playback_wake.clear()
+                continue
+            try:
+                if self._audio_channel.get_busy():
+                    if self._audio_channel.get_queue() is None:
+                        self._audio_channel.queue(self._audio_playback_queue.get_nowait())
+                        self._audio_sounds_scheduled += 1
+                    else:
+                        self._audio_playback_wake.wait(0.005)
+                        self._audio_playback_wake.clear()
+                else:
+                    self._audio_channel.play(self._audio_playback_queue.get_nowait())
+                    self._audio_sounds_scheduled += 1
+                self._audio_output_status = (
+                    f"{self._audio_output_device} | "
+                    f"{self._audio_sounds_scheduled} chunks scheduled"
+                )
+            except queue.Empty:
+                self._audio_playback_wake.wait(0.005)
+                self._audio_playback_wake.clear()
+            except Exception as exc:
+                self._audio_playback_error = str(exc)
+                self._audio_output_status = f"Playback error: {exc}"
+                self.stateChanged.emit()
+                self._audio_playback_wake.wait(0.01)
+                self._audio_playback_wake.clear()
+
+    def _stop_audio_playback_thread(self) -> None:
+        self._audio_playback_running = False
+        self._audio_playback_wake.set()
+        if self._audio_playback_thread is not None:
+            if self._audio_playback_thread is not threading.current_thread():
+                self._audio_playback_thread.join(timeout=0.5)
+            self._audio_playback_thread = None
+        self._clear_audio_playback_queue()
+
+    def _start_audio_playback_thread(self) -> None:
+        if self._audio_channel is None:
+            return
+        self._audio_playback_running = True
+        self._audio_playback_thread = threading.Thread(
+            target=self._audio_playback_loop,
+            name="audio-playback-buffer",
+            daemon=True,
+        )
+        self._audio_playback_thread.start()
+
+    def _initialize_audio_output(self, device_name: str | None) -> bool:
+        self._audio_playback_running = False
+        self._audio_playback_wake.set()
+        if self._audio_playback_thread is not None:
+            self._audio_playback_thread.join(timeout=0.5)
+            self._audio_playback_thread = None
+        self._clear_audio_playback_queue()
+        if self._audio_channel is not None:
+            try:
+                self._audio_channel.stop()
+            except Exception:
+                pass
+        self._audio_channel = None
+        self._mixer_ready = False
+        if pygame is None:
+            self._audio_output_status = "pygame is unavailable"
+            return False
+        try:
+            if pygame.mixer.get_init() is not None:
+                pygame.mixer.quit()
+            pygame.mixer.init(
+                frequency=int(self._audio_sample_rate or 16000),
+                size=-16,
+                channels=2,
+                buffer=1024,
+                devicename=None if device_name in (None, "", "System default") else device_name,
+                allowedchanges=0,
+            )
+            mixer_format = pygame.mixer.get_init()
+            if mixer_format is None:
+                raise pygame.error("mixer did not initialize")
+            self._mixer_ready = True
+            self._audio_channel = pygame.mixer.Channel(0)
+            self._audio_output_device = device_name or "System default"
+            self._audio_output_status = f"{self._audio_output_device} | mixer {mixer_format}"
+            self._start_audio_playback_thread()
+            return True
+        except pygame.error as exc:
+            self._audio_playback_error = str(exc)
+            self._audio_output_status = f"Cannot open {device_name or 'system default'}: {exc}"
+            return False
+
+    @Slot(str)
+    def setAudioOutputDevice(self, device_name: str) -> None:
+        requested = (device_name or "System default").strip()
+        if requested == self._audio_output_device:
+            return
+        selected = None if requested == "System default" else requested
+        if not self._initialize_audio_output(selected):
+            failed_status = self._audio_output_status
+            self._audio_output_device = "System default"
+            if self._initialize_audio_output(None):
+                self._audio_output_status = f"{failed_status} | using system default"
+            else:
+                self._audio_output_status = failed_status
+        else:
+            self._audio_output_device = requested
+        self.stateChanged.emit()
+
+    @Slot(str)
+    def setAudioDebugChannel(self, channel: str) -> None:
+        normalized = channel.lower().strip()
+        if normalized in {"both", "left", "right"} and normalized != self._audio_debug_channel:
+            self._audio_debug_channel = normalized
+            self.stateChanged.emit()
+
+    @Slot(str)
+    def setAudioCaptureChannel(self, channel: str) -> None:
+        normalized = channel.upper().strip()
+        if normalized not in {"BOTH", "LEFT", "RIGHT"}:
+            return
+        self._send_audio_firmware_command(f"CTRL AUDIO CHANNEL {normalized}")
+
+    @Slot(str)
+    def setAudioQuality(self, quality: str) -> None:
+        normalized = quality.upper().strip()
+        if normalized not in {"LOW", "DEFAULT", "MAX"}:
+            return
+        if self.audioRecordingEnabled or self.audioQualityLocked:
+            self._set_state(lastSendResult="Stop and restart the SD audio session before changing quality")
+            return
+        self._send_audio_firmware_command(f"CTRL AUDIO QUALITY {normalized}")
+
+    @Slot()
+    def toggleAudioRecording(self) -> None:
+        command = "START" if not self.audioRecordingEnabled else "STOP"
+        self._send_audio_firmware_command(f"CTRL AUDIO RECORD {command}")
+
+    def _send_audio_firmware_command(self, command: str) -> None:
+        if self._transport is None:
+            self._set_state(lastSendResult="No serial link", lastSentLine=command)
+            return
+        result = send_text(self._transport, command)
+        self._set_state(lastSendResult=result, lastSentLine=command)
+        if "failed" not in result.lower():
+            self._append_comm_log(f"TX {command}")
+
+    @Slot(float)
+    def setAudioDebugGain(self, gain_percent: float) -> None:
+        normalized = max(0.0, min(200.0, float(gain_percent)))
+        if abs(normalized - self._audio_debug_gain) >= 0.5:
+            self._audio_debug_gain = normalized
+            self.stateChanged.emit()
+
+    @Slot(bool)
+    def setAudioHighPassEnabled(self, enabled: bool) -> None:
+        self._audio_high_pass = bool(enabled)
+        self._reset_audio_filter_state()
+        self.stateChanged.emit()
+
+    @Slot(float)
+    def setAudioHighPassHz(self, frequency_hz: float) -> None:
+        self._audio_high_pass_hz = max(20.0, min(300.0, float(frequency_hz)))
+        self.stateChanged.emit()
+
+    @Slot(bool)
+    def setAudioLowPassEnabled(self, enabled: bool) -> None:
+        self._audio_low_pass = bool(enabled)
+        self._reset_audio_filter_state()
+        self.stateChanged.emit()
+
+    @Slot(float)
+    def setAudioLowPassHz(self, frequency_hz: float) -> None:
+        self._audio_low_pass_hz = max(500.0, min(7900.0, (self._audio_sample_rate or 16000) * 0.45, float(frequency_hz)))
+        self.stateChanged.emit()
+
+    @Slot(bool)
+    def setAudioNoiseGateEnabled(self, enabled: bool) -> None:
+        self._audio_noise_gate = bool(enabled)
+        self.stateChanged.emit()
+
+    @Slot(float)
+    def setAudioNoiseGatePercent(self, threshold_percent: float) -> None:
+        self._audio_noise_gate_percent = max(0.0, min(10.0, float(threshold_percent)))
+        self.stateChanged.emit()
+
+    def _reset_audio_filter_state(self) -> None:
+        self._audio_filter_previous_x = [0.0, 0.0]
+        self._audio_filter_previous_y = [0.0, 0.0]
+        self._audio_filter_low_pass_y = [0.0, 0.0]
+
+    def _filter_audio_samples(self, samples: array, channels: int) -> array:
+        filtered = array("h")
+        if channels <= 0:
+            return filtered
+        sample_rate = float(self._audio_sample_rate or 16000)
+        dt = 1.0 / sample_rate
+        hp_rc = 1.0 / (2.0 * math.pi * self._audio_high_pass_hz)
+        hp_alpha = hp_rc / (hp_rc + dt)
+        lp_alpha = 1.0 - math.exp(-2.0 * math.pi * self._audio_low_pass_hz / sample_rate)
+        gate_threshold = self._audio_noise_gate_percent / 100.0
+        for frame_start in range(0, len(samples) - channels + 1, channels):
+            frame_out: list[int] = []
+            for channel in range(min(channels, 2)):
+                value = int(samples[frame_start + channel]) / 32768.0
+                if self._audio_high_pass:
+                    value = hp_alpha * (
+                        self._audio_filter_previous_y[channel]
+                        + value - self._audio_filter_previous_x[channel]
+                    )
+                    self._audio_filter_previous_x[channel] = int(samples[frame_start + channel]) / 32768.0
+                    self._audio_filter_previous_y[channel] = value
+                if self._audio_low_pass:
+                    self._audio_filter_low_pass_y[channel] += lp_alpha * (
+                        value - self._audio_filter_low_pass_y[channel]
+                    )
+                    value = self._audio_filter_low_pass_y[channel]
+                if self._audio_noise_gate and abs(value) < gate_threshold:
+                    value = 0.0
+                frame_out.append(max(-32768, min(32767, int(value * 32767.0))))
+            if channels == 1:
+                filtered.extend((frame_out[0], frame_out[0]))
+            else:
+                filtered.extend((frame_out[0], frame_out[1]))
+        return filtered
+
+    @Slot(bool)
+    def setAudioHighPassEnabled(self, enabled: bool) -> None:
+        self._audio_high_pass = bool(enabled)
+        self._reset_audio_filter_state()
+        self.stateChanged.emit()
+
+    @Slot(float)
+    def setAudioHighPassHz(self, frequency_hz: float) -> None:
+        self._audio_high_pass_hz = max(20.0, min(300.0, float(frequency_hz)))
+        self.stateChanged.emit()
+
+    @Slot(bool)
+    def setAudioLowPassEnabled(self, enabled: bool) -> None:
+        self._audio_low_pass = bool(enabled)
+        self._reset_audio_filter_state()
+        self.stateChanged.emit()
+
+    @Slot(float)
+    def setAudioLowPassHz(self, frequency_hz: float) -> None:
+        self._audio_low_pass_hz = max(500.0, min(7900.0, (self._audio_sample_rate or 16000) * 0.45, float(frequency_hz)))
+        self.stateChanged.emit()
+
+    @Slot(bool)
+    def setAudioNoiseGateEnabled(self, enabled: bool) -> None:
+        self._audio_noise_gate = bool(enabled)
+        self.stateChanged.emit()
+
+    @Slot(float)
+    def setAudioNoiseGatePercent(self, threshold_percent: float) -> None:
+        self._audio_noise_gate_percent = max(0.0, min(10.0, float(threshold_percent)))
+        self.stateChanged.emit()
+
+    def _reset_audio_filter_state(self) -> None:
+        self._audio_filter_previous_x = [0.0, 0.0]
+        self._audio_filter_previous_y = [0.0, 0.0]
+        self._audio_filter_low_pass_y = [0.0, 0.0]
+
+    def _filter_audio_samples(self, samples: array, channels: int) -> array:
+        filtered = array("h")
+        if channels <= 0:
+            return filtered
+        sample_rate = float(self._audio_sample_rate or 16000)
+        dt = 1.0 / sample_rate
+        hp_rc = 1.0 / (2.0 * math.pi * self._audio_high_pass_hz)
+        hp_alpha = hp_rc / (hp_rc + dt)
+        lp_alpha = 1.0 - math.exp(-2.0 * math.pi * self._audio_low_pass_hz / sample_rate)
+        gate_threshold = self._audio_noise_gate_percent / 100.0
+        for frame_start in range(0, len(samples) - channels + 1, channels):
+            frame_out: list[int] = []
+            for channel in range(min(channels, 2)):
+                value = int(samples[frame_start + channel]) / 32768.0
+                if self._audio_high_pass:
+                    value = hp_alpha * (
+                        self._audio_filter_previous_y[channel]
+                        + value - self._audio_filter_previous_x[channel]
+                    )
+                    self._audio_filter_previous_x[channel] = int(samples[frame_start + channel]) / 32768.0
+                    self._audio_filter_previous_y[channel] = value
+                if self._audio_low_pass:
+                    self._audio_filter_low_pass_y[channel] += lp_alpha * (
+                        value - self._audio_filter_low_pass_y[channel]
+                    )
+                    value = self._audio_filter_low_pass_y[channel]
+                if self._audio_noise_gate and abs(value) < gate_threshold:
+                    value = 0.0
+                frame_out.append(max(-32768, min(32767, int(value * 32767.0))))
+            if channels == 1:
+                filtered.extend((frame_out[0], frame_out[0]))
+            else:
+                filtered.extend((frame_out[0], frame_out[1]))
+        return filtered
 
     @Slot(str)
     def setWifiLocalIp(self, local_ip: str) -> None:
@@ -1127,6 +1975,8 @@ class ControlStationBackend(QObject):
         )
 
     def _append_comm_log(self, entry: str) -> None:
+        if entry.startswith("RX TEL "):
+            return
         timestamp = time.time()
         category = classify_log_entry(entry)
         display_entry = {
@@ -1143,11 +1993,24 @@ class ControlStationBackend(QObject):
             self._scientific_log = (self._scientific_log + [display_entry])[-120:]
         else:
             self._system_log = (self._system_log + [display_entry])[-120:]
-        with self._log_file.open("a", encoding="utf-8") as handle:
-            handle.write(f"{timestamp}: {entry}\n")
+        if entry.startswith("TX "):
+            stamp = datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="milliseconds")
+            self._command_trace_pending.append(f"{stamp} {entry}\n")
         self.stateChanged.emit()
 
+    def _flush_command_traces(self) -> None:
+        if not self._command_trace_pending:
+            return
+        lines = self._command_trace_pending
+        self._command_trace_pending = []
+        with self._log_file.open("a", encoding="utf-8") as handle:
+            handle.writelines(lines)
+        self._last_command_trace_flush = time.monotonic()
+
     def _set_state(self, **updates: object) -> None:
+        updates = {key: value for key, value in updates.items() if self._state.get(key) != value}
+        if not updates:
+            return
         self._state = {**self._state, **updates}
         self.stateChanged.emit()
 
@@ -1202,20 +2065,24 @@ class ControlStationBackend(QObject):
         if pygame is not None:
             pygame.init()
             pygame.joystick.init()
-            self._mixer_ready = pygame.mixer.get_init() is not None
-            if not self._mixer_ready:
-                try:
-                    pygame.mixer.init(frequency=16000, size=-16, channels=2, buffer=512)
-                    self._mixer_ready = True
-                except pygame.error:
-                    self._mixer_ready = False
-            self._audio_channel = pygame.mixer.Channel(0) if self._mixer_ready else None
+            try:
+                from pygame._sdl2.audio import get_audio_device_names
+
+                self._audio_output_devices = ["System default"] + list(get_audio_device_names(False))
+            except Exception:
+                self._audio_output_devices = ["System default"]
+            self._initialize_audio_output(None)
+        else:
+            self._audio_output_status = "pygame is unavailable; audio cannot play"
+        self.stateChanged.emit()
         self._joystick = get_controller()
         self._queue_transport_connection(initial=True)
         self._timer.start()
 
     def shutdown(self) -> None:
         self._timer.stop()
+        self._flush_command_traces()
+        self._stop_audio_playback_thread()
         self._close_test_session("application_exit")
         if self._transport is not None:
             try:
@@ -1333,12 +2200,16 @@ class ControlStationBackend(QObject):
             stop_result = send_text(self._transport, "CTRL STOP")
             self._set_state(lastSendResult=stop_result, lastSentLine="CTRL STOP")
             self._append_comm_log(f"TX CTRL STOP target={target}")
+        send_text(self._transport, "REQ STATUS ALL")
+        self._append_comm_log(f"TX REQ STATUS ALL target={target}")
         if initial:
             self._append_comm_log(f"CONNECT success target={target}")
         else:
             self._append_comm_log(f"RECONNECTED target={target}")
 
     def _send_current_command(self) -> None:
+        if self._state.get("sdDownloadActive") or self._state.get("serviceMode"):
+            return
         input_mode = str(self._state.get("controlInputMode", "controller"))
         if input_mode == "controller":
             joystick_turn, joystick_thrust, joystick_yaw = read_motion_axes(
@@ -1598,6 +2469,41 @@ class ControlStationBackend(QObject):
             status_key, status_values = status_update
             if status_key == "MODE" and status_values:
                 self._set_state(controllerMode=status_values[0].lower())
+            elif status_key == "FIRMWARE" and status_values:
+                self._set_state(firmwareVersion=" ".join(status_values))
+            elif status_key == "SCIENCE" and status_values:
+                self._set_state(scienceExperimentState=status_values[0],
+                                scienceSessionPath=status_values[1] if len(status_values) > 1 and status_values[1] != "NONE" else "")
+            elif status_key == "SERVICE" and status_values:
+                self._set_state(serviceMode=status_values[0] == "ON")
+            elif status_key == "STREAM" and len(status_values) >= 2:
+                if status_values[0] == "AUDIO":
+                    self._set_state(audioStreamEnabled=status_values[1] == "ON")
+                elif status_values[0] == "IMU":
+                    self._set_state(imuStreamEnabled=status_values[1] == "ON")
+            elif status_key == "AUDIO" and len(status_values) >= 5:
+                values = list(status_values)
+                sample_rate = int(values[values.index("RATE") + 1]) if "RATE" in values else 16000
+                quality_locked = "QUALITY_LOCKED" in values and values[values.index("QUALITY_LOCKED") + 1] == "ON"
+                previous_rate = self._audio_sample_rate
+                self._audio_sample_rate = sample_rate
+                if previous_rate != sample_rate:
+                    device_name = self._audio_output_device
+                    selected_device = None if device_name in (None, "", "System default") else device_name
+                    if not self._initialize_audio_output(selected_device) and selected_device is not None:
+                        self._initialize_audio_output(None)
+                self._audio_low_pass_hz = min(self._audio_low_pass_hz, sample_rate * 0.45)
+                quality_name = {8000: "LOW", 16000: "DEFAULT", 48000: "MAX"}.get(sample_rate, "CUSTOM")
+                self._set_state(
+                    audioCaptureChannel=values[0],
+                    audioRecordingEnabled=(values[2] == "ON"),
+                    audioSdStatus=values[4],
+                    audioSampleRateHz=sample_rate,
+                    audioQuality=quality_name,
+                    audioQualityLocked=quality_locked,
+                    audioLowPassHz=self._audio_low_pass_hz,
+                    audioOutputStatus=self._audio_output_status,
+                )
             elif status_key == "POS":
                 self._set_state(currentLocation=_format_location(status_values))
                 if len(status_values) >= 2 and "UNKNOWN" not in {value.upper() for value in status_values[:2]}:
@@ -1948,23 +2854,107 @@ class ControlStationBackend(QObject):
                 distance_mm, valid = packet.values
                 self._set_state(currentDepth=(f"{distance_mm / 1000.0:.3f} m" if valid else "N/A"))
             elif packet.packet_type == "AUDIO":
-                pcm_bytes, _sample_count, channels = packet.values
+                pcm_bytes, _sample_count, channels, packet_version = packet.values
                 samples = _decode_pcm_samples(pcm_bytes)
-                peak = _update_audio_waveform_buffer(self._waveform_buffer, samples, channels)
-                self._audio_waveform = list(self._waveform_buffer)
-                self._set_state(
-                    audioStream=(
-                        f"16.0 kHz stereo" if channels == 2 else "16.0 kHz mono"
-                    ),
-                    audioLevel=f"{peak * 100.0:.1f}%",
-                )
+                filtered_samples = self._filter_audio_samples(samples, channels)
+                self._audio_channels = channels
+                if self._audio_sample_rate <= 0:
+                    self._audio_sample_rate = 16000
+                if packet_version >= 2:
+                    if self._audio_packet_version < 2:
+                        self._audio_last_sequence = None
+                        self._audio_packets_received = 0
+                        self._audio_packets_lost = 0
+                        self._audio_packets_out_of_order = 0
+                        self._audio_playback_drops = 0
+                    self._audio_packets_received += 1
+                    sequence = packet.sequence & 0xFFFF
+                    if self._audio_last_sequence is not None:
+                        delta = (sequence - self._audio_last_sequence) & 0xFFFF
+                        if delta == 0 or delta >= 0x8000:
+                            self._audio_packets_out_of_order += 1
+                        elif delta > 1:
+                            self._audio_packets_lost += delta - 1
+                            self._audio_last_sequence = sequence
+                        else:
+                            self._audio_last_sequence = sequence
+                    else:
+                        self._audio_last_sequence = sequence
+                self._audio_packet_version = packet_version
+                # Audio packets arrive much faster than the UI can usefully redraw.
+                # Keep the real-time filter and playback path per packet, but do
+                # waveform analysis, list copies, and QML notifications at 10 Hz.
+                now = time.monotonic()
+                if now - self._last_audio_ui_update >= 0.1:
+                    self._last_audio_ui_update = now
+                    peak = _update_audio_waveform_buffer(self._waveform_buffer, samples, channels)
+                    left_rms, right_rms = _audio_channel_rms_percent(samples, channels)
+                    self._audio_left_rms_percent = left_rms
+                    self._audio_right_rms_percent = right_rms or 0.0
+                    left_peak, right_peak = _update_channel_waveforms(
+                        deque(maxlen=1), deque(maxlen=1), samples, channels
+                    )
+                    _update_channel_waveforms(
+                        self._audio_left_buffer, self._audio_right_buffer, filtered_samples, channels
+                    )
+                    self._audio_waveform = list(self._waveform_buffer)
+                    self._audio_left_waveform = list(self._audio_left_buffer)
+                    self._audio_right_waveform = list(self._audio_right_buffer)
+                    self._audio_left_level = f"{left_peak:.1f}% peak"
+                    self._audio_right_level = f"{right_peak:.1f}% peak" if right_peak is not None else "Unavailable"
+                    self._set_state(
+                        audioStream=(
+                            f"{self._audio_sample_rate / 1000.0:.1f} kHz | {channels} channel{'s' if channels != 1 else ''}"
+                        ),
+                        audioLevel=f"{peak * 100.0:.1f}%",
+                        audioChannelCount=channels,
+                        audioLeftLevel=self._audio_left_level,
+                        audioRightLevel=self._audio_right_level,
+                        audioLeftRmsPercent=self._audio_left_rms_percent,
+                        audioRightRmsPercent=self._audio_right_rms_percent,
+                        audioPacketLossStatus=self.audioPacketLossStatus,
+                        audioPacketsReceived=self._audio_packets_received,
+                        audioPacketsLost=self._audio_packets_lost,
+                        audioPacketsOutOfOrder=self._audio_packets_out_of_order,
+                        audioPlaybackDrops=self._audio_playback_drops,
+                    )
                 if not self._audio_muted and self._audio_channel is not None:
                     try:
-                        if not self._audio_channel.get_busy():
-                            sound = pygame.mixer.Sound(buffer=pcm_bytes)
-                            self._audio_channel.play(sound)
-                    except Exception:
-                        pass
+                        monitor_samples = array("h")
+                        gain = self._audio_debug_gain / 100.0
+                        if channels == 1:
+                            for sample in filtered_samples[::2]:
+                                value = max(-32768, min(32767, int(sample * gain)))
+                                monitor_samples.extend((value, value))
+                        else:
+                            for index in range(0, len(filtered_samples) - 1, 2):
+                                left = int(filtered_samples[index])
+                                right = int(filtered_samples[index + 1])
+                                if self._audio_debug_channel == "left":
+                                    right = left
+                                elif self._audio_debug_channel == "right":
+                                    left = right
+                                left = max(-32768, min(32767, int(left * gain)))
+                                right = max(-32768, min(32767, int(right * gain)))
+                                monitor_samples.extend((left, right))
+                        if sys.byteorder != "little":
+                            monitor_samples.byteswap()
+                        # ESP32 packets are only 5.3 ms at 48 kHz. Creating and
+                        # scheduling one SDL Sound per datagram overwhelms the UI
+                        # and mixer; combine ~40 ms of PCM into each playback item.
+                        self._audio_playback_pending.extend(monitor_samples.tobytes())
+                        bytes_per_second = int((self._audio_sample_rate or 16000) * 2 * 2)
+                        batch_bytes = max(1024, bytes_per_second // 25)
+                        if len(self._audio_playback_pending) >= batch_bytes:
+                            aligned_length = len(self._audio_playback_pending) & ~3
+                            pcm_batch = bytes(self._audio_playback_pending[:aligned_length])
+                            del self._audio_playback_pending[:aligned_length]
+                            sound = pygame.mixer.Sound(buffer=pcm_batch)
+                            self._queue_audio_playback(sound)
+                    except Exception as exc:
+                        self._audio_playback_error = str(exc)
+                        self._audio_output_status = f"Audio chunk error: {exc}"
+                        self.stateChanged.emit()
 
         self._maybe_record_science_sample()
 
@@ -1979,6 +2969,8 @@ class ControlStationBackend(QObject):
         self.stateChanged.emit()
 
     def _tick(self) -> None:
+        if time.monotonic() - self._last_command_trace_flush >= 1.0:
+            self._flush_command_traces()
         self._refresh_speed_source()
         if self._joystick is None:
             self._joystick = get_controller()
@@ -1997,6 +2989,7 @@ class ControlStationBackend(QObject):
             self._queue_transport_connection()
 
         self._drain_pending_connection()
+        self._drain_sd_card_operation()
 
         if self._transport is not None:
             if self._transport.is_open:
@@ -2080,12 +3073,14 @@ def run(args: argparse.Namespace) -> None:
     app_dir = Path(__file__).resolve().parent.parent
     log_dir = app_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    system_log_dir = log_dir / "system"
+    system_log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    log_file = Path(args.comm_log_file) if args.comm_log_file else (log_dir / f"comm-{timestamp}.log")
+    log_file = Path(args.comm_log_file) if args.comm_log_file else (system_log_dir / f"commands-{timestamp}.log")
     prefs_path = log_dir / CONNECTION_PREFS_FILENAME
     apply_connection_preferences(args, prefs_path)
     with log_file.open("a", encoding="utf-8") as handle:
-        handle.write(f"{time.time()}: COMM LOG START file={log_file}\n")
+        handle.write(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} COMMAND TRACE START\n")
 
     engine = QQmlApplicationEngine()
     backend = ControlStationBackend(args, log_file, prefs_path)
@@ -2102,6 +3097,5 @@ def run(args: argparse.Namespace) -> None:
     QTimer.singleShot(0, backend.start)
     exit_code = app.exec()
     with log_file.open("a", encoding="utf-8") as handle:
-        handle.write(f"{time.time()}: COMM LOG END\n")
+        handle.write(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} COMMAND TRACE END\n")
     raise SystemExit(exit_code)
-

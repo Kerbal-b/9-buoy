@@ -986,7 +986,7 @@ def run() -> None:
                     current_depth=(f"{distance_mm / 1000.0:.3f} m" if valid else "N/A"),
                 )
             elif packet.packet_type == "AUDIO":
-                pcm_bytes, _sample_count, channels = packet.values
+                pcm_bytes, _sample_count, channels, _packet_version = packet.values
                 samples = decode_pcm_samples(pcm_bytes)
                 peak = update_audio_waveform_buffer(audio_waveform_buffer, samples, channels)
                 telemetry = replace(

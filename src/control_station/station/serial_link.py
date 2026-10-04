@@ -34,6 +34,7 @@ WIFI_DEFAULT_HOST = "auto"
 WIFI_DEFAULT_TCP_PORT = 5000
 WIFI_DEFAULT_UDP_PORT = 5001
 WIFI_DEFAULT_AUDIO_PORT = 5002
+WIFI_AUDIO_MAX_PACKETS_PER_POLL = 12
 CONNECTION_PREFS_FILENAME = "connection-prefs.json"
 
 PACKET_TYPE_IMU = 1
@@ -324,7 +325,10 @@ class WiFiTransport:
             if packet is not None:
                 packets.append(packet)
 
-        while True:
+        # Do not drain an unlimited live audio backlog in one UI timer tick.
+        # At 48 kHz the buoy can send hundreds of small datagrams per second;
+        # a continuous stream must not monopolize the control station thread.
+        for _ in range(WIFI_AUDIO_MAX_PACKETS_PER_POLL):
             try:
                 payload, address = self._audio_udp.recvfrom(4096)
             except BlockingIOError:
@@ -660,7 +664,7 @@ def _decode_audio_packet(payload: bytes) -> TelemetryPacket | None:
         return None
 
     version, packet_type, sequence, timestamp_ms, sample_count, channels = HEADER_AUDIO_STRUCT.unpack_from(payload, 0)
-    if version != 1 or packet_type != PACKET_TYPE_AUDIO:
+    if version not in (1, 2) or packet_type != PACKET_TYPE_AUDIO:
         return None
 
     pcm_bytes = payload[HEADER_AUDIO_STRUCT.size:]
@@ -672,7 +676,7 @@ def _decode_audio_packet(payload: bytes) -> TelemetryPacket | None:
         packet_type="AUDIO",
         sequence=sequence,
         timestamp_ms=timestamp_ms,
-        values=(pcm_bytes, sample_count, channels),
+        values=(pcm_bytes, sample_count, channels, version),
     )
 
 

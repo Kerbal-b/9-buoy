@@ -194,6 +194,22 @@ Item {
         )
     }
 
+    // A running bench test must continuously prove that the control station
+    // is alive. Firmware stops propulsion after one second without a command.
+    Timer {
+        interval: 250
+        repeat: true
+        running: root.testRunning && root.testPowerPercent !== 0 && root.isConnected()
+        onTriggered: {
+            if (root.backendObject) {
+                root.backendObject.sendMotorTestPower(
+                    root.motorKey(root.selectedMotorIndex),
+                    root.testPowerPercent
+                )
+            }
+        }
+    }
+
     ScrollView {
         id: motorScroll
         anchors.fill: parent

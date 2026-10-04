@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls.Basic
 
 Item {
     id: root
@@ -25,16 +26,71 @@ Item {
         Text {
             x: 20
             y: 48
-            text: "Live environmental, motion, and acoustic telemetry"
+            text: backendObject && backendObject.audioRecordingEnabled
+                ? "Audio priority active: non-GPS sensors sample every 30 seconds"
+                : "Live sensor telemetry and session audio capture"
             color: "#829aad"
             font.pixelSize: 12
         }
 
+        Rectangle {
+            x: 20
+            y: 78
+            width: parent.width - 40
+            height: 54
+            radius: 9
+            color: "#111c28"
+            border.color: "#395166"
+            Row {
+                anchors.fill: parent
+                anchors.margins: 8
+                spacing: 10
+                Text {
+                    text: "Manual session: " + (backendState.scienceExperimentState || "IDLE")
+                    color: "#e6ecf2"
+                    font.bold: true
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                Button {
+                    text: "Start capture"
+                    enabled: backendObject && backendState.scienceExperimentState === "IDLE"
+                    onClicked: backendObject.startScienceExperiment()
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                Button {
+                    text: "Stop capture"
+                    enabled: backendObject && backendState.scienceExperimentState === "RECORDING"
+                    onClicked: backendObject.stopScienceExperiment()
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                Button {
+                    text: "Save and close"
+                    enabled: backendObject && backendState.scienceExperimentState === "STOPPED"
+                    onClicked: backendObject.saveScienceExperiment()
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                Button {
+                    text: backendObject && backendObject.audioRecordingEnabled ? "Stop audio" : "Start audio"
+                    enabled: backendObject && backendState.scienceExperimentState === "RECORDING"
+                    onClicked: backendObject.toggleAudioRecording()
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                Text {
+                    text: backendState.scienceSessionPath
+                        ? (backendObject && backendObject.audioRecordingEnabled ? "Audio recording ON" : "Audio recording OFF")
+                        : "No open session"
+                    color: backendObject && backendObject.audioRecordingEnabled ? "#75d9a7" : "#efb76f"
+                    font.bold: true
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+            }
+        }
+
         Row {
             x: 20
-            y: 82
+            y: 145
             width: parent.width - 40
-            height: parent.height - 102
+            height: parent.height - 165
             spacing: 18
 
             Column {

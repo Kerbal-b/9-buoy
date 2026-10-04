@@ -25,7 +25,9 @@ Review this section after each control station update and confirm that the code 
 - Controller source: Xbox controller connected to the laptop
 - Main movement input: left stick X for horizontal movement and left stick Y for forward and reverse movement
 - Deadzone behavior: ignore small stick movement near center
-- Buoy layout: one rear motor and two front motors arranged with 120 degree spacing
+- Buoy layout: external tangential motors with the rear water jet pointing
+  left, both front motors producing forward buoy force, and pure-yaw motor
+  signs `+/-/+`
 - Output command formats: `CTRL VECTOR <lateral> <thrust>` and `CTRL MOTION <lateral> <thrust> <yaw>`
 - Hello ping mode: optional repeated `hello world` messages for link testing
 - Default transport path: Wi-Fi TCP for reliable commands plus UDP for fast telemetry
@@ -43,7 +45,7 @@ The main control-station window uses three stable panel regions:
 
 - Top-left: `Buoy Visualization` — the buoy shape, motor arrangement, and movement vector.
 - Bottom-left: `Buoy Operational` — connection, Wi-Fi, navigation, movement, power, and operational telemetry.
-- Full-height right: `Dashboard` — a tabbed area for Science & Audio, logs, maps/science views, motor testing, navigation testing, and future subtabs.
+- Full-height right: `Dashboard` — a tabbed area for science and audio telemetry, instrument debugging, logs, maps/science views, motor testing, and navigation testing.
 
 Future control-station changes must preserve these three regions and their responsibilities. New right-side features should be added as Dashboard subtabs. Change this layout only when the project owner explicitly requests a design change.
 
@@ -78,7 +80,8 @@ Future control-station changes must preserve these three regions and their respo
 - `station/models.py` shared runtime and command data structures
 - `station/settings.py` UI and runtime constants
 - `qml/Main.qml` main three-region window layout and dashboard tabs
-- `qml/ScienceAudioPanel.qml` Science & Audio dashboard tab
+- `qml/ScienceAudioPanel.qml` Science & Audio telemetry dashboard tab
+- `qml/MicrophoneDebugPanel.qml` Instrument Debug dashboard tab, with per-channel microphone waveforms, packet continuity, monitor controls, and laptop-side high-pass, low-pass, and noise-gate filters
 - `qml/MotorTestPanel.qml` motor testing, output visualization, and calibration dashboard tab
 - `qml/NavigationTestPanel.qml` requested-versus-measured movement visualization and opt-in navigation balance-assist controls
 - `station/navigation.py` filtered IMU direction comparison and bounded real-time correction algorithm
@@ -118,6 +121,8 @@ CTRL MOTION <lateral> <thrust> <yaw>
 ```
 
 All three values range from `-100` to `+100`. Translation-only commands continue using `CTRL VECTOR` for compatibility. When yaw is combined with translation, the firmware scales the complete three-motor mix together if necessary so no motor exceeds its allowed command range.
+
+The ESP32 propulsion watchdog requires fresh control traffic at least once per second while a motor command is active. Normal drive commands are refreshed at the configured send rate, and the Motor Test tab refreshes its selected motor command every `250 ms`. Losing Wi-Fi/TCP or exceeding the watchdog interval stops all motors.
 
 ## Navigation Test Mode
 
@@ -343,3 +348,13 @@ Windows batch equivalent:
 ```bat
 src\control_station\run_controller_debug.bat
 ```
+
+## Science experiments and SD browsing
+
+The firmware mounts the SD card at boot but creates no session until `CTRL SCIENCE START YYYYMMDDTHHMMSSZ`. The control station sends the UTC timestamp automatically. Start creates `/sessionNNN-YYYYMMDDTHHMMSSZ`, begins science and telemetry recording, and writes `manifest.txt` with the start time. Microphone recording starts disabled and can be enabled only where a mission needs audio with `CTRL AUDIO RECORD START`; `CTRL AUDIO RECORD STOP` stops it. While audio is recording, non-GPS sensor sampling and science/telemetry logging run at 30-second intervals and the audio queue is enlarged; this audio-priority profile is active in firmware, but should be revisited during mission design so GPS, drift/current measurements, motor control, and safety-critical current readings retain appropriate rates during autonomous navigation. The microphone's digital input gain is 1x to preserve headroom; laptop playback gain does not alter SD files. Repeated audio start/stop commands currently append to one `audio.wav` with timestamps in `audio.idx`. `CTRL SCIENCE STOP YYYYMMDDTHHMMSSZ` stops recording and stamps the stop time. `CTRL SCIENCE SAVE YYYYMMDDTHHMMSSZ` flushes and closes the files, then stamps the save time. An unfinished session retains `status=recording` in its manifest so it can be identified after power loss.
+
+Audio and IMU Wi-Fi streams start disabled. Use `CTRL STREAM AUDIO START` / `STOP` and `CTRL STREAM IMU START` / `STOP` to control them independently. Lightweight telemetry remains available. The microphone panel controls audio streaming; Navigation Test controls IMU streaming; Science & Audio holds manual mission capture controls.
+
+The SD Card panel requests root session summaries first, including folder sizes. It requests a session's file list only when that session is opened. Downloading or deleting a session sends `CTRL SERVICE START`: motors stop, audio and IMU streams stop, and sensor polling pauses. Downloads and deletion are unavailable while a mission session is open. The panel shows the current session, bytes, speed, elapsed time, estimated time left, and a Stop download button. Session deletion requires confirmation and permanently removes only the selected top-level `sessionNNN-timestamp` folder and its contents. Completion, cancellation, and errors send `CTRL SERVICE STOP`. The control station stores timestamped outgoing command traces in `src/control_station/logs/system/commands-*.log`. New science sessions do not contain a `system.log` file.
+
+The proposed automatic mission transcript, checkpoint log, and per-checkpoint audio file model are documented in [mission-transcript.md](../mission-transcript.md). Those automation commands are not yet implemented.

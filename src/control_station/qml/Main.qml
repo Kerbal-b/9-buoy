@@ -40,6 +40,8 @@ ApplicationWindow {
         if (tab === "analysis") return 3
         if (tab === "motors") return 4
         if (tab === "navigation") return 5
+        if (tab === "instrument_debug") return 6
+        if (tab === "sd_debug") return 7
         return 0
     }
 
@@ -49,6 +51,8 @@ ApplicationWindow {
         if (index === 3) return "analysis"
         if (index === 4) return "motors"
         if (index === 5) return "navigation"
+        if (index === 6) return "instrument_debug"
+        if (index === 7) return "sd_debug"
         return "science"
     }
 
@@ -291,7 +295,8 @@ ApplicationWindow {
                 const frontLeft = [cx - frontOffsetX, hullCy - frontOffsetY]
                 const frontRight = [cx + frontOffsetX, hullCy - frontOffsetY]
                 const rear = [cx, hullCy + rearOffsetY]
-                const motorRadius = 28
+                const ductLength = 76
+                const ductWidth = 36
 
                 function signedValue(value) {
                     const numericValue = Number(value) || 0
@@ -319,101 +324,121 @@ ApplicationWindow {
                     ctx.closePath()
                 }
 
-                function drawVerticalUsageBar(x, y, barHeight, value) {
-                    const magnitude = clamp(Math.abs(Number(value) || 0) / 100.0, 0, 1)
-                    const barWidth = 10
-                    roundedRect(x, y, barWidth, barHeight, 5)
-                    ctx.fillStyle = "#0a121b"
-                    ctx.fill()
-                    ctx.strokeStyle = "#31485a"
-                    ctx.lineWidth = 1
-                    ctx.stroke()
-                    if (magnitude > 0) {
-                        const fillHeight = (barHeight - 4) * magnitude
-                        roundedRect(x + 2, y + barHeight - fillHeight - 2, barWidth - 4, fillHeight, 3)
-                        ctx.fillStyle = usageColor(value)
-                        ctx.fill()
-                    }
-                    ctx.fillStyle = "#466075"
-                    ctx.fillRect(x + 2, y + barHeight / 2, barWidth - 4, 1)
+                function motorPower(value, pwm) {
+                    const appliedPwm = Number(pwm)
+                    if (Number.isFinite(appliedPwm) && appliedPwm >= 0)
+                        return clamp(appliedPwm / 255.0, 0, 1)
+                    return clamp(Math.abs(Number(value) || 0) / 100.0, 0, 1)
                 }
 
-                function drawHorizontalUsageBar(x, y, barWidth, value) {
-                    const magnitude = clamp(Math.abs(Number(value) || 0) / 100.0, 0, 1)
-                    const barHeight = 10
-                    roundedRect(x, y, barWidth, barHeight, 5)
-                    ctx.fillStyle = "#0a121b"
-                    ctx.fill()
-                    ctx.strokeStyle = "#31485a"
-                    ctx.lineWidth = 1
-                    ctx.stroke()
-                    if (magnitude > 0) {
-                        const fillWidth = (barWidth - 4) * magnitude
-                        roundedRect(x + 2, y + 2, fillWidth, barHeight - 4, 3)
-                        ctx.fillStyle = usageColor(value)
-                        ctx.fill()
-                    }
-                    ctx.fillStyle = "#466075"
-                    ctx.fillRect(x + barWidth / 2, y + 2, 1, barHeight - 4)
-                }
-
-                function drawMotor(point, value, pwm, label, labelX, labelY) {
-                    const magnitude = clamp(Math.abs(Number(value) || 0) / 100.0, 0, 1)
+                function drawPowerLink(startPoint, endPoint, value, pwm) {
+                    const power = motorPower(value, pwm)
+                    if (power <= 0.002) return
                     const color = usageColor(value)
+                    ctx.save()
+                    ctx.shadowColor = color
+                    ctx.shadowBlur = 5 + 8 * power
+                    ctx.strokeStyle = color
+                    ctx.globalAlpha = 0.35 + 0.65 * power
+                    ctx.lineWidth = 1.5 + 4.5 * power
+                    ctx.lineCap = "round"
+                    ctx.beginPath()
+                    ctx.moveTo(startPoint[0], startPoint[1])
+                    ctx.lineTo(endPoint[0], endPoint[1])
+                    ctx.stroke()
+                    ctx.restore()
+                }
+
+                function drawMotorDuct(point, forceX, forceY, value, pwm, label, labelX, labelY) {
+                    const magnitude = clamp(Math.abs(Number(value) || 0) / 100.0, 0, 1)
+                    const power = motorPower(value, pwm)
+                    const color = usageColor(value)
+                    // Motor axes are stored as force on the buoy. Propeller wash
+                    // points opposite that force; canvas Y increases downward.
+                    const waterX = -forceX
+                    const waterY = forceY
+                    const direction = value < 0 ? -1 : 1
+                    const angle = Math.atan2(waterY, waterX)
 
                     ctx.save()
-                    ctx.shadowColor = value === 0 ? "transparent" : color
-                    ctx.shadowBlur = value === 0 ? 0 : 9
+                    ctx.translate(point[0], point[1])
+                    ctx.rotate(angle)
+                    ctx.shadowColor = power <= 0.002 ? "transparent" : color
+                    ctx.shadowBlur = power <= 0.002 ? 0 : 8 + 8 * power
                     ctx.beginPath()
-                    ctx.fillStyle = "#0b141e"
-                    ctx.arc(point[0], point[1], motorRadius + 2, 0, Math.PI * 2)
+                    roundedRect(-ductLength / 2, -ductWidth / 2, ductLength, ductWidth, 12)
+                    const ductGradient = ctx.createLinearGradient(
+                        -ductLength / 2, 0, ductLength / 2, 0
+                    )
+                    ductGradient.addColorStop(0, "#101b25")
+                    ductGradient.addColorStop(0.22, "#385065")
+                    ductGradient.addColorStop(0.5, "#162633")
+                    ductGradient.addColorStop(0.78, "#385065")
+                    ductGradient.addColorStop(1, "#101b25")
+                    ctx.fillStyle = ductGradient
                     ctx.fill()
-                    ctx.restore()
-
-                    ctx.beginPath()
                     ctx.strokeStyle = "#385064"
-                    ctx.lineWidth = 3
-                    ctx.arc(point[0], point[1], motorRadius, 0, Math.PI * 2)
+                    ctx.lineWidth = 2
                     ctx.stroke()
 
-                    if (magnitude > 0) {
-                        ctx.beginPath()
-                        ctx.strokeStyle = color
-                        ctx.lineWidth = 4
-                        ctx.lineCap = "round"
-                        ctx.arc(point[0], point[1], motorRadius, -Math.PI / 2,
-                                -Math.PI / 2 + Math.PI * 2 * magnitude)
-                        ctx.stroke()
-                        ctx.lineCap = "butt"
+                    ctx.fillStyle = "#0a121b"
+                    roundedRect(-ductLength / 2 + 6, -5, ductLength - 12, 10, 5)
+                    ctx.fill()
+                    if (power > 0.002) {
+                        const meterWidth = (ductLength - 12) * power
+                        const meterX = direction > 0
+                            ? -ductLength / 2 + 6
+                            : ductLength / 2 - 6 - meterWidth
+                        ctx.fillStyle = color
+                        roundedRect(meterX, -4, meterWidth, 8, 4)
+                        ctx.fill()
                     }
 
-                    const motorGradient = ctx.createRadialGradient(
-                        point[0] - 7, point[1] - 9, 2,
-                        point[0], point[1], motorRadius - 5
-                    )
-                    motorGradient.addColorStop(0, "#203346")
-                    motorGradient.addColorStop(1, "#101b27")
+                    ctx.strokeStyle = "#7590a5"
+                    ctx.lineWidth = 2
                     ctx.beginPath()
-                    ctx.fillStyle = motorGradient
-                    ctx.arc(point[0], point[1], motorRadius - 6, 0, Math.PI * 2)
-                    ctx.fill()
+                    ctx.moveTo(-8, -ductWidth / 2 + 3)
+                    ctx.lineTo(-8, ductWidth / 2 - 3)
+                    ctx.moveTo(8, -ductWidth / 2 + 3)
+                    ctx.lineTo(8, ductWidth / 2 - 3)
+                    ctx.stroke()
 
-                    ctx.fillStyle = "#f4f8fb"
-                    ctx.font = "bold 12px sans-serif"
-                    ctx.textAlign = "center"
-                    ctx.textBaseline = "middle"
-                    ctx.fillText(signedValue(value) + "%", point[0], point[1] - 6)
-
-                    ctx.fillStyle = value === 0 ? "#6f8799" : color
-                    ctx.font = "bold 8px sans-serif"
-                    const pwmNumber = Number(pwm)
-                    const pwmText = Number.isFinite(pwmNumber) && pwmNumber >= 0 ? Math.round(pwmNumber) : "--"
-                    ctx.fillText("PWM A " + pwmText, point[0], point[1] + 10)
+                    if (magnitude > 0.005) {
+                        const arrowStart = direction * (ductLength / 2 - 7)
+                        const arrowEnd = direction * (ductLength / 2 + 17)
+                        ctx.beginPath()
+                        ctx.strokeStyle = color
+                        ctx.lineWidth = 3
+                        ctx.lineCap = "round"
+                        ctx.moveTo(arrowStart, 0)
+                        ctx.lineTo(arrowEnd, 0)
+                        ctx.stroke()
+                        ctx.lineCap = "butt"
+                        ctx.fillStyle = color
+                        ctx.beginPath()
+                        ctx.moveTo(arrowEnd, 0)
+                        ctx.lineTo(arrowEnd - direction * 9, -6)
+                        ctx.lineTo(arrowEnd - direction * 9, 6)
+                        ctx.closePath()
+                        ctx.fill()
+                    }
+                    ctx.restore()
 
                     ctx.fillStyle = "#8ca3b5"
                     ctx.font = "bold 9px sans-serif"
+                    ctx.textAlign = "center"
                     ctx.textBaseline = "alphabetic"
                     ctx.fillText(label, labelX, labelY)
+
+                    const pwmNumber = Number(pwm)
+                    const pwmText = Number.isFinite(pwmNumber) && pwmNumber >= 0 ? Math.round(pwmNumber) : "--"
+                    ctx.fillStyle = value === 0 ? "#6f8799" : color
+                    ctx.font = "bold 10px sans-serif"
+                    ctx.fillText(
+                        signedValue(value) + "%  |  PWM " + pwmText,
+                        labelX,
+                        labelY + 14
+                    )
                 }
 
                 // Hull outline and motor arms follow the measured current layout:
@@ -448,6 +473,13 @@ ApplicationWindow {
                 ctx.lineTo(rear[0], rear[1] - 22)
                 ctx.stroke()
                 ctx.lineCap = "butt"
+
+                drawPowerLink([cx - 34, hullCy - 45], frontLeft,
+                              s.frontLeftMotor || 0, s.frontLeftMotorPwm)
+                drawPowerLink([cx + 34, hullCy - 45], frontRight,
+                              s.frontRightMotor || 0, s.frontRightMotorPwm)
+                drawPowerLink([cx, hullCy + 58], rear,
+                              s.rearMotor || 0, s.rearMotorPwm)
 
                 // Yaw is rotational, so visualize it independently from the
                 // blue translation vector as a direction-aware arc on the hull.
@@ -524,16 +556,15 @@ ApplicationWindow {
                 ctx.fillStyle = yawMagnitude > 0.005 ? "#d8b8ff" : "#60788d"
                 ctx.fillText("YAW " + signedValue(Number(s.yaw) || 0) + "%", cx, hullCy + 41)
 
-                drawVerticalUsageBar(frontLeft[0] - 45, frontLeft[1] - 39, 78, s.frontLeftMotor || 0)
-                drawVerticalUsageBar(frontRight[0] + 35, frontRight[1] - 39, 78, s.frontRightMotor || 0)
-                drawHorizontalUsageBar(rear[0] - 70, rear[1] + 37, 140, s.rearMotor || 0)
-
-                drawMotor(frontLeft, s.frontLeftMotor || 0, s.frontLeftMotorPwm || 0,
-                          "FRONT LEFT", frontLeft[0], frontLeft[1] + 43)
-                drawMotor(frontRight, s.frontRightMotor || 0, s.frontRightMotorPwm || 0,
-                          "FRONT RIGHT", frontRight[0], frontRight[1] + 43)
-                drawMotor(rear, s.rearMotor || 0, s.rearMotorPwm || 0,
-                          "REAR", rear[0] + 48, rear[1] + 4)
+                drawMotorDuct(frontLeft, 0.5, 0.8660254,
+                              s.frontLeftMotor || 0, s.frontLeftMotorPwm,
+                              "FRONT LEFT", frontLeft[0], frontLeft[1] - 58)
+                drawMotorDuct(frontRight, -0.5, 0.8660254,
+                              s.frontRightMotor || 0, s.frontRightMotorPwm,
+                              "FRONT RIGHT", frontRight[0], frontRight[1] - 58)
+                drawMotorDuct(rear, 1.0, 0.0,
+                              s.rearMotor || 0, s.rearMotorPwm,
+                              "REAR / WATER LEFT", rear[0], rear[1] + 34)
 
                 const rearPwm = Math.max(0, Math.round(Number(s.rearMotorPwm) || 0))
                 const leftPwm = Math.max(0, Math.round(Number(s.frontLeftMotorPwm) || 0))
@@ -553,18 +584,8 @@ ApplicationWindow {
                 ctx.fillText(demandText, 2, height - 5)
 
                 ctx.textAlign = "right"
-                ctx.fillStyle = "#7890a3"
-                ctx.fillText("FWD", width - 62, height - 5)
-                ctx.fillStyle = "#3ddc97"
-                ctx.beginPath()
-                ctx.arc(width - 86, height - 5, 3, 0, Math.PI * 2)
-                ctx.fill()
-                ctx.fillStyle = "#7890a3"
-                ctx.fillText("REV", width - 4, height - 5)
-                ctx.fillStyle = "#ffaa46"
-                ctx.beginPath()
-                ctx.arc(width - 29, height - 5, 3, 0, Math.PI * 2)
-                ctx.fill()
+                ctx.fillStyle = "#60788d"
+                ctx.fillText("GREEN +  /  ORANGE -  /  ARROWS SHOW WATER FLOW", width - 2, 10)
             }
         }
 
@@ -773,6 +794,7 @@ ApplicationWindow {
         Repeater {
                 model: [
                     { label: "Connection", value: s.serialStatus },
+                    { label: "Firmware", value: s.firmwareVersion || "Unknown" },
                     { label: "Battery", value: s.batteryStatus },
                     { label: "Location", value: s.currentLocation },
                     { label: "Target", value: s.targetLocation },
@@ -1139,6 +1161,7 @@ ApplicationWindow {
                 } else if (motorTestPanel.testRunning) {
                     motorTestPanel.deactivate()
                 }
+                if (tab === "sd_debug") backend.refreshSdFiles()
             }
 
             TabButton { text: "Science & Audio" }
@@ -1147,6 +1170,8 @@ ApplicationWindow {
             TabButton { text: "Bottom Mesh" }
             TabButton { text: "Motor Test" }
             TabButton { text: "Navigation Test" }
+            TabButton { text: "Instrument Debug" }
+            TabButton { text: "SD Card" }
         }
 
         StackLayout {
@@ -1504,6 +1529,19 @@ ApplicationWindow {
                 Layout.fillHeight: true
                 backendObject: backend
                 backendState: s
+            }
+
+            MicrophoneDebugPanel {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                backendObject: backend
+                backendState: s
+            }
+
+            SdCardDebugPanel {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                backendObject: backend
             }
         }
     }

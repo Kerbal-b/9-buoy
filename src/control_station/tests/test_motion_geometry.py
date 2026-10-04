@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from station.geometry import build_manual_command
+from station.geometry import LEGACY_RADIAL_MOTOR_MIX, build_manual_command
 
 
 class MotionGeometryTests(unittest.TestCase):
@@ -17,27 +17,41 @@ class MotionGeometryTests(unittest.TestCase):
 
         self.assertEqual(command.to_line(), "CTRL MOTION +0 +0 +35\n")
         self.assertEqual(command.rear_motor, 35)
-        self.assertEqual(command.front_left_motor, 35)
+        self.assertEqual(command.front_left_motor, -35)
         self.assertEqual(command.front_right_motor, 35)
 
-    def test_full_lateral_translation_reaches_full_front_motor_output(self) -> None:
+    def test_full_right_translation_uses_horizontal_rear_motor(self) -> None:
         command = build_manual_command(1.0, 0.0)
 
-        self.assertEqual(command.rear_motor, 0)
-        self.assertEqual(command.front_left_motor, 100)
-        self.assertEqual(command.front_right_motor, -100)
+        self.assertEqual(command.rear_motor, 100)
+        self.assertEqual(command.front_left_motor, 67)
+        self.assertEqual(command.front_right_motor, -67)
 
-    def test_left_translation_only_reverses_the_two_angled_motors(self) -> None:
+    def test_full_left_translation_reverses_right_translation_mix(self) -> None:
         command = build_manual_command(-1.0, 0.0)
 
-        self.assertEqual(command.rear_motor, 0)
-        self.assertEqual(command.front_left_motor, -100)
-        self.assertEqual(command.front_right_motor, 100)
+        self.assertEqual(command.rear_motor, -100)
+        self.assertEqual(command.front_left_motor, -67)
+        self.assertEqual(command.front_right_motor, 67)
 
     def test_combined_translation_and_yaw_stays_bounded(self) -> None:
         command = build_manual_command(1.0, 1.0, 1.0)
 
         self.assertLessEqual(max(abs(command.rear_motor), abs(command.front_left_motor), abs(command.front_right_motor)), 100)
+
+    def test_forward_drives_both_front_motors_forward(self) -> None:
+        command = build_manual_command(0.0, 1.0)
+
+        self.assertEqual(command.rear_motor, 0)
+        self.assertEqual(command.front_left_motor, 100)
+        self.assertEqual(command.front_right_motor, 100)
+
+    def test_legacy_layout_remains_available(self) -> None:
+        command = build_manual_command(0.0, 0.0, 0.35, LEGACY_RADIAL_MOTOR_MIX)
+
+        self.assertEqual(command.rear_motor, 35)
+        self.assertEqual(command.front_left_motor, 35)
+        self.assertEqual(command.front_right_motor, 35)
 
 
 if __name__ == "__main__":
