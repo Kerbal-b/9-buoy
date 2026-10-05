@@ -33,6 +33,8 @@ The mission log should record each instruction, transition, checkpoint arrival/d
 
 The current firmware creates one session and logs science/telemetry during manual mission capture. Audio starts disabled and can be toggled manually. Multiple audio intervals currently append to `audio.wav`; `audio.idx` keeps their timestamps, but the WAV alone does not encode the gaps. Checkpoint commands, transcript upload/execution, per-checkpoint WAV chunks, and automated sensor switching are not yet implemented. `CTRL SCIENCE STOP` ends capture, and `CTRL SCIENCE SAVE` closes the session; they are not pause/resume controls.
 
+The planned alternate upload route is control station → router or TX Backpack access point → ExpressLRS TX Backpack MAVLink UDP → ELRS radio link → buoy receiver UART → buoy mission storage. The control station can discover the TX Backpack and listen for MAVLink battery, position, and channel telemetry on UDP `14550`. Neither production buoy firmware nor the station implements MAVLink mission transfer, and production firmware does not yet send MAVLink telemetry. The isolated CRSF bench sketch verifies radio control and telemetry only. Mission transfer will need a MAVLink receiver on the buoy, a defined mapping from the transcript to mission messages, and an acknowledged save before launch.
+
 SD downloads enter service mode only after a mission is saved and closed. Service mode stops motors, pauses sensor polling and audio capture, disables heavy Wi-Fi streams, and exits after transfer or cancellation. A mission must never start or continue while service mode is active.
 
 ## Open decision: audio priority versus navigation

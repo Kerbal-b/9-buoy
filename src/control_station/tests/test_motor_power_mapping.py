@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 import unittest
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from station.qt_app import _calibrated_motor_pwm, _motor_percent_command, _parse_motor_output_telemetry
+from station.qt_app import (
+    ControlStationBackend,
+    _calibrated_motor_pwm,
+    _motor_percent_command,
+    _parse_motor_output_telemetry,
+    parse_args,
+)
 
 
 class MotorPowerMappingTests(unittest.TestCase):
@@ -30,6 +40,28 @@ class MotorPowerMappingTests(unittest.TestCase):
     def test_invalid_motor_output_telemetry_is_ignored(self) -> None:
         self.assertIsNone(_parse_motor_output_telemetry("TEL MOTOR OUT 40 nope"))
         self.assertIsNone(_parse_motor_output_telemetry("TEL STATUS MODE MANUAL"))
+
+    def test_motor_test_keepalive_repeats_until_stop(self) -> None:
+        with patch("sys.argv", ["test"]):
+            args = parse_args()
+        with patch("station.qt_app.list_wifi_interfaces", return_value=[]):
+            backend = ControlStationBackend(args, Path("commands.log"), Path("prefs.json"))
+        backend._transport = SimpleNamespace(is_open=True)
+
+        with patch("station.qt_app.send_text", return_value="sent") as send:
+            backend.sendMotorTestPower("rear", 15)
+            backend._send_motor_test_keepalive()
+            self.assertEqual(send.call_count, 1)
+
+            backend._last_motor_test_send_at = time.monotonic() - 0.25
+            backend._send_motor_test_keepalive()
+            self.assertEqual(send.call_count, 2)
+            self.assertTrue(any("keepalive" in line for line in backend._command_trace_pending))
+
+            backend.stopMotorTest("released")
+            backend._send_motor_test_keepalive()
+            self.assertEqual(send.call_count, 3)
+            self.assertTrue(any("HOLD ENDED reason=released" in line for line in backend._command_trace_pending))
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ Item {
         Text {
             x: 20
             y: 18
-            text: "Science & Audio"
+            text: "Instrument Readings & Audio"
             color: "#e6ecf2"
             font.pixelSize: 22
             font.bold: true
@@ -283,8 +283,9 @@ Item {
     Connections {
         target: backendObject
 
-        function onStateChanged() {
-            audioCanvas.requestPaint()
+        function onAudioWaveformChanged() {
+            if (root.visible) audioCanvas.requestPaint()
         }
     }
+    onVisibleChanged: if (visible) audioCanvas.requestPaint()
 }

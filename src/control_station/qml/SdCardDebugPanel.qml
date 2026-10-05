@@ -108,7 +108,7 @@ Item {
             RowLayout {
                 Layout.fillWidth: true
                 Text {
-                    text: "SD Card Debug"
+                    text: "SD Card"
                     color: "#e6ecf2"
                     font.pixelSize: 23
                     font.bold: true

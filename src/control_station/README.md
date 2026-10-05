@@ -36,18 +36,35 @@ Review this section after each control station update and confirm that the code 
 - Debug mode launch: `--debug-controller`
 - Debug mode goal: show generic controller inputs, with analog values as live bars and digital buttons as labeled on/off indicators
 - Current ESP32 Wi-Fi target: the buoy joins SSID `Bouy` with password `SuperMonkey`, then serves TCP `5000`, UDP telemetry `5001`, and UDP audio `5002`
+- The Radio / ELRS panel can find an ExpressLRS TX Backpack on the same network. It checks `elrs_txbp.local`, then probes local IPv4 /24 addresses for the TX Backpack web page and shows its IP and MAVLink forwarding status. The station listens for validated MAVLink HEARTBEAT, SYS_STATUS, GLOBAL_POSITION_INT, RADIO_STATUS, RC_CHANNELS, and RC_CHANNELS_RAW messages on UDP `14550`. The ESP32 MAVLink bench sketch relays ELRS receiver uplink LQ/RSSI/SNR and TX12 channel positions to this panel, using smaller eight-channel messages to fit the ELRS telemetry budget. Battery and position require production buoy MAVLink telemetry. Set `Backpack > Telemetry` to `WiFi` in the ExpressLRS Lua script to enable forwarding; `Enable Backpack WiFi` is firmware update mode. Discovery and telemetry reception do not yet send missions over MAVLink.
+
+### TX12 MKII control map
+
+The Radio / ELRS panel puts the light TX12 MKII image beside the buoy telemetry table and shows a compact, two-column control map underneath. The duplicate 16-channel grid has been removed. **Show unmapped** reveals controls with no channel or no defined function; it is off by default. A control counts as mapped when it has a channel and either a `purpose` or at least one switch-position `meaning` in `config/tx12-channel-map.json`. The starter map assumes **Mode 2 / AETR**: right stick horizontal CH1 (aileron), right stick vertical CH2 (elevator), left stick vertical CH3 (throttle), and left stick horizontal CH4 (rudder). Confirm those outputs in the active EdgeTX model's channel monitor. Edit any `channel` value from 1 through 16 and click **Reload map** in the panel. The file only labels the station display; it does not program EdgeTX, transmit controls, or assign buoy commands. Buoy commands will be mapped to channel values in firmware separately.
+
+The template maps SE/SF/SB/SC to CH5-CH8 and SA/SD to CH9-CH10. Those channels are planned assignments that must also be mixed in the active EdgeTX model; S1 and S2 remain unassigned. Physical labels follow the [RadioMaster TX12 MKII manual](https://cdn.shopify.com/s/files/1/0701/8066/7584/files/TX12MKII_A2.0.pdf?v=1770617495), and the starter stick assignments follow the [EdgeTX Mode 2 and channel-order definitions](https://manual.edgetx.org/v2.11/bw-radios/radio-settings/radio-setup). The generated photo and marker locations are visual aids.
+
+The current channel plan, stick functions, switch assignments, and display thresholds are in [config/TX12-CONTROLS.md](config/TX12-CONTROLS.md). The station shows live bars for all four stick axes and discrete channel states for switches; position command meanings remain open in the JSON map.
+
+### TX Backpack bench diagnostic (no buoy receiver required)
+
+From `src/control_station`, run `python diagnose_backpack.py --host 192.168.8.134 --seconds 20 --log logs/backpack_diagnostic.jsonl` (replace the IP if DHCP changes it). This standard-library tool checks the Backpack web page and firmware revision, reads the `/mavlink` forwarding state and counters, listens on UDP 14550, and logs every raw datagram with any MAVLink frame metadata and supported decoded messages. A `crc_valid: null` frame uses a message ID whose CRC extra is not in the small built-in decoder; it is logged but not authenticated. When MAVLink forwarding is active, the tool sends one harmless ground-station HEARTBEAT to the Backpack UDP listen port (normally 14555) and checks status again. Use `--no-probe` for receive-only observation.
+
+Only one process can normally listen on UDP 14550 on Windows. Close the main control station before running this tool for full reception. A different `--listen-port` permits web/status testing while the main station runs, but the Backpack still sends to its configured port 14550. The Backpack web endpoint proves PC-to-Backpack Wi-Fi/TCP reachability even without an ELRS receiver; it does not prove MAVLink UDP or RF. The `/mavlink` status page exposes forwarding state, GCS IP, ports, and packet counters. It does not expose the TX12 battery or EdgeTX-local state. When RADIO_STATUS (message 109) arrives, the tool reports its validated raw fields. ExpressLRS uses its receiver-generated `RADIO_STATUS.rssi` for uplink LQ and `remrssi` for uplink RSSI; the bench ESP32 must relay it for the PC to see it.
+
+The separate `esp32-elrs-crsf-test` bench sketch uses CRSF at 420000 baud. It sends no MAVLink frames, so a zero Backpack MAVLink downlink count is expected even when its TX12 control and EdgeTX telemetry work. The control station sends a periodic GCS HEARTBEAT to an active Backpack so it learns the PC address. The `esp32-elrs-mavlink-test` sketch at 460800 baud is the current bench source for heartbeat, link measurements, and channel telemetry.
 - Test fallback: simulation mode when no serial port is supplied
 - Display goal: keep diagnostics out of the main interface unless debug mode is opened
 
 ## Control-Station Layout Contract
 
-The main control-station window uses three stable panel regions:
+The main control-station window uses three panel regions:
 
 - Top-left: `Buoy Visualization` — the buoy shape, motor arrangement, and movement vector.
-- Bottom-left: `Buoy Operational` — connection, Wi-Fi, navigation, movement, power, and operational telemetry.
-- Full-height right: `Dashboard` — a tabbed area for science and audio telemetry, instrument debugging, logs, maps/science views, motor testing, and navigation testing.
+- Bottom-left: `Buoy Status` — compact operational telemetry and control source selection.
+- Full-height right: `Dashboard` — Overview, Communications, Power, Motor Test, Navigation, Instrument Debugging, and SD Card tabs.
 
-Future control-station changes must preserve these three regions and their responsibilities. New right-side features should be added as Dashboard subtabs. Change this layout only when the project owner explicitly requests a design change.
+Overview is the default page and shows one compact status tile for each subsystem. Communications owns Wi-Fi source selection, connection controls, link diagnostics, text commands, the link log, and ELRS backpack telemetry. Instrument Debugging contains sensor readings, audio session capture, and microphone diagnostics. The former Map and Bottom Mesh tabs have been removed pending Mission Tracking and Mission Creation.
 
 ## Current Responsibilities
 
@@ -80,7 +97,11 @@ Future control-station changes must preserve these three regions and their respo
 - `station/models.py` shared runtime and command data structures
 - `station/settings.py` UI and runtime constants
 - `qml/Main.qml` main three-region window layout and dashboard tabs
-- `qml/ScienceAudioPanel.qml` Science & Audio telemetry dashboard tab
+- `qml/OverviewPanel.qml` default subsystem status tiles
+- `qml/CommunicationsPanel.qml` Wi-Fi controls, ELRS backpack telemetry, and link log
+- `qml/PowerPanel.qml` battery status, current, and charging indication
+- `qml/InstrumentPanel.qml` instrument readings and microphone debugging subpages
+- `qml/ScienceAudioPanel.qml` instrument readings and audio session controls
 - `qml/MicrophoneDebugPanel.qml` Instrument Debug dashboard tab, with per-channel microphone waveforms, packet continuity, monitor controls, and laptop-side high-pass, low-pass, and noise-gate filters
 - `qml/MotorTestPanel.qml` motor testing, output visualization, and calibration dashboard tab
 - `qml/NavigationTestPanel.qml` requested-versus-measured movement visualization and opt-in navigation balance-assist controls
@@ -90,6 +111,8 @@ Future control-station changes must preserve these three regions and their respo
 - `activate_env.sh` activate the local virtual environment in the current shell
 - `run_control_station.sh` run the program using the local virtual environment
 - `run_controller_debug.sh` open the separate controller diagnostics window
+
+The Radio / ELRS panel shows backpack discovery, MAVLink receive status, bench receiver uplink LQ/RSSI/SNR, and TX12 channel positions. The former TX12 USB joystick controls are no longer shown on this card. The separate ESP32 MAVLink sketch is a bench test; production firmware does not yet report RF link status, accept TX12 receiver channels, or send MAVLink telemetry. Solar input telemetry is also not yet available, so Power marks it unavailable.
 
 ## Command Format
 
@@ -122,17 +145,17 @@ CTRL MOTION <lateral> <thrust> <yaw>
 
 All three values range from `-100` to `+100`. Translation-only commands continue using `CTRL VECTOR` for compatibility. When yaw is combined with translation, the firmware scales the complete three-motor mix together if necessary so no motor exceeds its allowed command range.
 
-The ESP32 propulsion watchdog requires fresh control traffic at least once per second while a motor command is active. Normal drive commands are refreshed at the configured send rate, and the Motor Test tab refreshes its selected motor command every `250 ms`. Losing Wi-Fi/TCP or exceeding the watchdog interval stops all motors.
+The ESP32 propulsion watchdog requires fresh control traffic at least once per second while a motor command is active. Normal drive commands are refreshed at the configured send rate, and the control station backend refreshes the Motor Test command every `200 ms` while the test button is held. The command trace records each motor keepalive and marks button release, stop requests, tab changes, link loss, and an observed motor-output drop. Losing Wi-Fi/TCP or exceeding the watchdog interval stops all motors.
 
 ## Navigation Test Mode
 
-The `Navigation Test` dashboard tab compares three body-frame vectors:
+The `Navigation` dashboard tab compares three body-frame vectors:
 
 - the operator's requested controller vector
 - horizontal linear acceleration from the MPU6050 after low-frequency gravity and hull tilt are removed
 - the corrected vector actually sent to the buoy
 
-Balance assist is opt-in. Zero the IMU while the buoy is stationary, verify the measured-axis direction with short low-power inputs, and only then enable assist. The algorithm preserves requested magnitude and applies a smoothed angular correction limited by the configured maximum. It automatically disengages when IMU telemetry becomes stale, the connection drops, or the operator leaves the Navigation Test tab. Active corrections are recorded as `NAV` entries in the communication log.
+Balance assist is opt-in. Zero the IMU while the buoy is stationary, verify the measured-axis direction with short low-power inputs, and only then enable assist. The algorithm preserves requested magnitude and applies a smoothed angular correction limited by the configured maximum. It automatically disengages when IMU telemetry becomes stale, the connection drops, or the operator leaves the Navigation tab. Active corrections are recorded as `NAV` entries in the communication log.
 
 The installed MPU6050 is mounted 90 degrees clockwise. Navigation Test therefore defaults to swapping X/Y and inverting the mapped X axis: buoy-right is sensor `-Y`, and buoy-forward is sensor `+X`.
 

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from array import array
 from collections import deque
 from dataclasses import asdict
 from datetime import datetime, timezone
 import math
+import json
+import ipaddress
 from pathlib import Path
 import queue
+import socket
 import sys
 import time
 import threading
@@ -16,13 +20,14 @@ try:
     import pygame
 except ModuleNotFoundError:
     pygame = None
-from PySide6.QtCore import QEvent, QObject, Property, QStandardPaths, QTimer, Qt, Signal, Slot, QUrl
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, Property, QStandardPaths, QTimer, Qt, Signal, Slot, QUrl
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 
-from .controller import get_controller, read_motion_axes
+from .controller import read_motion_axes
 from .geometry import ACTIVE_MOTOR_MIX, MOTOR_OUTPUT_BOOST, build_manual_command
 from .models import ScienceSample
+from .mavlink_telemetry import decode_datagram, gcs_heartbeat
 from .navigation import GpsSpeedTracker, NavigationAssist
 from .log_categories import (
     NAVIGATION_LOG,
@@ -32,6 +37,7 @@ from .log_categories import (
     interpret_log_entry,
 )
 from .protocol import is_protocol_message, parse_acknowledgement, parse_error, parse_science_update, parse_status_update
+from .radio_wifi import discover_tx_backpack
 from .serial_link import (
     CONNECTION_PREFS_FILENAME,
     WIFI_DEFAULT_AUDIO_PORT,
@@ -51,8 +57,24 @@ from .serial_link import (
 from .sd_card_client import delete_sd_session, download_sd_file, download_sd_session, list_sd_files, list_sd_session
 from .test_session import PersistentTestSession
 from .telemetry_quality import ImuStreamQuality
+from .tx12_mapping import DEFAULT_TX12_MAPPING_PATH, load_tx12_mapping
 
 DEFAULT_MIXER_POWER_LIMIT = 0.50
+ELRS_MAVLINK_UDP_PORT = 14550
+RADIO_DEVICE_TOKENS = ("tx12", "radiomaster", "edgetx")
+BUOY_ROUTER_NETWORK = ipaddress.IPv4Network("192.168.8.0/24")
+
+
+def _get_default_controller():
+    if pygame is None:
+        return None
+    for index in range(pygame.joystick.get_count()):
+        joystick = pygame.joystick.Joystick(index)
+        if any(token in joystick.get_name().lower() for token in RADIO_DEVICE_TOKENS):
+            continue
+        joystick.init()
+        return joystick
+    return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -393,6 +415,8 @@ class KeyboardDriveFilter(QObject):
 
 class ControlStationBackend(QObject):
     stateChanged = Signal()
+    logChanged = Signal()
+    audioWaveformChanged = Signal()
     dashboardTabChanged = Signal()
     audioMutedChanged = Signal()
 
@@ -401,9 +425,47 @@ class ControlStationBackend(QObject):
         self._args = args
         self._log_file = log_file
         self._prefs_path = prefs_path
+        self._tx12_mapping_path = DEFAULT_TX12_MAPPING_PATH
         self._state: dict[str, object] = {
             "controllerStatus": "Not connected",
-            "controllerName": "Connect Xbox controller",
+            "controllerName": "Connect a controller",
+            "radioUsbStatus": "Not connected",
+            "radioUsbConnected": False,
+            "radioUsbName": "",
+            "radioWifiStatus": "Not scanned",
+            "radioWifiIp": "",
+            "radioWifiScanning": False,
+            "networkBuoyDevices": [],
+            "networkScanStatus": "Looking for the 192.168.8.0/24 buoy network",
+            "networkScanning": False,
+            "wifiReceivedMessages": 0,
+            "wifiReceivedBytes": 0,
+            "wifiMessageRate": 0.0,
+            "wifiThroughputKib": 0.0,
+            "wifiTrafficStatus": "No active buoy control link",
+            "tcpPort": int(args.tcp_port),
+            "udpPort": int(args.udp_port),
+            "audioPort": int(args.audio_port),
+            "radioTelemetryStatus": "Not listening",
+            "radioTelemetryPackets": 0,
+            "elrsPacketLogging": False,
+            "radioSystemId": "Unknown",
+            "radioLinkStatus": "No receiver RADIO_STATUS relayed",
+            "radioRssiStatus": "Unknown",
+            "radioLinkQuality": "Waiting for ELRS receiver status",
+            "radioSnrStatus": "Unknown",
+            "radioBatteryStatus": "N/A",
+            "radioCurrentDraw": "N/A",
+            "radioLocation": "Unknown",
+            "radioChannels": [],
+            "tx12Controls": [],
+            "tx12MapPath": str(self._tx12_mapping_path),
+            "tx12MapStatus": "Mapping not loaded",
+            "telemetrySource": "No live telemetry",
+            "radioAxes": [],
+            "radioAxisValues": [],
+            "radioAxisMapping": {"lateral": 0, "thrust": 1, "yaw": 2},
+            "radioAxisInverted": {"lateral": False, "thrust": True, "yaw": False},
             "controllerMode": "idle",
             "controlInputMode": "controller",
             "controlInputModeDetail": "Left stick movement + right stick yaw",
@@ -533,6 +595,7 @@ class ControlStationBackend(QObject):
             "navigationCorrectedFrontLeftMotor": 0,
             "navigationCorrectedFrontRightMotor": 0,
         }
+        self.reloadTx12Mapping()
         self._comm_log: list[str] = []
         self._command_trace_pending: list[str] = []
         self._last_command_trace_flush = time.monotonic()
@@ -584,7 +647,7 @@ class ControlStationBackend(QObject):
                 "default_reversed": True,
             },
         }
-        self._dashboard_tab = "logs"
+        self._dashboard_tab = "overview"
         self._audio_muted = False
         self._network_interfaces = list_wifi_interfaces()
         self._wifi_local_ip = getattr(args, "wifi_local_ip", "auto") or "auto"
@@ -610,6 +673,9 @@ class ControlStationBackend(QObject):
         self._audio_sounds_scheduled = 0
 
         self._transport = None
+        self._wifi_tcp_messages_total = 0
+        self._wifi_traffic_transport = None
+        self._wifi_traffic_sample: tuple[int, int, float] | None = None
         self._connection_thread: threading.Thread | None = None
         self._connection_lock = threading.Lock()
         self._connection_in_flight = False
@@ -624,6 +690,36 @@ class ControlStationBackend(QObject):
         self._sd_cancel_event = threading.Event()
         self._sd_service_requested = False
         self._joystick = None
+        self._radio_usb_connected = False
+        self._radio_wifi_lock = threading.Lock()
+        self._radio_wifi_pending: tuple[str | None, str] | None = None
+        self._radio_wifi_scanning = False
+        self._network_scan_lock = threading.Lock()
+        self._network_scan_pending: tuple[list[dict[str, object]], str] | None = None
+        self._network_scanning = False
+        self._radio_telemetry_socket: socket.socket | None = None
+        self._radio_telemetry_last_at = 0.0
+        self._radio_link_last_at = 0.0
+        self._radio_heartbeat_last_at = 0.0
+        self._radio_telemetry_packets = 0
+        self._radio_system_id: int | None = None
+        self._radio_field_last_at: dict[str, float] = {}
+        self._radio_mapping_path = prefs_path.with_name("radio-mapping.json")
+        try:
+            stored_mapping = json.loads(self._radio_mapping_path.read_text(encoding="utf-8"))
+            if isinstance(stored_mapping, dict):
+                stored_axes = stored_mapping.get("axes", stored_mapping)
+                stored_inverted = stored_mapping.get("inverted", {})
+                self._state["radioAxisMapping"] = {
+                    key: max(0, int(stored_axes.get(key, default)))
+                    for key, default in (("lateral", 0), ("thrust", 1), ("yaw", 2))
+                }
+                self._state["radioAxisInverted"] = {
+                    key: bool(stored_inverted.get(key, default))
+                    for key, default in (("lateral", False), ("thrust", True), ("yaw", False))
+                }
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
         self._rx_buffer = bytearray()
         self._command = build_manual_command(0.0, 0.0)
         self._keyboard_turn = 0.0
@@ -642,8 +738,9 @@ class ControlStationBackend(QObject):
         self._connected_device_name: str | None = None
         self._last_reconnect_attempt = 0.0
         self._reconnect_interval = 2.0
+        self._auto_reconnect_enabled = True
         self._ping_interval = 5.0
-        self._link_timeout = 3.0
+        self._link_timeout = 8.0
         self._imu_quality = ImuStreamQuality(expected_interval_ms=50)
         self._last_imu_gyro = (0.0, 0.0, 0.0)
         self._last_science_sample_time = 0.0
@@ -663,33 +760,43 @@ class ControlStationBackend(QObject):
         }
         self._last_recorded_imu_arrival_at: float | None = None
         self._last_motor_output_at: float | None = None
+        self._last_motor_output_log_at = 0.0
+        self._last_motor_test_log_command: str | None = None
+        self._active_motor_test: tuple[str, int] | None = None
+        self._last_motor_test_send_at = 0.0
+        self._last_motor_test_actual_drive = 0
         self._last_power_at: float | None = None
+        self._last_tick_at = 0.0
 
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._tick)
+        self._log_update_timer = QTimer(self)
+        self._log_update_timer.setSingleShot(True)
+        self._log_update_timer.setInterval(250)
+        self._log_update_timer.timeout.connect(self.logChanged.emit)
 
     @Property(dict, notify=stateChanged)
     def state(self) -> dict[str, object]:
         return self._state
 
-    @Property(list, notify=stateChanged)
+    @Property(list, notify=logChanged)
     def commLog(self) -> list[str]:
         return self._comm_log
 
-    @Property(list, notify=stateChanged)
+    @Property(list, notify=logChanged)
     def categorizedLog(self) -> list[dict[str, str]]:
         return self._categorized_log
 
-    @Property(list, notify=stateChanged)
+    @Property(list, notify=logChanged)
     def systemLog(self) -> list[dict[str, str]]:
         return self._system_log
 
-    @Property(list, notify=stateChanged)
+    @Property(list, notify=logChanged)
     def navigationLog(self) -> list[dict[str, str]]:
         return self._navigation_log
 
-    @Property(list, notify=stateChanged)
+    @Property(list, notify=logChanged)
     def scientificLog(self) -> list[dict[str, str]]:
         return self._scientific_log
 
@@ -697,15 +804,15 @@ class ControlStationBackend(QObject):
     def scienceHistory(self) -> list[dict[str, object]]:
         return self._science_history
 
-    @Property(list, notify=stateChanged)
+    @Property(list, notify=audioWaveformChanged)
     def audioWaveform(self) -> list[float]:
         return self._audio_waveform
 
-    @Property(list, notify=stateChanged)
+    @Property(list, notify=audioWaveformChanged)
     def audioLeftWaveform(self) -> list[float]:
         return self._audio_left_waveform
 
-    @Property(list, notify=stateChanged)
+    @Property(list, notify=audioWaveformChanged)
     def audioRightWaveform(self) -> list[float]:
         return self._audio_right_waveform
 
@@ -873,6 +980,25 @@ class ControlStationBackend(QObject):
         return self._wifi_local_ip
 
     @Property(str, notify=stateChanged)
+    def stationNetworkIp(self) -> str:
+        if self._transport is not None and str(self._state.get("serialTarget", "")).startswith("WIFI:"):
+            tcp_socket = getattr(self._transport, "_tcp", None)
+            try:
+                return str(tcp_socket.getsockname()[0]) if tcp_socket else self._wifi_local_ip
+            except OSError:
+                pass
+        if self._wifi_local_ip and self._wifi_local_ip.lower() != "auto":
+            return self._wifi_local_ip
+        addresses = [entry["value"] for entry in self._network_interfaces if entry.get("value") != "auto"]
+        for address in addresses:
+            try:
+                if ipaddress.IPv4Address(address) in BUOY_ROUTER_NETWORK:
+                    return address
+            except ipaddress.AddressValueError:
+                continue
+        return addresses[0] if addresses else "No IPv4 address detected"
+
+    @Property(str, notify=stateChanged)
     def connectionButtonLabel(self) -> str:
         serial_status = str(self._state.get("serialStatus", "Disconnected"))
         if serial_status.startswith("Connecting"):
@@ -889,7 +1015,7 @@ class ControlStationBackend(QObject):
 
     @Slot(str)
     def setDashboardTab(self, tab: str) -> None:
-        if tab not in {"science", "logs", "map", "analysis", "motors", "navigation", "instrument_debug", "sd_debug"}:
+        if tab not in {"overview", "communications", "power", "motors", "navigation", "instrument_debug", "sd_debug"}:
             return
         if self._dashboard_tab != tab:
             leaving_motor_debug = self._dashboard_tab == "motors" and tab != "motors"
@@ -897,6 +1023,9 @@ class ControlStationBackend(QObject):
             self._dashboard_tab = tab
             self.dashboardTabChanged.emit()
             if leaving_motor_debug:
+                if self._active_motor_test is not None:
+                    stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                    self._command_trace_pending.append(f"{stamp} MOTOR TEST TAB LEFT\n")
                 self.stopAllMotors()
             if leaving_navigation_test:
                 was_enabled = self._navigation.enabled
@@ -1494,6 +1623,8 @@ class ControlStationBackend(QObject):
             return
         self._wifi_local_ip = normalized
         self._args.wifi_local_ip = normalized
+        self._auto_reconnect_enabled = True
+        self._reconnect_interval = 2.0
         self._connection_request_id += 1
         with self._connection_lock:
             self._pending_connection = None
@@ -1511,6 +1642,7 @@ class ControlStationBackend(QObject):
     @Slot()
     def toggleConnection(self) -> None:
         if self._transport is not None:
+            self._auto_reconnect_enabled = False
             try:
                 self._transport.close()
             except Exception:
@@ -1519,11 +1651,430 @@ class ControlStationBackend(QObject):
             self._set_transport_disconnected("Disconnected")
             return
 
+        self._auto_reconnect_enabled = True
+        self._reconnect_interval = 2.0
         self._queue_transport_connection(initial=False)
         self.stateChanged.emit()
 
     @Slot()
+    def connectRadioController(self) -> None:
+        if pygame is None:
+            self._set_state(radioUsbStatus="pygame joystick support is unavailable")
+            return
+        pygame.event.pump()
+        for index in range(pygame.joystick.get_count()):
+            candidate = pygame.joystick.Joystick(index)
+            name = candidate.get_name()
+            if not any(token in name.lower() for token in RADIO_DEVICE_TOKENS):
+                continue
+            candidate.init()
+            if candidate.get_numaxes() < 3:
+                self._set_state(radioUsbStatus="TX12 needs at least three USB joystick axes")
+                return
+            self.stopAllMotors()
+            if self._joystick is not None and self._joystick is not candidate:
+                self._joystick.quit()
+            self._joystick = candidate
+            self._radio_usb_connected = True
+            self._navigation_requires_center = True
+            axes = [{"index": axis, "label": f"Axis {axis}"} for axis in range(candidate.get_numaxes())]
+            mapping = dict(self._state["radioAxisMapping"])
+            mapping = {key: value if value < len(axes) else default for key, value, default in
+                       (("lateral", mapping["lateral"], 0), ("thrust", mapping["thrust"], 1), ("yaw", mapping["yaw"], 2))}
+            self._set_state(
+                radioUsbStatus="USB joystick connected",
+                radioUsbConnected=True,
+                radioUsbName=name,
+                radioAxes=axes,
+                radioAxisMapping=mapping,
+                controllerStatus="Connected",
+                controllerName=name,
+                navigationReleaseRequired=True,
+            )
+            return
+        self._set_state(radioUsbStatus="TX12 not found; enable USB joystick mode and reconnect")
+
+    @Slot()
+    def reloadTx12Mapping(self) -> None:
+        try:
+            controls = load_tx12_mapping(self._tx12_mapping_path)
+        except (OSError, ValueError, TypeError) as exc:
+            self._set_state(tx12MapStatus=f"Mapping error: {exc}")
+            return
+        assignable = [item for item in controls if item["kind"] != "radio_ui"]
+        assigned = sum(item["channel"] is not None for item in assignable)
+        defined = sum(
+            item["channel"] is not None and (
+                bool(item["purpose"]) and item["purpose"] != "Unassigned"
+                or any(position["meaning"] for position in item["positions"])
+            )
+            for item in assignable
+        )
+        self._set_state(
+            tx12Controls=controls,
+            tx12MapStatus=f"{defined} functions defined; {assigned}/{len(assignable)} channels assigned",
+        )
+
+    @Slot()
+    def findRadioBackpack(self) -> None:
+        if self._radio_wifi_scanning:
+            return
+        self._network_interfaces = list_wifi_interfaces()
+        self._radio_wifi_scanning = True
+        self._set_state(radioWifiStatus="Scanning local Wi-Fi...", radioWifiScanning=True)
+        local_ips = [entry["value"] for entry in self._network_interfaces if entry["value"] != "auto"]
+        selected_ip = self._wifi_local_ip
+
+        def worker() -> None:
+            try:
+                result = discover_tx_backpack(local_ips, selected_ip)
+            except Exception as exc:
+                result = (None, f"TX Backpack scan failed: {exc}")
+            with self._radio_wifi_lock:
+                self._radio_wifi_pending = result
+
+        threading.Thread(target=worker, daemon=True, name="tx-backpack-discovery").start()
+
+    @Slot(bool)
+    def setElrsPacketLogging(self, enabled: bool) -> None:
+        self._set_state(elrsPacketLogging=bool(enabled))
+
+    @Slot()
+    def scanBuoyNetwork(self) -> None:
+        target = str(self._state.get("serialTarget", ""))
+        if self._network_scanning:
+            return
+        self._network_interfaces = list_wifi_interfaces()
+        local_ip = self.stationNetworkIp
+        try:
+            address = ipaddress.IPv4Address(local_ip)
+        except ValueError:
+            self._set_state(networkScanStatus="No station IPv4 address is available for a network scan")
+            return
+        if address not in BUOY_ROUTER_NETWORK:
+            self._set_state(
+                networkScanStatus="Connect the station to 192.168.8.0/24 to scan for buoy devices",
+                networkBuoyDevices=[],
+            )
+            return
+        subnet = BUOY_ROUTER_NETWORK
+        local_ip = str(address)
+        port = int(self._args.tcp_port)
+        control_host = (
+            extract_wifi_host_from_target(target)
+            if target.startswith("WIFI:")
+            else None
+        )
+        transport_connected = self._transport is not None and self._transport.is_open
+        # The target may already have accepted a pending control connection even
+        # before the main thread installs its transport. Never probe its port.
+        reserved_host = control_host
+        connected_host = control_host if transport_connected else None
+        self._network_scanning = True
+        self._set_state(networkScanning=True, networkScanStatus=f"Scanning {subnet} for buoy services...")
+
+        def worker() -> None:
+            found: list[str] = [connected_host] if connected_host else []
+            def probe(address: str) -> str | None:
+                try:
+                    with socket.create_connection((address, port), timeout=0.22, source_address=(local_ip, 0)) as connection:
+                        connection.close()
+                    return address
+                except OSError:
+                    return None
+            addresses = [
+                str(candidate)
+                for candidate in subnet.hosts()
+                if str(candidate) not in {local_ip, reserved_host}
+            ]
+            with ThreadPoolExecutor(max_workers=64) as executor:
+                futures = [executor.submit(probe, address) for address in addresses]
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result:
+                        found.append(result)
+            if control_host and control_host not in found and self._transport is not None and self._transport.is_open:
+                found.append(control_host)
+            found.sort(key=lambda value: tuple(int(part) for part in value.split(".")))
+            devices = [
+                {"ip": address, "label": f"Buoy {index + 1}", "status": "Connected" if target.startswith("WIFI:") and address == extract_wifi_host_from_target(target) else "Reachable"}
+                for index, address in enumerate(found)
+            ]
+            with self._network_scan_lock:
+                self._network_scan_pending = (devices, f"{len(devices)} buoy device(s) found on {subnet}")
+
+        threading.Thread(target=worker, daemon=True, name="buoy-network-scan").start()
+
+    def _drain_network_scan(self) -> None:
+        with self._network_scan_lock:
+            result = self._network_scan_pending
+            self._network_scan_pending = None
+        if result is None:
+            return
+        devices, status = result
+        self._network_scanning = False
+        self._set_state(networkBuoyDevices=devices, networkScanStatus=status, networkScanning=False)
+
+    def _drain_radio_wifi_discovery(self) -> None:
+        with self._radio_wifi_lock:
+            result = self._radio_wifi_pending
+            self._radio_wifi_pending = None
+        if result is None:
+            return
+        address, status = result
+        self._radio_wifi_scanning = False
+        if address != self._state.get("radioWifiIp"):
+            self._radio_system_id = None
+            self._radio_telemetry_last_at = 0.0
+            self._radio_link_last_at = 0.0
+            self._radio_heartbeat_last_at = 0.0
+            self._radio_telemetry_packets = 0
+            self._radio_field_last_at.clear()
+            reset: dict[str, object] = dict(
+                radioTelemetryPackets=0,
+                radioSystemId="Unknown",
+                radioLinkStatus="No receiver RADIO_STATUS relayed",
+                radioRssiStatus="Unknown",
+                radioLinkQuality="Waiting for ELRS receiver status",
+                radioSnrStatus="Unknown",
+                radioBatteryStatus="N/A",
+                radioCurrentDraw="N/A",
+                radioLocation="Unknown",
+                radioChannels=[],
+            )
+            if self._radio_telemetry_socket is not None:
+                reset["radioTelemetryStatus"] = f"Listening on UDP {ELRS_MAVLINK_UDP_PORT}; waiting for buoy telemetry"
+            if self._state.get("telemetrySource") == "ELRS":
+                reset.update(
+                    telemetrySource="No live telemetry",
+                    batteryStatus="N/A",
+                    currentDraw="N/A",
+                    currentLocation="Unknown",
+                )
+            self._set_state(**reset)
+        self._set_state(radioWifiStatus=status, radioWifiIp=address or "", radioWifiScanning=False)
+        if "MAVLink forwarding disabled" in status:
+            self._set_state(radioTelemetryStatus="Backpack MAVLink forwarding disabled; set Backpack > Telemetry to WiFi in ELRS Lua")
+
+    def _start_radio_telemetry(self) -> None:
+        receiver = None
+        try:
+            receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            receiver.bind(("0.0.0.0", ELRS_MAVLINK_UDP_PORT))
+            receiver.setblocking(False)
+        except OSError as exc:
+            if receiver is not None:
+                receiver.close()
+            self._set_state(radioTelemetryStatus=f"UDP {ELRS_MAVLINK_UDP_PORT} unavailable: {exc}")
+            return
+        self._radio_telemetry_socket = receiver
+        self._set_state(radioTelemetryStatus=f"Listening on UDP {ELRS_MAVLINK_UDP_PORT}; waiting for buoy telemetry")
+
+    def _poll_radio_telemetry(self) -> None:
+        receiver = self._radio_telemetry_socket
+        backpack_ip = str(self._state.get("radioWifiIp", ""))
+        if receiver is None:
+            return
+        now = time.monotonic()
+        if (backpack_ip and "MAVLink forwarding active" in str(self._state.get("radioWifiStatus", ""))
+                and now - self._radio_heartbeat_last_at >= 3.0):
+            try:
+                receiver.sendto(gcs_heartbeat(), (backpack_ip, 14555))
+                self._radio_heartbeat_last_at = now
+            except OSError as exc:
+                self._set_state(radioTelemetryStatus=f"ELRS UDP send error: {exc}")
+        for _ in range(32):
+            try:
+                datagram, sender = receiver.recvfrom(4096)
+            except BlockingIOError:
+                break
+            except OSError as exc:
+                self._set_state(radioTelemetryStatus=f"ELRS UDP receive error: {exc}")
+                break
+            if not backpack_ip or sender[0] != backpack_ip:
+                continue
+            for message in decode_datagram(datagram):
+                if self._state.get("elrsPacketLogging"):
+                    packet_json = json.dumps(message, sort_keys=True, separators=(",", ":"))
+                    self._append_comm_log(f"ELRS MAVLink RX {packet_json}")
+                if message["kind"] == "radio_status":
+                    self._radio_link_last_at = time.monotonic()
+                    local_rssi = message["rssi_raw"]
+                    remote_rssi = message["remote_rssi_raw"]
+                    if int(message["system_id"]) == 1 and int(message["component_id"]) == 68:
+                        # This bench sketch relays the ExpressLRS receiver's
+                        # RADIO_STATUS: rssi is uplink LQ on a 0..255 scale,
+                        # remrssi is the positive magnitude of RSSI in dBm.
+                        self._set_state(
+                            radioLinkStatus="ELRS receiver status live",
+                            radioRssiStatus=f"-{remote_rssi} dBm (RX uplink)" if remote_rssi is not None else "Unknown",
+                            radioLinkQuality=f"{round(local_rssi * 100 / 255)}% (RX uplink)" if local_rssi is not None else "Unknown",
+                            radioSnrStatus=(f"{message['noise_raw'] if message['noise_raw'] < 128 else message['noise_raw'] - 256} dB (RX uplink)"
+                                            if message["noise_raw"] is not None else "Unknown"),
+                        )
+                    else:
+                        self._set_state(
+                            radioLinkStatus="MAVLink RADIO_STATUS received",
+                            radioRssiStatus=f"{local_rssi} (device units)" if local_rssi is not None else "Unknown",
+                            radioLinkQuality="Unavailable from this radio status",
+                            radioSnrStatus="Unknown",
+                        )
+                    continue
+                system_id = int(message["system_id"])
+                if self._radio_system_id is None:
+                    self._radio_system_id = system_id
+                if system_id != self._radio_system_id:
+                    continue
+                self._radio_telemetry_last_at = time.monotonic()
+                self._radio_telemetry_packets += 1
+                updates: dict[str, object] = {
+                    "radioTelemetryStatus": "Receiving buoy telemetry over ELRS",
+                    "radioTelemetryPackets": self._radio_telemetry_packets,
+                    "radioSystemId": str(system_id),
+                }
+                kind = message["kind"]
+                if kind == "power":
+                    self._radio_field_last_at["power"] = self._radio_telemetry_last_at
+                    voltage = message["voltage_v"]
+                    current = message["current_a"]
+                    percent = message["remaining_pct"]
+                    battery_parts = []
+                    if voltage is not None:
+                        battery_parts.append(f"{voltage:.3f} V")
+                    if current is not None:
+                        battery_parts.append(f"{current:.3f} A")
+                    if percent is not None:
+                        battery_parts.append(f"{percent}%")
+                    battery = " / ".join(battery_parts) or "N/A"
+                    draw = f"{current:.3f} A" if current is not None else "N/A"
+                    updates.update(radioBatteryStatus=battery, radioCurrentDraw=draw)
+                    if self._transport is None or not self._transport.is_open:
+                        updates.update(batteryStatus=battery, currentDraw=draw, telemetrySource="ELRS")
+                elif kind == "position":
+                    self._radio_field_last_at["position"] = self._radio_telemetry_last_at
+                    location = _format_udp_position(message["latitude"], message["longitude"])
+                    updates["radioLocation"] = location
+                    if self._transport is None or not self._transport.is_open:
+                        updates.update(currentLocation=location, telemetrySource="ELRS")
+                elif kind == "channels":
+                    self._radio_field_last_at["channels"] = self._radio_telemetry_last_at
+                    updates["radioChannels"] = message["channels"]
+                elif kind == "channels_raw":
+                    self._radio_field_last_at["channels"] = self._radio_telemetry_last_at
+                    channels = list(self._state.get("radioChannels", []))
+                    channels.extend([None] * (16 - len(channels)))
+                    offset = int(message["port"]) * 8
+                    channels[offset:offset + 8] = message["channels"]
+                    updates["radioChannels"] = channels
+                self._set_state(**updates)
+
+        now = time.monotonic()
+        if self._radio_link_last_at and now - self._radio_link_last_at > 5.0:
+            self._radio_link_last_at = 0.0
+            self._set_state(radioLinkStatus="RADIO_STATUS stale", radioRssiStatus="Unknown", radioLinkQuality="Unknown", radioSnrStatus="Unknown")
+        if self._radio_field_last_at.get("channels", 0.0) and now - self._radio_field_last_at["channels"] > 10.0:
+            self._radio_field_last_at.pop("channels")
+            self._set_state(radioChannels=[])
+        if self._radio_field_last_at.get("power", 0.0) and now - self._radio_field_last_at["power"] > 15.0:
+            self._radio_field_last_at.pop("power")
+            updates = {"radioBatteryStatus": "N/A", "radioCurrentDraw": "N/A"}
+            if self._state.get("telemetrySource") == "ELRS":
+                updates.update(batteryStatus="N/A", currentDraw="N/A")
+            self._set_state(**updates)
+        if self._radio_field_last_at.get("position", 0.0) and now - self._radio_field_last_at["position"] > 15.0:
+            self._radio_field_last_at.pop("position")
+            updates = {"radioLocation": "Unknown"}
+            if self._state.get("telemetrySource") == "ELRS":
+                updates["currentLocation"] = "Unknown"
+            self._set_state(**updates)
+        if self._radio_telemetry_last_at and time.monotonic() - self._radio_telemetry_last_at > 5.0:
+            self._radio_telemetry_last_at = 0.0
+            self._radio_field_last_at.clear()
+            updates = {
+                "radioTelemetryStatus": "ELRS telemetry stale (no packets for 5 s)",
+                "radioBatteryStatus": "N/A",
+                "radioCurrentDraw": "N/A",
+                "radioLocation": "Unknown",
+                "radioChannels": [],
+            }
+            if self._state.get("telemetrySource") == "ELRS":
+                updates.update(
+                    telemetrySource="No live telemetry",
+                    batteryStatus="N/A",
+                    currentDraw="N/A",
+                    currentLocation="Unknown",
+                )
+            self._set_state(**updates)
+
+    @Slot()
+    def disconnectRadioController(self) -> None:
+        if not self._radio_usb_connected:
+            return
+        self.stopAllMotors()
+        if self._joystick is not None:
+            self._joystick.quit()
+        self._joystick = None
+        self._radio_usb_connected = False
+        self._navigation_requires_center = True
+        self._set_state(
+            radioUsbStatus="Not connected",
+            radioUsbConnected=False,
+            radioUsbName="",
+            radioAxes=[],
+            radioAxisValues=[],
+            controllerStatus="Not connected",
+            controllerName="Connect a controller",
+            navigationReleaseRequired=True,
+        )
+
+    @Slot(str, int)
+    def setRadioAxisMapping(self, action: str, axis: int) -> None:
+        if action not in {"lateral", "thrust", "yaw"} or not self._radio_usb_connected:
+            return
+        if axis < 0 or axis >= len(self._state["radioAxes"]):
+            return
+        mapping = dict(self._state["radioAxisMapping"])
+        if axis in (value for key, value in mapping.items() if key != action):
+            return
+        self.stopAllMotors()
+        mapping[action] = axis
+        self._navigation_requires_center = True
+        self._set_state(radioAxisMapping=mapping, navigationReleaseRequired=True)
+        try:
+            self._save_radio_mapping()
+        except OSError:
+            self._set_state(radioUsbStatus="Mapping active; could not save it to disk")
+
+    @Slot(str, bool)
+    def setRadioAxisInverted(self, action: str, inverted: bool) -> None:
+        if action not in {"lateral", "thrust", "yaw"} or not self._radio_usb_connected:
+            return
+        self.stopAllMotors()
+        signs = dict(self._state["radioAxisInverted"])
+        signs[action] = bool(inverted)
+        self._navigation_requires_center = True
+        self._set_state(radioAxisInverted=signs, navigationReleaseRequired=True)
+        try:
+            self._save_radio_mapping()
+        except OSError:
+            self._set_state(radioUsbStatus="Mapping active; could not save it to disk")
+
+    def _save_radio_mapping(self) -> None:
+        self._radio_mapping_path.parent.mkdir(parents=True, exist_ok=True)
+        self._radio_mapping_path.write_text(
+            json.dumps({"axes": self._state["radioAxisMapping"], "inverted": self._state["radioAxisInverted"]}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    @Slot()
     def stopAllMotors(self) -> None:
+        if self._active_motor_test is not None:
+            stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            age_ms = int((time.monotonic() - self._last_motor_test_send_at) * 1000)
+            self._command_trace_pending.append(f"{stamp} MOTOR TEST STOP REQUEST last_keepalive_age_ms={age_ms}\n")
+        self._last_motor_test_log_command = None
+        self._active_motor_test = None
+        self._last_motor_test_actual_drive = 0
         if self._transport is None:
             self._set_state(lastSendResult="No serial link", lastSentLine="")
             return
@@ -1534,8 +2085,11 @@ class ControlStationBackend(QObject):
         if "failed" not in result.lower():
             self._append_comm_log(f"TX {command}")
 
-    @Slot()
-    def stopMotorTest(self) -> None:
+    @Slot(str)
+    def stopMotorTest(self, reason: str) -> None:
+        if self._active_motor_test is not None:
+            stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            self._command_trace_pending.append(f"{stamp} MOTOR TEST HOLD ENDED reason={reason}\n")
         self.stopAllMotors()
 
     @Slot()
@@ -1858,8 +2412,29 @@ class ControlStationBackend(QObject):
         command = _motor_percent_command(normalized_motor, power_value)
         result = send_text(self._transport, command)
         self._set_state(lastSendResult=result, lastSentLine=command)
-        if "failed" not in result.lower():
+        if "failed" in result.lower():
+            self._active_motor_test = None
+            self._last_motor_test_log_command = None
+            self._append_comm_log(f"TX failed {command}: {result}")
+            return
+        next_test = (normalized_motor, power_value)
+        if self._active_motor_test != next_test:
+            self._last_motor_test_actual_drive = 0
+        self._active_motor_test = next_test
+        self._last_motor_test_send_at = time.monotonic()
+        if command != self._last_motor_test_log_command:
             self._append_comm_log(f"TX {command}")
+            self._last_motor_test_log_command = command
+        else:
+            stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            self._command_trace_pending.append(f"{stamp} TX {command} keepalive\n")
+
+    def _send_motor_test_keepalive(self) -> None:
+        active = self._active_motor_test
+        if active is None or self._transport is None or not self._transport.is_open:
+            return
+        if time.monotonic() - self._last_motor_test_send_at >= 0.2:
+            self.sendMotorTestPower(*active)
 
     @Slot(str, str, int, int, int, int, float, float, bool)
     def sendMotorCalibration(
@@ -1975,8 +2550,6 @@ class ControlStationBackend(QObject):
         )
 
     def _append_comm_log(self, entry: str) -> None:
-        if entry.startswith("RX TEL "):
-            return
         timestamp = time.time()
         category = classify_log_entry(entry)
         display_entry = {
@@ -1996,7 +2569,10 @@ class ControlStationBackend(QObject):
         if entry.startswith("TX "):
             stamp = datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="milliseconds")
             self._command_trace_pending.append(f"{stamp} {entry}\n")
-        self.stateChanged.emit()
+        if QCoreApplication.instance() is None:
+            self.logChanged.emit()
+        elif not self._log_update_timer.isActive():
+            self._log_update_timer.start()
 
     def _flush_command_traces(self) -> None:
         if not self._command_trace_pending:
@@ -2027,7 +2603,13 @@ class ControlStationBackend(QObject):
         )
 
     def _set_transport_disconnected(self, status: str = "Disconnected") -> None:
+        if self._active_motor_test is not None:
+            stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            self._command_trace_pending.append(f"{stamp} MOTOR TEST LINK LOST status={status}\n")
         self._transport = None
+        self._active_motor_test = None
+        self._last_motor_test_log_command = None
+        self._last_motor_test_actual_drive = 0
         self._connected_device_name = None
         self._gps_speed.invalidate()
         self._navigation.set_enabled(False, time.monotonic())
@@ -2036,10 +2618,14 @@ class ControlStationBackend(QObject):
         self._keyboard_turn = 0.0
         self._keyboard_thrust = 0.0
         self._keyboard_yaw = 0.0
+        radio_fresh = bool(self._radio_telemetry_last_at and time.monotonic() - self._radio_telemetry_last_at <= 5.0)
         self._set_state(
             serialStatus=status,
             serialTarget="No port selected",
-            currentDraw="N/A",
+            batteryStatus=self._state["radioBatteryStatus"] if radio_fresh else "N/A",
+            currentDraw=self._state["radioCurrentDraw"] if radio_fresh else "N/A",
+            currentLocation=self._state["radioLocation"] if radio_fresh else "Unknown",
+            telemetrySource="ELRS" if radio_fresh else "No live telemetry",
             navigationAssistEnabled=False,
             navigationAssistActive=False,
             navigationStatus="Assist off: buoy disconnected",
@@ -2075,12 +2661,18 @@ class ControlStationBackend(QObject):
         else:
             self._audio_output_status = "pygame is unavailable; audio cannot play"
         self.stateChanged.emit()
-        self._joystick = get_controller()
+        self._joystick = _get_default_controller()
+        self._start_radio_telemetry()
         self._queue_transport_connection(initial=True)
         self._timer.start()
+        self.findRadioBackpack()
+        self.scanBuoyNetwork()
 
     def shutdown(self) -> None:
         self._timer.stop()
+        if self._radio_telemetry_socket is not None:
+            self._radio_telemetry_socket.close()
+            self._radio_telemetry_socket = None
         self._flush_command_traces()
         self._stop_audio_playback_thread()
         self._close_test_session("application_exit")
@@ -2119,6 +2711,7 @@ class ControlStationBackend(QObject):
             return
 
         self._connection_in_flight = True
+        self._last_reconnect_attempt = time.time()
         self._connection_request_id += 1
         request_id = self._connection_request_id
         target = self._build_transport_target()
@@ -2166,6 +2759,8 @@ class ControlStationBackend(QObject):
             return
 
         if transport is None:
+            self._last_reconnect_attempt = time.time()
+            self._reconnect_interval = min(10.0, max(2.0, self._reconnect_interval * 1.7))
             self._set_state(serialStatus="Reconnecting", serialTarget=target)
             if not initial:
                 self._append_comm_log(f"RECONNECT failed target={target}: {status}")
@@ -2174,8 +2769,10 @@ class ControlStationBackend(QObject):
             return
 
         self._transport = transport
+        self._reconnect_interval = 2.0
         self._last_protocol_response_time = time.time()
         self._last_protocol_send_time = 0.0
+        self._last_ping_time = time.time()
         self._awaiting_protocol_response = False
         self._ping_sent = False
 
@@ -2197,6 +2794,7 @@ class ControlStationBackend(QObject):
             serial_status = f"Connected ({self._connected_device_name})"
         self._set_state(serialStatus=serial_status, serialTarget=target)
         if self._args.transport == "wifi":
+            self.scanBuoyNetwork()
             stop_result = send_text(self._transport, "CTRL STOP")
             self._set_state(lastSendResult=stop_result, lastSentLine="CTRL STOP")
             self._append_comm_log(f"TX CTRL STOP target={target}")
@@ -2212,9 +2810,22 @@ class ControlStationBackend(QObject):
             return
         input_mode = str(self._state.get("controlInputMode", "controller"))
         if input_mode == "controller":
-            joystick_turn, joystick_thrust, joystick_yaw = read_motion_axes(
-                self._joystick, self._args.deadzone
-            )
+            if self._radio_usb_connected and self._joystick is not None and pygame is not None:
+                pygame.event.pump()
+                mapping = self._state["radioAxisMapping"]
+                values = [self._joystick.get_axis(index) for index in range(self._joystick.get_numaxes())]
+                deadzone = self._args.deadzone
+                def mapped_axis(action: str) -> float:
+                    value = values[mapping[action]]
+                    value = -value if self._state["radioAxisInverted"][action] else value
+                    return value if abs(value) >= deadzone else 0.0
+                joystick_turn = mapped_axis("lateral")
+                joystick_thrust = mapped_axis("thrust")
+                joystick_yaw = mapped_axis("yaw")
+            else:
+                joystick_turn, joystick_thrust, joystick_yaw = read_motion_axes(
+                    self._joystick, self._args.deadzone
+                )
         else:
             joystick_turn, joystick_thrust, joystick_yaw = 0.0, 0.0, 0.0
         turn, thrust, yaw = _select_manual_input(
@@ -2441,6 +3052,20 @@ class ControlStationBackend(QObject):
             if output is not None:
                 self._last_motor_output_at = time.time()
                 rear_drive, rear_pwm, left_drive, left_pwm, right_drive, right_pwm = output
+                if self._active_motor_test is not None:
+                    selected_motor = self._active_motor_test[0]
+                    selected_drive = {
+                        "rear": rear_drive,
+                        "front_left": left_drive,
+                        "front_right": right_drive,
+                    }.get(selected_motor, 0)
+                    if self._last_motor_test_actual_drive != 0 and selected_drive == 0:
+                        age_ms = int((time.monotonic() - self._last_motor_test_send_at) * 1000)
+                        stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                        self._command_trace_pending.append(
+                            f"{stamp} MOTOR OUTPUT DROPPED {selected_motor} last_keepalive_age_ms={age_ms}\n"
+                        )
+                    self._last_motor_test_actual_drive = selected_drive
                 self._set_state(
                     rearMotorActualDrive=rear_drive,
                     frontLeftMotorActualDrive=left_drive,
@@ -2451,6 +3076,10 @@ class ControlStationBackend(QObject):
                     motorOutputTelemetry=True,
                 )
                 self._last_protocol_response_time = time.time()
+                now = time.monotonic()
+                if now - self._last_motor_output_log_at >= 1.0:
+                    self._append_comm_log(f"RX {response_text}")
+                    self._last_motor_output_log_at = now
             return
         self._append_comm_log(f"RX {response_text}")
 
@@ -2505,7 +3134,7 @@ class ControlStationBackend(QObject):
                     audioOutputStatus=self._audio_output_status,
                 )
             elif status_key == "POS":
-                self._set_state(currentLocation=_format_location(status_values))
+                self._set_state(currentLocation=_format_location(status_values), telemetrySource="Buoy Wi-Fi")
                 if len(status_values) >= 2 and "UNKNOWN" not in {value.upper() for value in status_values[:2]}:
                     try:
                         self._update_gps_fix(float(status_values[0]), float(status_values[1]))
@@ -2519,9 +3148,9 @@ class ControlStationBackend(QObject):
             elif status_key == "HOLD" and status_values:
                 self._set_state(holdPosition=(status_values[0] == "ON"))
             elif status_key == "BATTERY":
-                self._set_state(batteryStatus=_parse_battery_status(" ".join(status_values)))
+                self._set_state(batteryStatus=_parse_battery_status(" ".join(status_values)), telemetrySource="Buoy Wi-Fi")
             elif status_key == "CURRENT":
-                self._set_state(currentDraw=_parse_battery_status(" ".join(status_values)))
+                self._set_state(currentDraw=_parse_battery_status(" ".join(status_values)), telemetrySource="Buoy Wi-Fi")
 
         science_update = parse_science_update(response_text)
         if science_update is not None:
@@ -2834,6 +3463,7 @@ class ControlStationBackend(QObject):
                 self._set_state(
                     batteryStatus=_format_udp_battery_status(battery_volts, current_amps, battery_pct),
                     currentDraw=f"{current_amps:.3f} A",
+                    telemetrySource="Buoy Wi-Fi",
                 )
             elif packet.packet_type == "STATE":
                 mode_value, hold_enabled, gps_valid, _motors_enabled = packet.values
@@ -2848,7 +3478,7 @@ class ControlStationBackend(QObject):
                 )
             elif packet.packet_type == "GPS":
                 latitude, longitude = packet.values
-                self._set_state(currentLocation=_format_udp_position(latitude, longitude))
+                self._set_state(currentLocation=_format_udp_position(latitude, longitude), telemetrySource="Buoy Wi-Fi")
                 self._update_gps_fix(latitude, longitude)
             elif packet.packet_type == "RANGE":
                 distance_mm, valid = packet.values
@@ -2900,6 +3530,7 @@ class ControlStationBackend(QObject):
                     self._audio_waveform = list(self._waveform_buffer)
                     self._audio_left_waveform = list(self._audio_left_buffer)
                     self._audio_right_waveform = list(self._audio_right_buffer)
+                    self.audioWaveformChanged.emit()
                     self._audio_left_level = f"{left_peak:.1f}% peak"
                     self._audio_right_level = f"{right_peak:.1f}% peak" if right_peak is not None else "Unavailable"
                     self._set_state(
@@ -2968,31 +3599,96 @@ class ControlStationBackend(QObject):
         self._last_science_sample_time = time.time()
         self.stateChanged.emit()
 
+    def _refresh_wifi_traffic(self) -> None:
+        transport = self._transport
+        target = str(self._state.get("serialTarget", ""))
+        if not target.startswith("WIFI:") or transport is None or not transport.is_open:
+            status = "Buoy control link connecting" if str(self._state.get("serialStatus", "")).startswith(("Connecting", "Reconnecting")) else "No active buoy control link"
+            self._set_state(wifiTrafficStatus=status)
+            self._wifi_traffic_transport = None
+            self._wifi_traffic_sample = None
+            return
+
+        tcp_bytes = int(getattr(transport, "rx_tcp_bytes", 0))
+        udp_bytes = int(getattr(transport, "rx_udp_bytes", 0))
+        udp_messages = int(getattr(transport, "rx_udp_datagrams", 0))
+        total_bytes = tcp_bytes + udp_bytes
+        total_messages = self._wifi_tcp_messages_total + udp_messages
+        now = time.monotonic()
+        if transport is not self._wifi_traffic_transport:
+            self._wifi_traffic_transport = transport
+            self._wifi_traffic_sample = (total_bytes, total_messages, now)
+            self._set_state(
+                wifiReceivedMessages=total_messages,
+                wifiReceivedBytes=total_bytes,
+                wifiMessageRate=0.0,
+                wifiThroughputKib=0.0,
+                wifiTrafficStatus="Connected; measuring received traffic",
+            )
+            return
+
+        sample = self._wifi_traffic_sample
+        if sample is None:
+            self._wifi_traffic_sample = (total_bytes, total_messages, now)
+            return
+        elapsed = now - sample[2]
+        if elapsed < 1.0:
+            return
+        bytes_per_second = max(0, total_bytes - sample[0]) / elapsed
+        messages_per_second = max(0, total_messages - sample[1]) / elapsed
+        self._wifi_traffic_sample = (total_bytes, total_messages, now)
+        self._set_state(
+            wifiReceivedMessages=total_messages,
+            wifiReceivedBytes=total_bytes,
+            wifiMessageRate=round(messages_per_second, 1),
+            wifiThroughputKib=round(bytes_per_second / 1024.0, 1),
+            wifiTrafficStatus="Receiving buoy Wi-Fi data" if total_bytes > sample[0] else "Connected; no received data in the last second",
+        )
+
     def _tick(self) -> None:
+        tick_at = time.monotonic()
+        if self._last_tick_at and tick_at - self._last_tick_at > 0.25:
+            stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            gap_ms = int((tick_at - self._last_tick_at) * 1000)
+            self._command_trace_pending.append(f"{stamp} CONTROL LOOP GAP {gap_ms} ms\n")
+        self._last_tick_at = tick_at
         if time.monotonic() - self._last_command_trace_flush >= 1.0:
             self._flush_command_traces()
         self._refresh_speed_source()
+        if self._radio_usb_connected and self._joystick is not None:
+            try:
+                pygame.event.pump()
+                self._set_state(radioAxisValues=[
+                    round(self._joystick.get_axis(index), 3)
+                    for index in range(self._joystick.get_numaxes())
+                ])
+            except pygame.error:
+                self.disconnectRadioController()
         if self._joystick is None:
-            self._joystick = get_controller()
+            self._joystick = _get_default_controller()
             if self._joystick is not None:
                 self._set_state(controllerStatus="Connected", controllerName=self._joystick.get_name())
         else:
             self._set_state(controllerStatus="Connected", controllerName=self._joystick.get_name())
 
         if (
-            self._transport is None
+            self._auto_reconnect_enabled
+            and self._transport is None
             and self._pending_connection is None
             and not self._connection_in_flight
             and (time.time() - self._last_reconnect_attempt) >= self._reconnect_interval
         ):
-            self._last_reconnect_attempt = time.time()
             self._queue_transport_connection()
 
         self._drain_pending_connection()
+        self._drain_radio_wifi_discovery()
+        self._drain_network_scan()
+        self._poll_radio_telemetry()
         self._drain_sd_card_operation()
 
         if self._transport is not None:
             if self._transport.is_open:
+                self._send_motor_test_keepalive()
                 self._send_current_command()
                 incoming_bytes = read_available_bytes(self._transport)
                 if incoming_bytes:
@@ -3005,6 +3701,8 @@ class ControlStationBackend(QObject):
                         del self._rx_buffer[:newline_index + 1]
                         if not line_bytes:
                             continue
+                        if str(self._state.get("serialTarget", "")).startswith("WIFI:"):
+                            self._wifi_tcp_messages_total += 1
                         response_text = line_bytes.decode("ascii", errors="replace")
                         self._process_text_line(response_text)
                 self._process_binary_telemetry()
@@ -3028,19 +3726,7 @@ class ControlStationBackend(QObject):
                 self._ping_sent = False
                 self._transport = None
 
-        if self._ping_sent and (time.time() - self._last_ping_time) > 3.0:
-            self._append_comm_log("PING timeout")
-            try:
-                if self._transport is not None:
-                    self._transport.close()
-            except Exception:
-                pass
-            self._set_transport_disconnected("Reconnecting")
-            self._ping_sent = False
-            self._awaiting_protocol_response = False
-            self._transport = None
-
-        self.stateChanged.emit()
+        self._refresh_wifi_traffic()
 
     @Slot()
     def startHelloPing(self) -> None:

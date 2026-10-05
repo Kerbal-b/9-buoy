@@ -35,3 +35,5 @@ If controls work but telemetry does not, confirm receiver `RX` is connected to E
 ## Important Scope
 
 This is an isolated test firmware. It does not alter the production buoy firmware and does not control motors. Live battery, GPS, and motion values should only replace the test constants after this bidirectional CRSF link is verified.
+
+This sketch uses CRSF at 420000 baud and emits CRSF battery/GPS/flight-mode frames. It does **not** emit MAVLink HEARTBEAT or RADIO_STATUS. The TX Backpack MAVLink UDP bridge therefore cannot forward these bench values as MAVLink. For a MAVLink-over-ELRS bench test, configure the receiver UART protocol as MAVLink, use 460800 baud, and run a separate ESP32 sketch that emits a MAVLink HEARTBEAT. Keep this CRSF sketch for testing the normal CRSF radio path.

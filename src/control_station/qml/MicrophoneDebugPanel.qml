@@ -259,7 +259,7 @@ Item {
                         width: parent.width
                         height: 28
                         spacing: 8
-                        CheckBox {
+                        StyledCheckBox {
                             text: "High pass"
                             checked: backendObject ? backendObject.audioHighPassEnabled : true
                             onToggled: if (backendObject) backendObject.setAudioHighPassEnabled(checked)
@@ -273,7 +273,7 @@ Item {
                             onMoved: if (backendObject) backendObject.setAudioHighPassHz(value)
                         }
                         Text { text: Math.round(backendObject ? backendObject.audioHighPassHz : 80) + " Hz"; color: "#e6ecf2"; anchors.verticalCenter: parent.verticalCenter }
-                        CheckBox {
+                        StyledCheckBox {
                             text: "Low pass"
                             checked: backendObject ? backendObject.audioLowPassEnabled : true
                             onToggled: if (backendObject) backendObject.setAudioLowPassEnabled(checked)
@@ -291,7 +291,7 @@ Item {
                         width: parent.width
                         height: 28
                         spacing: 8
-                        CheckBox {
+                        StyledCheckBox {
                             text: "Noise gate"
                             checked: backendObject ? backendObject.audioNoiseGateEnabled : false
                             onToggled: if (backendObject) backendObject.setAudioNoiseGateEnabled(checked)

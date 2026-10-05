@@ -7,13 +7,24 @@ Item {
     id: root
 
     property var backendObject
+    property var backendState: ({})
+    property bool active: true
     property string categoryFilter: "all"
     property string searchFilter: ""
 
-    readonly property var allEntries: backendObject ? backendObject.categorizedLog : []
-    readonly property int systemCount: backendObject ? backendObject.systemLog.length : 0
-    readonly property int navigationCount: backendObject ? backendObject.navigationLog.length : 0
-    readonly property int scientificCount: backendObject ? backendObject.scientificLog.length : 0
+    readonly property var allEntries: backendObject && active ? backendObject.categorizedLog : []
+    readonly property int systemCount: backendObject && active ? root.visibleLogCount(backendObject.systemLog) : 0
+    readonly property int navigationCount: backendObject && active ? backendObject.navigationLog.length : 0
+    readonly property int scientificCount: backendObject && active ? backendObject.scientificLog.length : 0
+
+    function visibleLogCount(entries) {
+        if (Boolean(root.backendState.elrsPacketLogging)) return entries.length
+        let count = 0
+        for (let i = 0; i < entries.length; ++i) {
+            if (!String(entries[i].message || "").startsWith("ELRS MAVLink RX ")) count++
+        }
+        return count
+    }
 
     function categoryTitle(category) {
         if (category === "navigation") return "NAVIGATION"
@@ -40,6 +51,7 @@ Item {
         const filtered = []
         for (let i = 0; i < source.length; ++i) {
             const entry = source[i]
+            if (!Boolean(root.backendState.elrsPacketLogging) && String(entry.message || "").startsWith("ELRS MAVLink RX ")) continue
             if (root.categoryFilter !== "all" && entry.category !== root.categoryFilter) continue
             if (query.length > 0) {
                 const searchable = String(entry.timestamp || "") + " " + String(entry.message || "") + " " + String(entry.interpretation || "")
@@ -103,7 +115,7 @@ Item {
 
                 Repeater {
                     model: [
-                        { key: "all", label: "ALL EVENTS", count: root.allEntries.length, color: "#d8e2eb" },
+                        { key: "all", label: "ALL EVENTS", count: root.visibleLogCount(root.allEntries), color: "#d8e2eb" },
                         { key: "system", label: "SYSTEM & MOTORS", count: root.systemCount, color: "#ffad5c" },
                         { key: "navigation", label: "NAVIGATION", count: root.navigationCount, color: "#50aaff" },
                         { key: "scientific", label: "SCIENTIFIC", count: root.scientificCount, color: "#56d6a9" }
@@ -165,6 +177,12 @@ Item {
                     text: root.categoryFilter === "all" ? "Showing all categories" : "Showing " + root.categoryFilter
                     color: root.categoryColor(root.categoryFilter)
                     font.pixelSize: 11
+                }
+
+                StyledCheckBox {
+                    text: "Log ELRS packets"
+                    checked: Boolean(root.backendState.elrsPacketLogging)
+                    onToggled: if (root.backendObject) root.backendObject.setElrsPacketLogging(checked)
                 }
 
                 Item { Layout.fillWidth: true }

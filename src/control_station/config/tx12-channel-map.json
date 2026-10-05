@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "radio": "RadioMaster TX12 MKII",
+  "description": "Control-station visualization and planned buoy-control meanings. Verify channel outputs in the active EdgeTX model. This file does not transmit commands or configure buoy firmware.",
+  "starter_profile": "Mode 2 / AETR",
+  "controls": [
+    {"id": "left_stick_horizontal", "label": "Left stick horizontal", "kind": "rf_axis", "channel": 4, "purpose": "Buoy yaw", "image_x": 0.25, "image_y": 0.46},
+    {"id": "left_stick_vertical", "label": "Left stick vertical", "kind": "rf_axis", "channel": 3, "purpose": "Motor power limit (0-100%)", "image_x": 0.31, "image_y": 0.40},
+    {"id": "right_stick_horizontal", "label": "Right stick horizontal", "kind": "rf_axis", "channel": 1, "purpose": "Sideways movement", "image_x": 0.68, "image_y": 0.46},
+    {"id": "right_stick_vertical", "label": "Right stick vertical", "kind": "rf_axis", "channel": 2, "purpose": "Forward / reverse movement", "image_x": 0.74, "image_y": 0.40},
+    {"id": "se", "label": "SE, left outer 3-position switch", "kind": "rf_switch", "channel": 5, "positions": [{"label": "Low", "meaning": null}, {"label": "Middle", "meaning": null}, {"label": "High", "meaning": null}], "image_x": 0.15, "image_y": 0.31},
+    {"id": "sb", "label": "SB, left inner 3-position switch", "kind": "rf_switch", "channel": 7, "positions": [{"label": "Low", "meaning": null}, {"label": "Middle", "meaning": null}, {"label": "High", "meaning": null}], "image_x": 0.22, "image_y": 0.27},
+    {"id": "sa", "label": "SA, left momentary button", "kind": "rf_switch", "channel": 9, "positions": [{"label": "Low", "meaning": null}, {"label": "High", "meaning": null}], "image_x": 0.29, "image_y": 0.31},
+    {"id": "sd", "label": "SD, right momentary button", "kind": "rf_switch", "channel": 10, "positions": [{"label": "Low", "meaning": null}, {"label": "High", "meaning": null}], "image_x": 0.71, "image_y": 0.31},
+    {"id": "sc", "label": "SC, right inner 3-position switch", "kind": "rf_switch", "channel": 8, "positions": [{"label": "Low", "meaning": null}, {"label": "Middle", "meaning": null}, {"label": "High", "meaning": null}], "image_x": 0.78, "image_y": 0.27},
+    {"id": "sf", "label": "SF, right outer 3-position switch", "kind": "rf_switch", "channel": 6, "positions": [{"label": "Low", "meaning": null}, {"label": "Middle", "meaning": null}, {"label": "High", "meaning": null}], "image_x": 0.85, "image_y": 0.31},
+    {"id": "s1", "label": "S1, left slider", "kind": "rf_axis", "channel": null, "purpose": "Unassigned", "image_x": 0.20, "image_y": 0.62},
+    {"id": "s2", "label": "S2, right slider", "kind": "rf_axis", "channel": null, "purpose": "Unassigned", "image_x": 0.80, "image_y": 0.62}
+  ]
+}

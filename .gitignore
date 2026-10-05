@@ -5,6 +5,8 @@ __pycache__/
 
 src/control_station/.venv/
 src/control_station/logs/
+src/control_station/tmp/
+/.codex_parent_trace.jsonl
 
 # Only src/ is tracked among top-level folders.
 /*/

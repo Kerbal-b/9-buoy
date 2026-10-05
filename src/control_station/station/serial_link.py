@@ -253,6 +253,9 @@ class WiFiTransport:
         self.udp_port = udp_port
         self.audio_port = audio_port
         self.local_ip = local_ip
+        self.rx_tcp_bytes = 0
+        self.rx_udp_bytes = 0
+        self.rx_udp_datagrams = 0
         self._tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._tcp.settimeout(connect_timeout)
         if local_ip and local_ip.lower() != "auto":
@@ -299,6 +302,7 @@ class WiFiTransport:
             if not payload:
                 self._is_open = False
                 break
+            self.rx_tcp_bytes += len(payload)
             chunks.extend(payload)
 
         return bytes(chunks)
@@ -321,6 +325,9 @@ class WiFiTransport:
             if address[0] != self.host:
                 continue
 
+            self.rx_udp_bytes += len(payload)
+            self.rx_udp_datagrams += 1
+
             packet = _decode_telemetry_packet(payload)
             if packet is not None:
                 packets.append(packet)
@@ -340,6 +347,9 @@ class WiFiTransport:
 
             if address[0] != self.host:
                 continue
+
+            self.rx_udp_bytes += len(payload)
+            self.rx_udp_datagrams += 1
 
             packet = _decode_audio_packet(payload)
             if packet is not None:

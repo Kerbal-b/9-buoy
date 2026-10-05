@@ -7,6 +7,15 @@ Item {
 
     property var backendObject
     property var backendState: ({})
+    readonly property string vectorCanvasKey: [
+        backendState.navigationRequestedTurn,
+        backendState.navigationRequestedThrust,
+        backendState.navigationCorrectedTurn,
+        backendState.navigationCorrectedThrust,
+        backendState.navigationMeasuredXG,
+        backendState.navigationMeasuredYG,
+        backendState.navigationRequestedYaw
+    ].join("|")
 
     function clamp(value, minimum, maximum) {
         return Math.max(minimum, Math.min(maximum, value))
@@ -21,7 +30,8 @@ Item {
         return (number >= 0 ? "+" : "") + number.toFixed(digits)
     }
 
-    onBackendStateChanged: vectorCanvas.requestPaint()
+    onVectorCanvasKeyChanged: if (visible) vectorCanvas.requestPaint()
+    onVisibleChanged: if (visible) vectorCanvas.requestPaint()
 
     ScrollView {
         id: navigationScroll
@@ -38,7 +48,7 @@ Item {
                 width: parent.width
                 height: 36
                 Text {
-                    text: "Navigation Test"
+                    text: "Navigation"
                     color: "#e6ecf2"
                     font.pixelSize: 22
                     font.bold: true
@@ -330,6 +340,7 @@ Item {
                     anchors.fill: parent
                     anchors.margins: 12
 
+                    Component.onCompleted: requestPaint()
                     onWidthChanged: requestPaint()
                     onHeightChanged: requestPaint()
 
@@ -509,19 +520,19 @@ Item {
                                 }
                             }
                         }
-                        CheckBox {
+                        StyledCheckBox {
                             id: invertX
                             text: "Invert IMU X"
                             checked: Boolean(backendState.navigationInvertX)
                             onToggled: if (backendObject) backendObject.setNavigationAxisSigns(checked, invertY.checked, swapXY.checked)
                         }
-                        CheckBox {
+                        StyledCheckBox {
                             id: invertY
                             text: "Invert IMU Y"
                             checked: Boolean(backendState.navigationInvertY)
                             onToggled: if (backendObject) backendObject.setNavigationAxisSigns(invertX.checked, checked, swapXY.checked)
                         }
-                        CheckBox {
+                        StyledCheckBox {
                             id: swapXY
                             text: "Swap IMU X/Y"
                             checked: Boolean(backendState.navigationSwapXY)
