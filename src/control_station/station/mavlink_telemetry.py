@@ -112,6 +112,11 @@ def decode_datagram(data: bytes) -> list[dict[str, Any]]:
                 if decoded is not None:
                     decoded["system_id"] = frame[5] if v2 else frame[3]
                     decoded["component_id"] = frame[6] if v2 else frame[4]
+                    if decoded["kind"] == "radio_status" and decoded["system_id"] == 1 and decoded["component_id"] == 68:
+                        # The buoy relay uses 255 for full ELRS LQ and for
+                        # signed SNR -1, while generic MAVLink uses 255 as unknown.
+                        decoded["rssi_raw"] = frame[header_length + 4]
+                        decoded["noise_raw"] = frame[header_length + 7]
                     messages.append(decoded)
         offset += frame_length
     return messages

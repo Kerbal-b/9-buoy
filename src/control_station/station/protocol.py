@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 
 def format_vector_command(turn: int, thrust: int) -> str:
     return f"CTRL VECTOR {turn:+d} {thrust:+d}\n"
@@ -40,6 +42,20 @@ def parse_status_update(text: str) -> tuple[str, tuple[str, ...]] | None:
         return None
 
     return parts[0], tuple(parts[1:])
+
+
+def format_firmware_version(values: tuple[str, ...]) -> str:
+    """Format numeric firmware fields, preserving older banner responses."""
+    if len(values) == 4 and all(value.isdecimal() for value in values):
+        major, minor, patch, build_date = values
+        if len(build_date) == 8:
+            try:
+                built = date(int(build_date[:4]), int(build_date[4:6]), int(build_date[6:]))
+            except ValueError:
+                pass
+            else:
+                return f"v{int(major)}.{int(minor)}.{int(patch)} ({built.isoformat()})"
+    return " ".join(values)
 
 
 def parse_science_update(text: str) -> tuple[str, tuple[str, ...]] | None:

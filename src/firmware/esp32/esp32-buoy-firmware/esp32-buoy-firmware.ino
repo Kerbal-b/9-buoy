@@ -10,6 +10,8 @@
 #include <math.h>
 #include <driver/i2s.h>
 #include <esp_timer.h>
+#include "elrs_link.h"
+#include "firmware_version.h"
 #if __has_include(<esp_arduino_version.h>)
 #include <esp_arduino_version.h>
 #endif
@@ -73,12 +75,11 @@ const uint32_t AUDIO_PRIORITY_SENSOR_INTERVAL_MS = 30000;
 // UART roles
 // UART0: USB programming/debug (Serial)
 // UART1: GPS
-// UART2: reserved for future expansion
+// UART2: SkyGuy Nano ELRS receiver, TX -> GPIO34 and RX <- GPIO25
 const int GPS_RX_PIN = 16;
 const int GPS_TX_PIN = -1;  // Receive-only; GPIO17 is the SD clock.
 
 const long GPS_BAUDRATE = 9600;
-const char* const FIRMWARE_BANNER = "ESP32_FW_2026_10_04_SDDELETE2";
 const char* const WIFI_STA_SSID = "Bouy";
 const char* const WIFI_STA_PASSWORD = "SuperMonkey";
 const uint16_t WIFI_TCP_PORT = 5000;
@@ -105,6 +106,10 @@ const uint32_t MOTOR_RAMP_INTERVAL_MS = 20;
 const int MOTOR_RAMP_UP_PER_SECOND = 120;
 const int MOTOR_RAMP_DOWN_PER_SECOND = 200;
 const uint32_t MOTOR_COMMAND_WATCHDOG_MS = 1000;
+const int ELRS_MOTOR_POWER_LIMIT_PERCENT = 50;
+const uint32_t ELRS_TELEMETRY_INTERVAL_MS = 1000;
+const uint32_t ELRS_BATTERY_INTERVAL_MS = 5000;
+const uint32_t ELRS_GPS_INTERVAL_MS = 5000;
 
 const int PWM_FREQ_HZ = 20000;
 const int PWM_RES_BITS = 8;
@@ -119,6 +124,7 @@ const uint32_t LED_FLASH_COMMAND_MS = 120;
 const uint32_t IMU_STREAM_INTERVAL_MS = 50;   // 20 Hz
 const uint32_t RANGE_STREAM_INTERVAL_MS = 250;
 const uint32_t WATER_TEMP_STREAM_INTERVAL_MS = 2000;
+const uint32_t WATER_CHEMISTRY_STREAM_INTERVAL_MS = 2000;
 const uint32_t POWER_STREAM_INTERVAL_MS = 500;
 const uint32_t STATE_STREAM_INTERVAL_MS = 500;
 const uint32_t MOTOR_OUTPUT_STREAM_INTERVAL_MS = 100;
@@ -296,6 +302,17 @@ const float external_tangential_yaw_gains[3] = {1.0f, -1.0f, 1.0f};
 
 HardwareSerial gpsSerial(1);   // UART1
 TinyGPSPlus gps;
+HardwareSerial elrsSerial(2);  // UART2
+ElrsLink elrs(elrsSerial);
+
+enum ControlSource { CONTROL_SOURCE_NONE, CONTROL_SOURCE_WIFI, CONTROL_SOURCE_ELRS };
+ControlSource controlSource = CONTROL_SOURCE_NONE;
+bool elrsArmReady = false;
+bool elrsArmed = false;
+uint32_t lastElrsAppliedRcMs = 0;
+uint32_t lastElrsTelemetryMs = 0;
+uint32_t lastElrsBatteryMs = 0;
+uint32_t lastElrsGpsMs = 0;
 
 double gpsLatitude = 0.0;
 double gpsLongitude = 0.0;
@@ -336,6 +353,7 @@ uint32_t commandFlashUntilMs = 0;
 uint32_t lastImuStreamMs = 0;
 uint32_t lastRangeStreamMs = 0;
 uint32_t lastWaterTempStreamMs = 0;
+uint32_t lastWaterChemistryStreamMs = 0;
 uint32_t lastPowerStreamMs = 0;
 uint32_t lastStateStreamMs = 0;
 uint32_t lastMotorOutputStreamMs = 0;
@@ -404,6 +422,7 @@ bool setupMpu6050();
 bool setupDs18b20();
 void updateDs18b20Sensor(uint32_t nowMs);
 void emitWaterTemperatureTelemetry();
+void emitWaterChemistryTelemetry();
 void emitSensorDiagnostics();
 bool setupAds1115();
 void setupJsnSr04t();
@@ -577,7 +596,11 @@ bool startSdRecorder(const String& startUtc) {
   sdTelemetryFile.println(F("timestamp_us,gps_valid,gps_date_ddmmyy,gps_time_hhmmsscc,latitude,longitude,control_mode,hold,motors_enabled,rear_drive,left_drive,right_drive,battery_v,current_a,audio_frames_dropped,sd_available,sd_mount_failures,sd_write_failures,sd_card_mib,sd_total_mib,sd_used_mib,sd_free_mib,sd_audio_bytes,sd_audio_buffer_bytes,sd_audio_queue_depth"));
   File manifest = SD.open((sdSessionDirectory + "/manifest.txt").c_str(), FILE_WRITE);
   if (manifest) {
-    manifest.println(FIRMWARE_BANNER);
+    manifest.println("firmware_version=" + firmwareVersionString());
+    manifest.println("firmware_major=" + String(kFirmwareVersionMajor));
+    manifest.println("firmware_minor=" + String(kFirmwareVersionMinor));
+    manifest.println("firmware_patch=" + String(kFirmwareVersionPatch));
+    manifest.println("firmware_build_date=" + String(kFirmwareBuildDate));
     manifest.println("start_utc=" + startUtc);
     manifest.println(F("status=recording"));
     manifest.println(F("timestamp_us is the 64-bit monotonic ESP timer; correlate it with GPS fields in telemetry.csv."));
@@ -759,7 +782,11 @@ void sendMotorOutputTelemetry() {
 }
 
 void sendStatusSnapshot() {
-  emitLine(String("TEL STATUS FIRMWARE ") + FIRMWARE_BANNER);
+  emitLine(firmwareVersionStatusLine());
+  emitLine(String("TEL STATUS ELRS BYTES ") + String(elrs.receivedBytes()) +
+    " RADIO " + String(elrs.validRadioStatus()) +
+    " RC " + String(elrs.validRcFrames()) +
+    " CRCERR " + String(elrs.crcErrors()));
   const char* audioChannelName = audioChannelSelection == 1 ? "LEFT" : (audioChannelSelection == 2 ? "RIGHT" : "BOTH");
   emitLine(
     String("TEL STATUS AUDIO ") + audioChannelName +
@@ -815,6 +842,7 @@ void sendStatusSnapshot() {
   emitLine("TEL STATUS CURRENT " + String(currentAmps, 2));
 
   emitWaterTemperatureTelemetry();
+  emitWaterChemistryTelemetry();
   emitLine("TEL SCI AIR_TEMP UNKNOWN");
 
   uint16_t depthMm = 0;
@@ -1316,6 +1344,9 @@ void stopMotorsForSafety(const __FlashStringHelper* reason) {
   bool wasActive = motorCommandActive();
   stopAllMotors();
   controlMode = CONTROL_MODE_IDLE;
+  controlSource = CONTROL_SOURCE_NONE;
+  elrsArmed = false;
+  elrsArmReady = false;
   holdPositionEnabled = false;
   if (wasActive) {
     recordLogLine("SAFETY MOTOR STOP: " + String(reason));
@@ -1323,6 +1354,12 @@ void stopMotorsForSafety(const __FlashStringHelper* reason) {
 }
 
 void updateMotorCommandWatchdog() {
+  if (controlSource == CONTROL_SOURCE_ELRS) {
+    if (!elrsArmed || !elrs.rcFresh(millis()) || !elrs.linkFresh(millis()) || elrs.linkQuality() == 0) {
+      stopMotorsForSafety(F("ELRS LINK LOST"));
+    }
+    return;
+  }
   if (!motorCommandActive()) {
     return;
   }
@@ -1340,7 +1377,7 @@ void updateMotorCommandWatchdog() {
 
 void processTcpControl() {
   if (WiFi.status() != WL_CONNECTED) {
-    if (hadControlClient || motorCommandActive()) {
+    if (controlSource == CONTROL_SOURCE_WIFI && (hadControlClient || motorCommandActive())) {
       stopMotorsForSafety(F("WI-FI LOST"));
     }
     hadControlClient = false;
@@ -1355,7 +1392,7 @@ void processTcpControl() {
     serviceMode = false;
     audioStreamEnabled = false;
     imuStreamEnabled = false;
-    stopMotorsForSafety(F("TCP CLIENT DISCONNECTED"));
+    if (controlSource == CONTROL_SOURCE_WIFI) stopMotorsForSafety(F("TCP CLIENT DISCONNECTED"));
     tcpClient.stop();
     tcpCommandBuffer = "";
     hadControlClient = false;
@@ -1367,7 +1404,7 @@ void processTcpControl() {
     audioStreamEnabled = false;
     imuStreamEnabled = false;
     if (tcpClient && tcpClient.connected()) {
-      stopMotorsForSafety(F("CONTROL CLIENT REPLACED"));
+      if (controlSource == CONTROL_SOURCE_WIFI) stopMotorsForSafety(F("CONTROL CLIENT REPLACED"));
       tcpClient.stop();
     }
     tcpClient = newClient;
@@ -1590,6 +1627,63 @@ void applyVectorCommand(int turn, int thrust) {
   applyMotionCommand(turn, thrust, 0);
 }
 
+int elrsStickPercent(uint16_t microseconds) {
+  int offset = constrain(static_cast<int>(microseconds) - 1500, -500, 500);
+  if (abs(offset) <= 40) return 0;
+  return constrain(static_cast<int>(roundf(offset / 5.0f)), -100, 100);
+}
+
+void processElrsControl() {
+  elrs.poll();
+  const uint32_t now = millis();
+  if (!elrs.rcFresh(now) || !elrs.linkFresh(now) || elrs.linkQuality() == 0) {
+    if (controlSource == CONTROL_SOURCE_ELRS) stopMotorsForSafety(F("ELRS RC FAILSAFE"));
+    return;
+  }
+
+  const uint16_t armChannel = elrs.channel(4);  // CH5: low disarm, high arm
+  if (armChannel < 1300) {
+    if (controlSource == CONTROL_SOURCE_ELRS) stopMotorsForSafety(F("ELRS DISARMED"));
+    elrsArmed = false;
+    elrsArmReady = true;
+    return;
+  }
+  if (armChannel < 1700 || serviceMode || sdTransferActive) {
+    if (controlSource == CONTROL_SOURCE_ELRS) stopMotorsForSafety(F("ELRS DISARMED"));
+    elrsArmed = false;
+    return;
+  }
+
+  const int lateral = elrsStickPercent(elrs.channel(0));
+  const int thrust = elrsStickPercent(elrs.channel(1));
+  const int yaw = elrsStickPercent(elrs.channel(3));
+  const uint16_t powerChannel = elrs.channel(2);
+  if (!elrsArmed) {
+    // The switch must first be observed low, with zero power and neutral
+    // controls before its next high transition can take motor authority.
+    if (controlSource == CONTROL_SOURCE_WIFI) {
+      elrsArmReady = false;
+      return;
+    }
+    if (!elrsArmReady || powerChannel > 1100 || lateral || thrust || yaw) return;
+    elrsArmed = true;
+    elrsArmReady = false;
+    controlSource = CONTROL_SOURCE_ELRS;
+    controlMode = CONTROL_MODE_MANUAL;
+    holdPositionEnabled = false;
+    lastElrsAppliedRcMs = 0;
+    recordLogLine("ELRS CONTROL ARMED");
+  }
+  if (controlSource != CONTROL_SOURCE_ELRS || elrs.lastRcMs() == lastElrsAppliedRcMs) return;
+  lastElrsAppliedRcMs = elrs.lastRcMs();
+  const int powerPercent = constrain((static_cast<int>(powerChannel) - 1000) / 10, 0, 100);
+  const float scale = (powerPercent * ELRS_MOTOR_POWER_LIMIT_PERCENT) / 10000.0f;
+  applyMotionCommand(static_cast<int>(roundf(lateral * scale)),
+                     static_cast<int>(roundf(thrust * scale)),
+                     static_cast<int>(roundf(yaw * scale)));
+  controlMode = CONTROL_MODE_MANUAL;
+}
+
 void stopAllMotors() {
   for (int i = 0; i < MOTOR_COUNT; i++) {
     targetDriveValues[i] = 0;
@@ -1715,6 +1809,17 @@ float readAds1115AverageVoltage(uint8_t channel, int sampleCount) {
   return (total / static_cast<float>(validSamples)) * (ADS1115_FULL_SCALE_VOLTS / 32768.0f);
 }
 
+void emitWaterChemistryTelemetry() {
+  const float tdsVoltage = readAds1115AverageVoltage(ADS1115_TDS_CHANNEL, 1);
+  const float turbidityAdcVoltage = readAds1115AverageVoltage(ADS1115_TURBIDITY_CHANNEL, 1);
+  emitLine(isnan(tdsVoltage)
+    ? "TEL SCI TDS_V UNKNOWN"
+    : "TEL SCI TDS_V " + String(tdsVoltage, 3));
+  emitLine(isnan(turbidityAdcVoltage)
+    ? "TEL SCI TURBIDITY_V UNKNOWN"
+    : "TEL SCI TURBIDITY_V " + String(turbidityAdcVoltage / TURBIDITY_INPUT_DIVIDER_RATIO, 3));
+}
+
 float readCurrentSensorVoltage() {
   float adcVoltage = readAds1115AverageVoltage(ADS1115_CURRENT_CHANNEL, CURRENT_SENSOR_SAMPLE_COUNT);
   return isnan(adcVoltage) ? NAN : adcVoltage / ACS712_INPUT_DIVIDER_RATIO;
@@ -1754,6 +1859,29 @@ float readCurrentSensorAmps() {
   }
 
   return currentAmps;
+}
+
+void serviceElrsTelemetry(uint32_t now) {
+  elrs.sendLinkAndChannels(now);
+  if (now - lastElrsTelemetryMs >= ELRS_TELEMETRY_INTERVAL_MS) {
+    lastElrsTelemetryMs = now;
+    elrs.sendHeartbeat(elrsArmed && controlSource == CONTROL_SOURCE_ELRS);
+  }
+  if (now - lastElrsBatteryMs >= ELRS_BATTERY_INTERVAL_MS) {
+    lastElrsBatteryMs = now;
+    const float battery = readBatterySystemVoltage();
+    if (battery > 0) elrs.sendBattery(battery, readCurrentSensorAmps(), estimateBatteryPercent(battery));
+  }
+  if (now - lastElrsGpsMs >= ELRS_GPS_INTERVAL_MS) {
+    lastElrsGpsMs = now;
+    if (gps.location.isValid() && gps.location.age() < 2000) {
+      elrs.sendGps(gps.location.lat(), gps.location.lng(),
+                   gps.speed.isValid() ? gps.speed.mps() : 0.0f,
+                   gps.course.isValid() ? gps.course.deg() : 0.0f,
+                   gps.altitude.isValid() ? gps.altitude.meters() : 0.0f,
+                   gps.satellites.isValid() ? static_cast<uint8_t>(constrain(gps.satellites.value(), 0UL, 255UL)) : 0);
+    }
+  }
 }
 
 void emitSensorDiagnostics() {
@@ -2344,6 +2472,15 @@ void handleControlCommand(String command) {
     return;
   }
 
+  const bool wifiPropulsionCommand = command.startsWith("CTRL MOTION ") ||
+    command.startsWith("CTRL VECTOR ") || command.startsWith("CTRL MOTOR ") ||
+    command.startsWith("CTRL HOLD ") || command.startsWith("CTRL GOTO ");
+  if (wifiPropulsionCommand && elrsArmed && command != "CTRL MOTOR STOP") {
+    emitLine("ERR ELRS CONTROL ACTIVE");
+    return;
+  }
+  if (wifiPropulsionCommand && command != "CTRL MOTOR STOP") controlSource = CONTROL_SOURCE_WIFI;
+
   // Only explicit control traffic and the control-station heartbeat refresh
   // the propulsion watchdog. Telemetry requests cannot keep a stale motor
   // command alive.
@@ -2370,6 +2507,9 @@ void handleControlCommand(String command) {
     if (scienceExperimentState != 0) { emitLine("ERR STOP AND SAVE MISSION FIRST"); return; }
     stopAllMotors();
     controlMode = CONTROL_MODE_IDLE;
+    controlSource = CONTROL_SOURCE_NONE;
+    elrsArmed = false;
+    elrsArmReady = false;
     holdPositionEnabled = false;
     audioStreamEnabled = false;
     imuStreamEnabled = false;
@@ -2532,6 +2672,9 @@ void handleControlCommand(String command) {
   if (command == "CTRL STOP" || command == "STOP") {
     stopAllMotors();
     controlMode = CONTROL_MODE_IDLE;
+    controlSource = CONTROL_SOURCE_NONE;
+    elrsArmed = false;
+    elrsArmReady = false;
     holdPositionEnabled = false;
     emitLine("ACK CTRL STOP");
     return;
@@ -2659,6 +2802,9 @@ void handleControlCommand(String command) {
     if (payload == "STOP") {
       stopAllMotors();
       controlMode = CONTROL_MODE_IDLE;
+      controlSource = CONTROL_SOURCE_NONE;
+      elrsArmed = false;
+      elrsArmReady = false;
       holdPositionEnabled = false;
       emitLine("ACK CTRL MOTOR STOP");
       return;
@@ -2770,6 +2916,9 @@ void handleControlCommand(String command) {
   if (command == "BANANA") {
     stopAllMotors();
     controlMode = CONTROL_MODE_IDLE;
+    controlSource = CONTROL_SOURCE_NONE;
+    elrsArmed = false;
+    elrsArmReady = false;
     emitLine("ACK CTRL STOP");
     return;
   }
@@ -2820,6 +2969,7 @@ void setup() {
   lastLedToggleMs = millis();
   setupMotors();
   stopAllMotors();
+  elrs.begin();
   ads1115Available = setupAds1115();
   sdCardMounted = mountSdCard();
   setupWifiControl();
@@ -2833,27 +2983,31 @@ void setup() {
     audioInputAvailable = false;
   }
 
-  emitLine(FIRMWARE_BANNER);
+  emitLine("ESP32 buoy firmware " + firmwareVersionString());
   emitLine("ESP32 buoy firmware ready");
   emitLine("SD card: " + String(sdCardMounted ? "ready" : "unavailable"));
   emitLine("ADS1115: " + String(ads1115Available ? "ready" : "unavailable"));
   emitLine("MPU6050: " + String(mpu6050Available ? "ready" : "unavailable"));
   emitLine("INMP441 audio: " + String(audioInputAvailable ? "ready" : "unavailable"));
+  emitLine("ELRS UART2: MAVLink 460800");
   updateSdCardTelemetry();
   emitSensorDiagnostics();
 }
 
 void loop() {
+  processElrsControl();
   if (!serviceMode) processAudioFrames();
   processTcpControl();
   processSdFileServer();
   updateMotorCommandWatchdog();
   if (serviceMode) {
+    serviceElrsTelemetry(millis());
     updateStatusLed();
     delay(1);
     return;
   }
   processGpsSerial();
+  serviceElrsTelemetry(millis());
   updateStatusLed();
   updateMotorRamps();
 
@@ -2878,6 +3032,12 @@ void loop() {
   if (controlClientConnected() && (nowMs - lastWaterTempStreamMs >= waterTemperatureIntervalMs)) {
     lastWaterTempStreamMs = nowMs;
     emitWaterTemperatureTelemetry();
+  }
+  const uint32_t waterChemistryIntervalMs = audioRecordingEnabled
+    ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : WATER_CHEMISTRY_STREAM_INTERVAL_MS;
+  if (controlClientConnected() && (nowMs - lastWaterChemistryStreamMs >= waterChemistryIntervalMs)) {
+    lastWaterChemistryStreamMs = nowMs;
+    emitWaterChemistryTelemetry();
   }
   if (controlClientConnected() && (nowMs - lastPowerStreamMs >= powerIntervalMs)) {
     lastPowerStreamMs = nowMs;

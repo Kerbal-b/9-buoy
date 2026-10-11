@@ -28,7 +28,7 @@ Item {
             y: 48
             text: backendObject && backendObject.audioRecordingEnabled
                 ? "Audio priority active: non-GPS sensors sample every 30 seconds"
-                : "Live sensor telemetry and session audio capture"
+                : "Live sensor telemetry; water quality readings require wet calibration"
             color: "#829aad"
             font.pixelSize: 12
         }
@@ -108,6 +108,18 @@ Item {
                     model: [
                         { label: "Depth", value: backendState.currentDepth },
                         { label: "Water temperature", value: backendState.waterTemperature },
+                        {
+                            label: "Conductivity",
+                            value: backendState.conductivityVoltage && backendState.conductivityVoltage !== "N/A"
+                                ? "Calibration needed" : "N/A",
+                            detail: "A2 signal: " + (backendState.conductivityVoltage || "N/A")
+                        },
+                        {
+                            label: "Turbidity",
+                            value: backendState.turbidityVoltage && backendState.turbidityVoltage !== "N/A"
+                                ? "Calibration needed" : "N/A",
+                            detail: "A3 signal: " + (backendState.turbidityVoltage || "N/A")
+                        },
                         { label: "Air temperature", value: backendState.airTemperature },
                         { label: "IMU acceleration", value: backendState.imuAccel },
                         { label: "IMU rotation", value: backendState.imuGyro },
@@ -133,12 +145,25 @@ Item {
                         Text {
                             anchors.right: parent.right
                             anchors.rightMargin: 12
-                            anchors.verticalCenter: parent.verticalCenter
+                            y: modelData.detail ? 8 : (parent.height - height) / 2
                             width: parent.width * 0.55
                             text: modelData.value || "N/A"
                             color: "#e6ecf2"
                             font.pixelSize: 13
                             font.bold: true
+                            horizontalAlignment: Text.AlignRight
+                            elide: Text.ElideRight
+                        }
+
+                        Text {
+                            visible: !!modelData.detail
+                            anchors.right: parent.right
+                            anchors.rightMargin: 12
+                            y: 29
+                            width: parent.width * 0.55
+                            text: modelData.detail || ""
+                            color: "#829aad"
+                            font.pixelSize: 11
                             horizontalAlignment: Text.AlignRight
                             elide: Text.ElideRight
                         }

@@ -108,7 +108,7 @@ class MavlinkTelemetryTests(unittest.TestCase):
                 frame, self.frame = self.frame, None
                 return frame, ("192.168.8.134", 14550)
 
-        payload = struct.pack("<HHBBBBB", 0, 0, 254, 11, 255, 13, 255)
+        payload = struct.pack("<HHBBBBB", 0, 0, 255, 11, 255, 255, 255)
         frame = make_frame(109, payload, version=1, system_id=1, component_id=68)
         backend = ControlStationBackend(
             backend_args(),
@@ -119,7 +119,7 @@ class MavlinkTelemetryTests(unittest.TestCase):
         backend._poll_radio_telemetry()
         self.assertEqual(backend._state["radioLinkQuality"], "100% (RX uplink)")
         self.assertEqual(backend._state["radioRssiStatus"], "-11 dBm (RX uplink)")
-        self.assertEqual(backend._state["radioSnrStatus"], "13 dB (RX uplink)")
+        self.assertEqual(backend._state["radioSnrStatus"], "-1 dB (RX uplink)")
         backend._radio_link_last_at -= 6.0
         backend._poll_radio_telemetry()
         self.assertEqual(backend._state["radioLinkQuality"], "Unknown")

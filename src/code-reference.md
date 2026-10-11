@@ -162,7 +162,7 @@ The historical Nano, HC-05, motor, and sensor schematic is retained in `docs/arc
 
 ## ESP32 Controller Wiring
 
-The active firmware uses UART1 receive-only for GPS. `GPIO1`, normally UART0 TX, is repurposed as the microSD chip-select line, so ordinary USB-serial output is unavailable while this SD wiring is active. UART2 has no active peripheral.
+The active firmware uses UART1 receive-only for GPS and UART2 for the ELRS receiver in MAVLink mode (`GPIO34` RX, `GPIO25` TX). `GPIO1`, normally UART0 TX, is repurposed as the microSD chip-select line, so ordinary USB-serial output is unavailable while this SD wiring is active.
 
 ### ESP32 Wiring Documentation
 
@@ -175,14 +175,14 @@ The production firmware remains the source of truth for active GPIO assignments.
 - Avoid `GPIO6` to `GPIO11` (connected to onboard flash on most dev boards).
 - Avoid boot strap pins for critical outputs during reset (`GPIO0`, `GPIO2`, `GPIO12`, `GPIO15`).
 - Analog sensors use an external ADS1115 on I2C. Its channels are `A0` current, `A1` battery, `A2` TDS, and `A3` turbidity.
-- `GPIO35` is an input-only microSD `MISO` line. `GPIO34` is not assigned by the active firmware.
+- `GPIO35` is an input-only microSD `MISO` line. `GPIO34` receives ELRS UART2 data.
 - `GPIO14` is used for the DS18B20 1-Wire data line in the current wiring plan.
 - `GPIO36` (`VP`) is used for the INMP441 microphone data line and is input-only, which matches the I2S microphone output.
 - `GPIO39` is input-only and receives the JSN-SR04T V3.0 echo pulse.
 - `GPIO13` sends the JSN-SR04T V3.0 trigger pulse.
 - Motor control is assigned to `GPIO18/19/21/22/32/33`; all six are hardware-PWM outputs for the three dual-input H-bridges.
 - I2C is assigned to `GPIO23/27` so it does not conflict with either front motor pair.
-- The current control architecture uses onboard Wi-Fi for command and telemetry transport. ExpressLRS/CRSF is not implemented in the active firmware.
+- The current control architecture supports Wi-Fi commands/telemetry and ELRS MAVLink radio control plus low-rate Backpack telemetry. See [production ELRS setup](firmware/esp32/esp32-buoy-firmware/ELRS-MAVLINK.md). CRSF remains an isolated bench sketch.
 - The JSN-SR04T V3.0 feeds both periodic UDP `RANGE` packets and text `TEL SCI DEPTH` updates.
 - The ESP32 firmware uses `OneWire` + `DallasTemperature` on `GPIO14` for `TEL SCI WATER_TEMP` support.
 
@@ -197,7 +197,7 @@ The production firmware remains the source of truth for active GPIO assignments.
 - Implements buoy motor control and telemetry protocol directly on ESP32.
 - Uses UART1 receive-only for GPS at `9600 baud`.
 - Repurposes the normal UART0 TX pin (`GPIO1`) as microSD chip select; ordinary USB-serial runtime logging is therefore unavailable with the active SD wiring.
-- Does not currently implement ExpressLRS/CRSF or another UART2 peripheral.
+- Uses UART2 for ExpressLRS MAVLink at 460800 baud, with receiver link/RC failsafe and a 50% radio propulsion limit.
 - Joins the buoy Wi-Fi network as a station in the current build.
 - Accepts reliable control commands over TCP.
 - Streams fast telemetry over UDP using compact binary packets for IMU, range, power, state, GPS, and stereo audio data, and emits DS18B20 water-temperature text telemetry.

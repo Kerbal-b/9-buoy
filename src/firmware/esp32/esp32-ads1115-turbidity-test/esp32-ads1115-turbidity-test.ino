@@ -142,7 +142,7 @@ const char* tdsStatus(bool readOk, int32_t raw, float voltage) {
 const char* turbidityStatus(bool readOk, int32_t raw, float adcVoltage) {
   if (!readOk) return "READ_ERROR";
   if (adcVoltage < -0.01f) return "CHECK_GROUND";
-  if (adcVoltage > 3.25f) return "INPUT_NEAR_3V3_LIMIT";
+  if (adcVoltage > 4.0f) return "INPUT_NEAR_ADC_RANGE_LIMIT";
   if (raw == 0) return "ZERO_OR_DISCONNECTED";
   return "OK_UNCALIBRATED";
 }
@@ -157,8 +157,8 @@ void printStartupInformation() {
   Serial.println();
   Serial.println("ESP32 ADS1115 WATER-QUALITY SENSOR TEST");
   Serial.println("I2C: SDA=GPIO23 SCL=GPIO27");
-  Serial.println("ADS1115: address=0x48 range=+/-4.096V, powered from 3.3V");
-  Serial.println("TDS: KS0429 powered from 3.3V, OUT directly to ADS1115 A2, common GND");
+  Serial.println("ADS1115: address=0x48 range=+/-4.096V, powered from 5V");
+  Serial.println("TDS: KS0429 powered from 5V, OUT directly to ADS1115 A2, common GND");
   Serial.println("Turbidity: KS0414 powered from 5V, OUT through divider to ADS1115 A3");
   Serial.println("Turbidity divider: sensor OUT -> 10k -> A3; A3 -> 15k -> GND");
   Serial.println("TDS ppm uses the Keyestudio equation with an assumed 25.0 C temperature.");
@@ -178,7 +178,7 @@ void setup() {
     Serial.println("PASS: ADS1115 acknowledged at I2C address 0x48.");
   } else {
     Serial.println("FAIL: No ADS1115 response at 0x48.");
-    Serial.println("Check 3.3V, GND, SDA GPIO23, SCL GPIO27, and ADDR to GND.");
+    Serial.println("Check 5V, GND, SDA GPIO23, SCL GPIO27, and ADDR to GND.");
   }
 
   Serial.println("timestamp_ms,tds_raw_median,tds_voltage,tds_ppm_estimate_25c,tds_min_v,tds_max_v,tds_status,turbidity_raw_average,a3_voltage,turbidity_sensor_voltage,turbidity_min_v,turbidity_max_v,turbidity_status");

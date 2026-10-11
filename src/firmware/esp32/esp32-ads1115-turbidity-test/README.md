@@ -6,7 +6,7 @@ This isolated bench sketch verifies the installed ADS1115, Keyestudio KS0429 TDS
 
 | Connection | Destination |
 | --- | --- |
-| ADS1115 `VDD` | ESP32 `3.3 V` |
+| ADS1115 `VDD` | Regulated `5 V` |
 | ADS1115 `GND` | Common `GND` |
 | ADS1115 `SDA` | ESP32 `GPIO23` |
 | ADS1115 `SCL` | ESP32 `GPIO27` |
@@ -16,7 +16,7 @@ This isolated bench sketch verifies the installed ADS1115, Keyestudio KS0429 TDS
 
 | TDS connection | Destination |
 | --- | --- |
-| KS0429 `VCC` / `+` | ESP32 `3.3 V` |
+| KS0429 `VCC` / `+` | Regulated `5 V` |
 | KS0429 `GND` / `-` | Common `GND` |
 | KS0429 analog output / `A` | ADS1115 `A2` |
 | Probe connector | TDS probe |
@@ -33,14 +33,14 @@ The TDS output is connected directly to `A2`; no voltage divider is used. The sk
 | ADC input | ADS1115 `A3` -> junction `A3_NODE` |
 | Pull-down resistor | Junction `A3_NODE` -> `15 kOhm` -> common `GND` |
 
-The ADS1115 uses `3.3 V`, but the KS0414 uses `5 V`. Set the KS0414 slide switch to `A` for analog output and keep its interface board dry.
+The ADS1115 and both sensor modules use regulated `5 V`. Set the KS0414 slide switch to `A` for analog output and keep its interface board dry. The ADS1115 SDA/SCL wires currently connect directly to ESP32 GPIO23/GPIO27; verify that the board's I2C pull-ups do not bring 5 V onto those ESP32 pins.
 
 ```text
-ESP32 3.3 V -------------------- ADS1115 VDD
-ESP32 3.3 V -------------------- KS0429 VCC / +
+regulated 5 V ------------------ ADS1115 VDD
+           +-------------------- KS0429 VCC / +
 KS0429 OUT --------------------> ADS1115 A2
 
-regulated 5 V ------------------ KS0414 VCC / +
+           +-------------------- KS0414 VCC / +
 KS0414 OUT ----[ 10 kOhm ]---o A3_NODE ---- ADS1115 A3
                             |
                          [ 15 kOhm ]

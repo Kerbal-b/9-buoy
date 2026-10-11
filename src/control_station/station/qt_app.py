@@ -36,7 +36,7 @@ from .log_categories import (
     display_timestamp,
     interpret_log_entry,
 )
-from .protocol import is_protocol_message, parse_acknowledgement, parse_error, parse_science_update, parse_status_update
+from .protocol import format_firmware_version, is_protocol_message, parse_acknowledgement, parse_error, parse_science_update, parse_status_update
 from .radio_wifi import discover_tx_backpack
 from .serial_link import (
     CONNECTION_PREFS_FILENAME,
@@ -500,6 +500,8 @@ class ControlStationBackend(QObject):
             "currentDraw": "N/A",
             "currentDepth": "N/A",
             "waterTemperature": "N/A",
+            "conductivityVoltage": "N/A",
+            "turbidityVoltage": "N/A",
             "airTemperature": "N/A",
             "imuAccel": "N/A",
             "imuGyro": "N/A",
@@ -1902,7 +1904,7 @@ class ControlStationBackend(QObject):
                     local_rssi = message["rssi_raw"]
                     remote_rssi = message["remote_rssi_raw"]
                     if int(message["system_id"]) == 1 and int(message["component_id"]) == 68:
-                        # This bench sketch relays the ExpressLRS receiver's
+                        # The buoy firmware relays the ExpressLRS receiver's
                         # RADIO_STATUS: rssi is uplink LQ on a 0..255 scale,
                         # remrssi is the positive magnitude of RSSI in dBm.
                         self._set_state(
@@ -3099,7 +3101,7 @@ class ControlStationBackend(QObject):
             if status_key == "MODE" and status_values:
                 self._set_state(controllerMode=status_values[0].lower())
             elif status_key == "FIRMWARE" and status_values:
-                self._set_state(firmwareVersion=" ".join(status_values))
+                self._set_state(firmwareVersion=format_firmware_version(status_values))
             elif status_key == "SCIENCE" and status_values:
                 self._set_state(scienceExperimentState=status_values[0],
                                 scienceSessionPath=status_values[1] if len(status_values) > 1 and status_values[1] != "NONE" else "")
@@ -3157,6 +3159,10 @@ class ControlStationBackend(QObject):
             science_key, science_values = science_update
             if science_key == "WATER_TEMP":
                 self._set_state(waterTemperature=_parse_science_value(science_values, "C"))
+            elif science_key == "TDS_V":
+                self._set_state(conductivityVoltage=_parse_science_value(science_values, "V"))
+            elif science_key == "TURBIDITY_V":
+                self._set_state(turbidityVoltage=_parse_science_value(science_values, "V"))
             elif science_key == "AIR_TEMP":
                 self._set_state(airTemperature=_parse_science_value(science_values, "C"))
             elif science_key == "DEPTH":
