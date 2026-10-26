@@ -94,7 +94,7 @@ Item {
     }
 
     function elrsLinkDetails() {
-        if (!root.elrsLinkActive()) return "No ELRS link telemetry"
+        if (!root.elrsLinkActive()) return "Station cannot verify RF; TX12 control may still be live"
         const details = ["LQ " + Math.round(root.linkQualityPercent()) + "%"]
         const rssi = String(backendState.radioRssiStatus || "").match(/-?\d+\s*dBm/i)
         const snr = String(backendState.radioSnrStatus || "").match(/-?\d+\s*dB/i)
@@ -316,7 +316,7 @@ Item {
                                 Row {
                                     width: parent.width; height: 34; spacing: 6
                                     Text { width: 125; text: "TX12 - buoy"; color: "#d5e3ec"; font.pixelSize: 11; anchors.verticalCenter: parent.verticalCenter }
-                                    Text { width: 88; text: root.elrsLinkActive() ? "RF LIVE" : "NO DATA"; color: root.elrsLinkActive() ? "#55d6a2" : "#f07878"; font.pixelSize: 11; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
+                                    Text { width: 88; text: root.elrsLinkActive() ? "RF OBSERVED" : "UNOBSERVED"; color: root.elrsLinkActive() ? "#55d6a2" : "#829aad"; font.pixelSize: 11; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
                                     Text { width: parent.width - 225; text: "ELRS / MAVLink | " + root.elrsLinkDetails(); color: root.elrsLinkActive() ? "#9eb5c7" : "#829aad"; font.pixelSize: 11; elide: Text.ElideRight; anchors.verticalCenter: parent.verticalCenter }
                                 }
                             }
@@ -341,7 +341,13 @@ Item {
                 ColumnLayout {
                     anchors.fill: parent; anchors.margins: 16; spacing: 8
                     Text { text: "RadioMaster TX12 / ELRS"; color: "#e6ecf2"; font.pixelSize: 23; font.bold: true }
-                    Text { text: "Backpack Wi-Fi confirms the PC can reach the backpack. ELRS link quality appears only when the buoy receiver relays RADIO_STATUS over MAVLink."; color: "#829aad"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                    Text {
+                        text: "SE arm: " + (backendState.radioArmStatus || "Unknown") +
+                              "   |   SF telemetry: " +
+                              (backendState.telemetryMode === "MAVLINK" ? "MAVLink / TX Backpack" : "Buoy Wi-Fi")
+                        color: "#9ce8e3"; font.pixelSize: 12; font.bold: true
+                    }
+                    Text { text: "The Backpack gives low-rate buoy state without buoy Wi-Fi. Signed motor PWM shows commanded drive direction; GPS track shows measured ground movement when available. The station cannot verify RF when Backpack telemetry is absent."; color: "#829aad"; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                     RowLayout {
                         Layout.fillWidth: true; spacing: 14
                         Item {
@@ -428,6 +434,14 @@ Item {
                                     { label: "System ID", value: backendState.radioSystemId || "Unknown" },
                                     { label: "Validated packets", value: String(backendState.radioTelemetryPackets || 0) },
                                     { label: "Radio status", value: backendState.radioLinkStatus || "No receiver RADIO_STATUS relayed" },
+                                    { label: "Motor authority", value: backendState.controlSource || "Unknown" },
+                                    { label: "TX12 arm", value: backendState.radioArmStatus || "Unknown" },
+                                    { label: "Recovery", value: backendState.recoveryStatus || "Unknown" },
+                                    { label: "Buoy mode", value: backendState.radioBuoyMode || "Unknown" },
+                                    { label: "Mission", value: backendState.radioMissionStatus || "Unknown" },
+                                    { label: "Motors", value: backendState.radioMotorOutput || "Unknown" },
+                                    { label: "Recording", value: backendState.radioRecordingStatus || "Unknown" },
+                                    { label: "GPS motion", value: backendState.radioGroundMotion || "Unknown" },
                                     { label: "RSSI", value: backendState.radioRssiStatus || "Unknown" },
                                     { label: "SNR", value: backendState.radioSnrStatus || "Unknown" }
                                 ]

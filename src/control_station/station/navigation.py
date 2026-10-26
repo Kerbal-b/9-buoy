@@ -272,7 +272,7 @@ class NavigationAssist:
             status = "Assist stopped: IMU telemetry stale"
         elif self.enabled and command_magnitude < self.minimum_command:
             self._smoothed_correction_deg *= 0.75
-            status = "Assist armed; waiting for controller input"
+            status = "Assist armed; waiting for Wi-Fi keyboard input"
         elif self.enabled and measured_magnitude < self.minimum_acceleration_g:
             self._smoothed_correction_deg *= 0.85
             status = "Assist armed; acceleration below threshold"
@@ -370,3 +370,20 @@ class GpsSpeedTracker:
         ):
             return None
         return self._speed_mps
+
+    def course_deg(self, now: float) -> float | None:
+        """Return bearing of recent ground displacement, clockwise from north."""
+        if (not self._valid or self._last_fix_time is None
+                or now - self._last_fix_time > self.stale_after_s or not self._fixes):
+            return None
+        latest = self._fixes[-1]
+        reference = next((fix for fix in self._fixes if latest[0] - fix[0] >= 2.0), None)
+        if reference is None:
+            return None
+        lat1, lat2 = math.radians(reference[1]), math.radians(latest[1])
+        dlon = math.radians(latest[2] - reference[2])
+        east = math.sin(dlon) * math.cos(lat2)
+        north = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+        if self._distance_m((reference[1], reference[2]), (latest[1], latest[2])) < 1.5:
+            return None
+        return math.degrees(math.atan2(east, north)) % 360.0

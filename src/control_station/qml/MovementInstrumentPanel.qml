@@ -8,6 +8,7 @@ Rectangle {
 
     property var backendState: ({})
     property var backendObject
+    property bool showSpeedReadout: true
 
     function clamp(value, minimum, maximum) {
         return Math.max(minimum, Math.min(maximum, value))
@@ -106,6 +107,7 @@ Rectangle {
         Rectangle {
             Layout.preferredWidth: 190
             Layout.fillHeight: true
+            visible: root.showSpeedReadout
             radius: 9
             color: "#101b27"
             border.color: "#2f4559"

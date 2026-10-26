@@ -25,7 +25,7 @@ This file explains what the main source files mean and what configuration decisi
 - `src/firmware/esp32-test/`
   - Standalone ESP32 bring-up firmware used to validate board upload, serial, and basic GPIO.
 - `src/control_station/`
-  - Laptop-side control station for controller input, debug tools, and future buoy communication.
+  - Laptop-side telemetry station, science tools, and optional Wi-Fi keyboard drive. TX12 radio propulsion runs on the buoy.
 
 ## Nano Firmware
 
@@ -195,9 +195,9 @@ The production firmware remains the source of truth for active GPIO assignments.
 ### What It Does
 
 - Implements buoy motor control and telemetry protocol directly on ESP32.
-- Uses UART1 receive-only for GPS at `9600 baud`.
+- Uses UART1 receive-only for the HGLRC M100-5883 GPS at `115200 baud`; its QMC5883 compass shares I2C SDA GPIO23 and SCL GPIO27 with the MPU6050 and ADS1115.
 - Repurposes the normal UART0 TX pin (`GPIO1`) as microSD chip select; ordinary USB-serial runtime logging is therefore unavailable with the active SD wiring.
-- Uses UART2 for ExpressLRS MAVLink at 460800 baud, with receiver link/RC failsafe and a 50% radio propulsion limit.
+- Uses UART2 for ExpressLRS MAVLink at 460800 baud, with receiver RC failsafe and a CH3-adjustable radio propulsion limit up to full PWM.
 - Joins the buoy Wi-Fi network as a station in the current build.
 - Accepts reliable control commands over TCP.
 - Streams fast telemetry over UDP using compact binary packets for IMU, range, power, state, GPS, and stereo audio data, and emits DS18B20 water-temperature text telemetry.
@@ -234,7 +234,7 @@ The production firmware remains the source of truth for active GPIO assignments.
 ### Notes
 
 - This firmware is intentionally isolated from buoy production logic.
-- Use it only for controller bring-up and quick board health checks.
+- Use it only for protocol bring-up and quick board health checks.
 
 ## Control Station
 
@@ -244,35 +244,32 @@ The production firmware remains the source of truth for active GPIO assignments.
   - Thin entry point that starts the control station app.
 - `src/control_station/run_control_station.sh`
   - Launches the main control station window.
-- `src/control_station/run_controller_debug.sh`
-  - Launches the separate controller debug window.
 
 ### Main Python Modules
 
-- `src/control_station/station/app.py`
-  - Main runtime loop, startup, argument parsing, and mode selection.
-- `src/control_station/station/controller.py`
-  - Reads controller state from `pygame`.
+- `src/control_station/station/qt_app.py`
+  - Main Qt runtime, TX12 telemetry, mode selection, and optional Wi-Fi keyboard drive.
 - `src/control_station/station/geometry.py`
   - Converts lateral, forward/reverse, and yaw inputs into buoy motor command values.
 - `src/control_station/station/navigation.py`
   - Removes slowly changing gravity/tilt from horizontal IMU acceleration and applies bounded direction correction during navigation testing.
 - `src/control_station/station/serial_link.py`
   - Handles Wi-Fi, BLE, and serial communication to the buoy.
-- `src/control_station/station/ui.py`
-  - Draws the main interface and the controller debug interface.
+- `src/control_station/qml/Main.qml`
+  - Draws the main interface and TX12 or Wi-Fi keyboard mode selector.
+- `src/control_station/qml/MissionsPanel.qml`
+  - Shows current buoy and recovery state while mission execution remains unimplemented.
 - `src/control_station/station/models.py`
-  - Shared data structures for commands and controller snapshots.
+  - Shared data structures for manual commands and science samples.
 - `src/control_station/station/settings.py`
-  - Centralized constants for colors, window size, and defaults.
+  - Default link settings.
 
 ### Current Control Station Configuration
 
-- Controller input source
-  - Xbox-style controller through `pygame`
+- Primary propulsion source
+  - TX12 through ELRS MAVLink receiver, with SE high on CH5 as the arm request
 - Main movement input
-  - left stick X for horizontal movement
-  - left stick Y for forward and reverse movement
+  - TX12 CH1 lateral, CH2 forward/reverse, CH3 power, CH4 yaw
 - Manual command format
   - `CTRL VECTOR <turn> <thrust>`
   - `CTRL MOTION <lateral> <thrust> <yaw>` when independent yaw is nonzero
@@ -288,15 +285,13 @@ The production firmware remains the source of truth for active GPIO assignments.
   - defaults to auto-discovery of the buoy host for the current ESP32 Wi-Fi link
 - Main interface
   - minimalist movement vector plus buoy layout
-- Debug interface
-  - generic controller inspector
-  - analog inputs shown as live bars
-  - digital inputs shown as labeled `ON/OFF` indicators
+- Radio panel
+  - ELRS link status, TX12 channels, arm state, motor authority, and recovery status
 
 ### Important Notes
 
 - The control station is modular on purpose so future systems can be added without growing one large file.
-- The debug window is meant for controller discovery and mapping, not for the main buoy UI.
+- Wi-Fi keyboard drive is explicitly selected for bench or recovery operation.
 - The control station already assumes a three-motor buoy layout for movement visualization and command generation.
 - The serial layer can now auto-discover a Bluetooth serial port by device name when an explicit `--port` is not provided.
 - The app also supports a ping-only send mode to quickly verify serial RX (`--hello-ping`).
@@ -309,7 +304,7 @@ The production firmware remains the source of truth for active GPIO assignments.
   - front-right
 - The control station and firmware are being developed in parallel.
 - The control station is prepared for serial, BLE, and Wi-Fi command-based control.
-- The joystick logic and the Arduino motor-output logic are now being kept separate.
+- ELRS receiver input and Arduino motor output are handled by production firmware.
 - The Arduino firmware currently takes live `VECTOR` commands and computes motor thrust onboard.
 - Firmware changes should be scoped section-by-section to keep refactors controlled.
 

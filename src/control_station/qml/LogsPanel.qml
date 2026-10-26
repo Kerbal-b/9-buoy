@@ -87,7 +87,7 @@ Item {
 
                 Text {
                     Layout.fillWidth: true
-                    text: "Chronological controller and telemetry activity"
+                    text: "Chronological control and telemetry activity"
                     color: "#829aad"
                     font.pixelSize: 11
                 }

@@ -64,6 +64,40 @@ def interpret_log_entry(entry: str) -> str:
     normalized = entry.strip()
     upper = normalized.upper()
 
+    if "TEL EVENT TELEMETRY_MODE MAVLINK" in upper:
+        return "SF selected MAVLink telemetry through the TX Backpack"
+    if "TEL EVENT TELEMETRY_MODE WIFI" in upper:
+        return "SF selected buoy Wi-Fi telemetry"
+    if "TEL STATUS TELEMETRY_MODE MAVLINK" in upper:
+        return "Telemetry route: MAVLink through the TX Backpack"
+    if "TEL STATUS TELEMETRY_MODE WIFI" in upper:
+        return "Telemetry route: buoy Wi-Fi"
+
+    if "TEL STATUS ELRS_FAILSAFE NONE" in upper:
+        return "No TX12 failsafe recorded since the buoy restarted"
+
+    match = re.search(
+        r"TEL (?:EVENT|STATUS) ELRS_FAILSAFE COUNT (\d+) REASON (\S+) "
+        r"RC_AGE_MS (\S+) LQ (\d+) LINK_AGE_MS (\S+)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if match:
+        count, reason, rc_age, link_quality, link_age = match.groups()
+        explanation = {
+            "RC_TIMEOUT": "no valid RC control frame for over 500 ms",
+            "ZERO_LQ": "the receiver reported zero link quality",
+            "RC_TIMEOUT_AND_ZERO_LQ": "RC frames timed out and the receiver reported zero link quality",
+            "ARM_STATE_LOST": "the firmware lost its armed state",
+        }.get(reason.upper(), reason.replace("_", " ").lower())
+        rc_detail = "no RC frame received yet" if rc_age.upper() == "UNKNOWN" else f"last RC frame {rc_age} ms old"
+        link_detail = (
+            "no link report received yet" if link_age.upper() == "UNKNOWN"
+            else f"last link report {link_age} ms old, quality {link_quality}%"
+        )
+        event_label = "TX12 failsafe" if "TEL EVENT ELRS_FAILSAFE" in upper else "Last TX12 failsafe"
+        return f"{event_label} #{count}: {explanation}; {rc_detail}; {link_detail}"
+
     match = re.search(r"CTRL VECTOR\s+([+-]?\d+)\s+([+-]?\d+)", normalized, re.IGNORECASE)
     if match:
         action = "accepted" if upper.startswith("RX ACK") else "requested"
@@ -150,7 +184,7 @@ def interpret_log_entry(entry: str) -> str:
 
     match = re.search(r"TEL STATUS MODE\s+(\S+)", normalized, re.IGNORECASE)
     if match:
-        return f"Controller mode — {_friendly_name(match.group(1))}"
+        return f"Buoy mode — {_friendly_name(match.group(1))}"
 
     if upper.startswith("NAV "):
         match = re.search(
@@ -169,20 +203,20 @@ def interpret_log_entry(entry: str) -> str:
         return "Navigation event — " + normalized[4:]
 
     if upper == "TX PING":
-        return "Heartbeat sent to controller"
+        return "Heartbeat sent to buoy"
     if upper == "RX ACK PING":
-        return "Controller heartbeat acknowledged"
+        return "Buoy heartbeat acknowledged"
     if upper.startswith("LINK TIMEOUT"):
-        return "Connection lost — controller stopped responding"
+        return "Connection lost — buoy stopped responding"
     if upper.startswith("PING TIMEOUT"):
-        return "Heartbeat timed out — controller response missing"
+        return "Heartbeat timed out — buoy response missing"
     if upper.startswith("CONNECT START"):
-        return "Connecting to the buoy controller"
+        return "Connecting to the buoy"
     if upper.startswith("CONNECT SUCCESS") or upper.startswith("RECONNECTED"):
-        return "Buoy controller connection established"
+        return "Buoy connection established"
     if upper.startswith("CONNECT FAILED") or upper.startswith("RECONNECT FAILED"):
-        return "Unable to connect to the buoy controller"
+        return "Unable to connect to the buoy"
     if upper.startswith("RX ERR") or upper.startswith("TX FAILED"):
-        return "Controller communication error"
+        return "Buoy communication error"
 
     return ""

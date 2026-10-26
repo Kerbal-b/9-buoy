@@ -42,6 +42,7 @@ PACKET_TYPE_RANGE = 2
 PACKET_TYPE_POWER = 3
 PACKET_TYPE_STATE = 4
 PACKET_TYPE_GPS = 5
+PACKET_TYPE_ELRS_CHANNELS = 6
 PACKET_TYPE_AUDIO = 10
 
 HEADER_STRUCT = struct.Struct("<BBHI")
@@ -51,6 +52,7 @@ RANGE_STRUCT = struct.Struct("<HBB")
 POWER_STRUCT = struct.Struct("<HhBB")
 STATE_STRUCT = struct.Struct("<BBBB")
 GPS_STRUCT = struct.Struct("<ii")
+ELRS_CHANNELS_STRUCT = struct.Struct("<16H")
 
 
 @dataclass(frozen=True)
@@ -664,6 +666,16 @@ def _decode_telemetry_packet(payload: bytes) -> TelemetryPacket | None:
             sequence=sequence,
             timestamp_ms=timestamp_ms,
             values=(lat_e7 / 1e7, lon_e7 / 1e7),
+        )
+
+    if packet_type == PACKET_TYPE_ELRS_CHANNELS:
+        if len(payload_bytes) != ELRS_CHANNELS_STRUCT.size:
+            return None
+        return TelemetryPacket(
+            packet_type="ELRS_CHANNELS",
+            sequence=sequence,
+            timestamp_ms=timestamp_ms,
+            values=ELRS_CHANNELS_STRUCT.unpack(payload_bytes),
         )
 
     return None

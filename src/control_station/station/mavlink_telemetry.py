@@ -7,11 +7,12 @@ validated before a packet can change displayed state.
 from __future__ import annotations
 
 import struct
+import math
 from typing import Any
 
 
 # Common.xml CRC_EXTRA values from the MAVLink generated message headers.
-CRC_EXTRAS = {0: 50, 1: 124, 33: 104, 35: 244, 65: 118, 109: 185}
+CRC_EXTRAS = {0: 50, 1: 124, 24: 24, 33: 104, 35: 244, 65: 118, 109: 185, 251: 170, 252: 44}
 
 
 def _crc_x25(data: bytes, extra: int) -> int:
@@ -32,7 +33,11 @@ def gcs_heartbeat() -> bytes:
 
 def _decode_payload(message_id: int, payload: bytes) -> dict[str, Any] | None:
     if message_id == 0 and len(payload) >= 9:  # HEARTBEAT
-        return {"kind": "heartbeat", "system_status": payload[7]}
+        return {
+            "kind": "heartbeat",
+            "system_status": payload[7],
+            "armed": bool(payload[6] & 0x80),
+        }
     if message_id == 1 and len(payload) >= 31:  # SYS_STATUS
         voltage_mv = struct.unpack_from("<H", payload, 14)[0]
         current_ca = struct.unpack_from("<h", payload, 16)[0]
@@ -47,7 +52,50 @@ def _decode_payload(message_id: int, payload: bytes) -> dict[str, Any] | None:
         latitude, longitude = struct.unpack_from("<ii", payload, 4)
         if not (-900000000 <= latitude <= 900000000 and -1800000000 <= longitude <= 1800000000):
             return None
-        return {"kind": "position", "latitude": latitude / 1e7, "longitude": longitude / 1e7}
+        north_cm_s, east_cm_s = struct.unpack_from("<hh", payload, 20)
+        track_cdeg = struct.unpack_from("<H", payload, 26)[0]
+        return {
+            "kind": "position", "latitude": latitude / 1e7, "longitude": longitude / 1e7,
+            "ground_speed_mps": None if track_cdeg == 0xFFFF else round(math.hypot(north_cm_s, east_cm_s) / 100.0, 2),
+            "ground_track_deg": None if track_cdeg == 0xFFFF else track_cdeg / 100.0,
+        }
+    if message_id == 24 and len(payload) >= 30:  # GPS_RAW_INT
+        fix_type = payload[8]
+        eph = struct.unpack_from("<H", payload, 21)[0]
+        satellites = payload[29]
+        return {
+            "kind": "gps_quality",
+            "satellites": None if satellites == 255 else satellites,
+            "hdop": None if eph == 0xFFFF else eph / 100.0,
+            "fix_valid": fix_type >= 2,
+        }
+    if message_id == 252 and len(payload) >= 18:  # NAMED_VALUE_INT
+        if payload[8:18] != b"BUOY_STATE":
+            return None
+        rear, left, right, flags = struct.unpack_from("<bbbB", payload, 4)
+        mode = flags & 0x07
+        source = (flags >> 3) & 0x03
+        if mode > 3 or source > 2:
+            return None
+        return {
+            "kind": "buoy_state", "mode": ("IDLE", "MANUAL", "HOLD", "GOTO")[mode],
+            "control_source": ("NONE", "WIFI", "TX12")[source],
+            "armed": bool(flags & 0x20), "recording": bool(flags & 0x40),
+            "recovery_stop": bool(flags & 0x80),
+            "motor_pwm": [round(value * 255 / 127) for value in (rear, left, right)],
+        }
+    if message_id == 251 and len(payload) >= 18:  # NAMED_VALUE_FLOAT
+        raw_name = payload[8:18].split(b"\0", 1)[0]
+        try:
+            name = raw_name.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+        if name not in {"WATER_TEMP", "DEPTH_M", "TDS_V", "TURBIDITY"}:
+            return None
+        value = struct.unpack_from("<f", payload, 4)[0]
+        if not math.isfinite(value):
+            return None
+        return {"kind": "science", "name": name, "value": value}
     if message_id == 35 and len(payload) >= 22:  # RC_CHANNELS_RAW, 8 channels per port
         port = payload[20]
         if port not in (0, 1):

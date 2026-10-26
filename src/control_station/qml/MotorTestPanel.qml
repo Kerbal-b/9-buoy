@@ -194,265 +194,226 @@ Item {
         return measuredValue(batteryPower(), "W", 1)
     }
 
-    Rectangle {
+
+    function motorDrive(key) {
+        const field = key === "rear" ? "rearMotorActualDrive" : key === "front_left" ? "frontLeftMotorActualDrive" : "frontRightMotorActualDrive"
+        return Number(backendState[field] || 0)
+    }
+
+    function motorPwm(key) {
+        const field = key === "rear" ? "rearMotorPwm" : key === "front_left" ? "frontLeftMotorPwm" : "frontRightMotorPwm"
+        return backendState[field] === undefined ? -1 : Number(backendState[field])
+    }
+
+    component PanelButton: Button {
+        id: panelButton
+        property bool primary: false
+        property bool danger: false
+        implicitHeight: 34
+        implicitWidth: Math.max(45, buttonLabel.implicitWidth + 20)
+        background: Rectangle {
+            radius: 8
+            color: !panelButton.enabled ? "#172431" : panelButton.danger ? "#5a2b34" : panelButton.primary ? "#175662" : panelButton.hovered ? "#263c4d" : "#1c2d3b"
+            border.color: !panelButton.enabled ? "#263643" : panelButton.danger ? "#a85b66" : panelButton.primary ? "#3c9ca7" : "#385064"
+        }
+        contentItem: Text {
+            id: buttonLabel
+            text: panelButton.text
+            color: !panelButton.enabled ? "#657b8b" : panelButton.danger ? "#ffe3e6" : panelButton.primary ? "#e8ffff" : "#dbe8ef"
+            font.pixelSize: 11
+            font.bold: true
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+    }
+
+    ColumnLayout {
         anchors.fill: parent
-        radius: 12
-        color: "#0b1119"
-        border.color: "#395166"
+        anchors.margins: 18
+        spacing: 12
 
-        ColumnLayout {
-            anchors.fill: parent
-            anchors.margins: 16
-            spacing: 12
-
+        RowLayout {
+            Layout.fillWidth: true
+            ColumnLayout { Layout.fillWidth: true; spacing: 2
+                Text { text: "Propulsion"; color: "#eef5f9"; font.pixelSize: 24; font.bold: true }
+                Text { text: "Motor output, bench controls, and live electrical load"; color: "#91a9b9"; font.pixelSize: 11 }
+            }
             Rectangle {
-                Layout.fillWidth: true
-                Layout.preferredHeight: 208
-                radius: 10
-                color: "#111c28"
-                border.color: "#395166"
-                RowLayout {
-                    anchors.fill: parent
-                    anchors.margins: 12
-                    spacing: 14
-                    Image {
-                        Layout.preferredWidth: 220
-                        Layout.fillHeight: true
-                        source: "../assets/underwater-thruster.png"
-                        sourceSize.width: 500
-                        fillMode: Image.PreserveAspectFit
-                        smooth: true
-                        mipmap: true
-                    }
+                width: 86; height: 24; radius: 12
+                color: root.isConnected() ? "#173b34" : "#3a3030"
+                border.color: root.isConnected() ? "#346e58" : "#68504a"
+                Text { anchors.centerIn: parent; text: root.isConnected() ? "CONNECTED" : "OFFLINE"; color: root.isConnected() ? "#78ddb2" : "#f2bb74"; font.pixelSize: 9; font.bold: true }
+            }
+            PanelButton { text: "STOP ALL MOTORS"; danger: true; enabled: root.isConnected(); onClicked: root.stopAllMotors() }
+        }
+
+        GridLayout {
+            Layout.fillWidth: true
+            columns: 3; columnSpacing: 12; rowSpacing: 0
+            Repeater {
+                model: [
+                    { label: "BATTERY VOLTAGE", value: root.measuredMetric("BATTERY VOLTAGE"), accent: "#75baff" },
+                    { label: "BATTERY CURRENT", value: root.measuredMetric("BATTERY CURRENT"), accent: "#f2bb74" },
+                    { label: "BATTERY POWER", value: root.measuredMetric("BATTERY POWER"), accent: "#78ddb2" }
+                ]
+                delegate: Rectangle {
+                    required property var modelData
+                    Layout.fillWidth: true; Layout.preferredHeight: 88
+                    radius: 14; color: "#111e2a"; border.color: "#2a4051"
                     ColumnLayout {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        spacing: 6
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Text { text: "Propulsion overview"; color: "#e6ecf2"; font.pixelSize: 20; font.bold: true }
-                            Text { Layout.fillWidth: true; text: root.isConnected() ? "Buoy connected" : "Buoy not connected"; color: root.isConnected() ? "#55d6a2" : "#9eb5c7"; font.pixelSize: 11; horizontalAlignment: Text.AlignRight }
-                            Button {
-                                text: "STOP ALL MOTORS"
-                                enabled: root.isConnected()
-                                onClicked: root.stopAllMotors()
-                                background: Rectangle { radius: 7; color: parent.down ? "#752e37" : "#9d3845"; border.color: "#e47b84" }
-                                contentItem: Text { text: parent.text; color: "white"; font.pixelSize: 11; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                            }
-                        }
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Text { text: "BENCH TEST POWER"; color: "#8ca3b5"; font.pixelSize: 10; font.bold: true }
-                            Slider {
-                                id: testPowerSlider
-                                Layout.preferredWidth: 190
-                                from: 1; to: 100; stepSize: 1; value: root.testPowerPercent
-                                enabled: !root.testRunning
-                                onMoved: root.testPowerPercent = Math.round(value)
-                                background: Rectangle { x: testPowerSlider.leftPadding; y: testPowerSlider.topPadding + testPowerSlider.availableHeight / 2 - height / 2; width: testPowerSlider.availableWidth; height: 6; radius: 3; color: "#273746" }
-                                handle: Rectangle { x: testPowerSlider.leftPadding + testPowerSlider.visualPosition * (testPowerSlider.availableWidth - width); y: testPowerSlider.topPadding + testPowerSlider.availableHeight / 2 - height / 2; width: 18; height: 18; radius: 9; color: "#e6ecf2"; border.color: "#5aa8dc" }
-                            }
-                            Text { text: root.testPowerPercent + "%"; color: "#e6ecf2"; font.pixelSize: 12; font.bold: true }
-                            Text { Layout.fillWidth: true; text: "Hold a direction button to test; release to stop."; color: "#829aad"; font.pixelSize: 10; elide: Text.ElideRight }
-                            Button {
-                                text: "Reload settings"
-                                enabled: root.isConnected()
-                                onClicked: root.reloadAllConfigurations()
-                                background: Rectangle { radius: 6; color: parent.down ? "#244a63" : "#1b3448"; border.color: "#55748d" }
-                                contentItem: Text { text: parent.text; color: "#e6ecf2"; font.pixelSize: 10; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                            }
-                        }
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            spacing: 8
-                            Repeater {
-                                model: ["BATTERY VOLTAGE", "BATTERY CURRENT", "BATTERY INPUT POWER"]
-                                delegate: Rectangle {
-                                    required property string modelData
-                                    Layout.fillWidth: true; Layout.fillHeight: true
-                                    radius: 6; color: "#0b131d"; border.color: "#263949"
-                                    ColumnLayout {
-                                        anchors.fill: parent; anchors.margins: 8; spacing: 3
-                                        Text { text: modelData; color: "#7890a3"; font.pixelSize: 9; font.bold: true }
-                                        Text { text: root.measuredMetric(modelData); color: "#e6ecf2"; font.pixelSize: 14; font.bold: true; Layout.fillWidth: true; elide: Text.ElideRight }
-                                        Text { text: String(root.backendState.telemetrySource || "No telemetry source"); color: "#829aad"; font.pixelSize: 9; elide: Text.ElideRight }
-                                    }
-                                }
-                            }
-                        }
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 8
-                            Text { text: "MOTOR CURRENT CALIBRATION"; color: "#7890a3"; font.pixelSize: 9; font.bold: true }
-                            Repeater {
-                                model: ["30%", "50%", "100%"]
-                                delegate: Rectangle {
-                                    required property string modelData
-                                    Layout.fillWidth: true; Layout.preferredHeight: 26
-                                    radius: 5; color: "#17232e"; border.color: "#30465a"
-                                    RowLayout {
-                                        anchors.fill: parent; anchors.leftMargin: 7; anchors.rightMargin: 7
-                                        Text { text: modelData; color: "#c8d5df"; font.pixelSize: 10; font.bold: true }
-                                        Text { Layout.fillWidth: true; text: "No sample"; color: "#829aad"; font.pixelSize: 9; horizontalAlignment: Text.AlignRight }
-                                    }
-                                }
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: "Mission propulsion estimate: awaiting route time and motor current calibration."
-                                color: "#efb76f"; font.pixelSize: 9; elide: Text.ElideRight
-                            }
-                        }
-                        Text {
-                            Layout.fillWidth: true
-                            text: "Starting model: Pprop = Pidle + sum(P100_i * d_i^3); d_i is normalized PWM from min/max/curve. Mission Wh = integral(Pprop dt)/3600. Fit to measured current/speed and route times."
-                            color: "#829aad"; font.pixelSize: 9; wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight
-                        }
+                        anchors.fill: parent; anchors.margins: 13; spacing: 4
+                        Text { text: modelData.label; color: modelData.accent; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1 }
+                        Text { text: modelData.value; color: "#eef5f9"; font.pixelSize: 20; font.bold: true; elide: Text.ElideRight; Layout.fillWidth: true }
                     }
                 }
             }
+        }
 
-            GridLayout {
-                id: motorGrid
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                columns: 3
-                columnSpacing: 12
-                rowSpacing: 0
-                Repeater {
-                    model: root.motorList
-                    delegate: Rectangle {
-                        id: motorCard
-                        required property var modelData
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        Layout.minimumWidth: 245
-                        radius: 11
-                        color: "#111c28"
-                        border.width: root.activeMotorKey === modelData.key ? 2 : 1
-                        border.color: root.activeMotorKey === modelData.key ? "#55d6a2" : "#395166"
+        Rectangle {
+            Layout.fillWidth: true; Layout.preferredHeight: 60
+            radius: 12; color: "#132432"; border.color: "#2a4051"
+            RowLayout {
+                anchors.fill: parent; anchors.margins: 12; spacing: 10
+                ColumnLayout { spacing: 2
+                    Text { text: "BENCH TEST POWER"; color: "#91a9b9"; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1 }
+                    Text { text: "Hold a direction button to run; release to stop."; color: "#dbe8ef"; font.pixelSize: 11 }
+                }
+                Item { Layout.fillWidth: true }
+                Slider {
+                    id: testPowerSlider
+                    Layout.preferredWidth: 175
+                    from: 1; to: 100; stepSize: 1; value: root.testPowerPercent
+                    enabled: !root.testRunning
+                    onMoved: root.testPowerPercent = Math.round(value)
+                    background: Rectangle {
+                        x: testPowerSlider.leftPadding; y: testPowerSlider.topPadding + testPowerSlider.availableHeight / 2 - height / 2
+                        width: testPowerSlider.availableWidth; height: 6; radius: 3; color: "#2a4051"
+                        Rectangle { width: testPowerSlider.visualPosition * parent.width; height: parent.height; radius: 3; color: "#65d4da" }
+                    }
+                    handle: Rectangle { x: testPowerSlider.leftPadding + testPowerSlider.visualPosition * (testPowerSlider.availableWidth - width); y: testPowerSlider.topPadding + testPowerSlider.availableHeight / 2 - height / 2; width: 18; height: 18; radius: 9; color: "#eef5f9"; border.color: "#65d4da" }
+                }
+                Text { text: root.testPowerPercent + "%"; color: "#eef5f9"; font.pixelSize: 15; font.bold: true; Layout.preferredWidth: 44 }
+                PanelButton { text: "Reload"; enabled: root.isConnected(); onClicked: root.reloadAllConfigurations() }
+            }
+        }
 
-                        ColumnLayout {
-                            anchors.fill: parent
-                            anchors.margins: 13
-                            spacing: 8
+        GridLayout {
+            id: motorGrid
+            Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 430
+            columns: 3; columnSpacing: 12; rowSpacing: 0
+            Repeater {
+                model: root.motorList
+                delegate: Rectangle {
+                    id: motorCard
+                    required property var modelData
+                    Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumWidth: 245
+                    radius: 16; color: "#111e2a"
+                    border.width: root.activeMotorKey === modelData.key ? 2 : 1
+                    border.color: root.activeMotorKey === modelData.key ? "#65d4da" : "#2a4051"
 
-                            RowLayout {
-                                Layout.fillWidth: true
-                                Text { text: modelData.label; color: "#80bfff"; font.pixelSize: 14; font.bold: true }
-                                Item { Layout.fillWidth: true }
-                                Text {
-                                    text: root.activeMotorKey === modelData.key
-                                        ? "TESTING " + root.activeDirection.toUpperCase()
-                                        : (root.dirtyProfiles[modelData.key] ? "UNSAVED" : (root.profileFor(modelData.key).loaded ? "LOADED" : "NOT READ"))
-                                    color: root.activeMotorKey === modelData.key ? "#55d6a2" : (root.dirtyProfiles[modelData.key] ? "#efb76f" : "#829aad")
-                                    font.pixelSize: 9; font.bold: true
+                    ColumnLayout {
+                        anchors.fill: parent; anchors.margins: 14; spacing: 10
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Text { text: modelData.label; color: "#75baff"; font.pixelSize: 11; font.bold: true; font.letterSpacing: 1; Layout.fillWidth: true }
+                            Text {
+                                text: root.activeMotorKey === modelData.key ? "RUNNING" : root.dirtyProfiles[modelData.key] ? "EDITED" : root.profileFor(modelData.key).loaded ? "READY" : "NOT READ"
+                                color: root.activeMotorKey === modelData.key ? "#78ddb2" : root.dirtyProfiles[modelData.key] ? "#f2bb74" : "#91a9b9"
+                                font.pixelSize: 9; font.bold: true
+                            }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Text { text: root.motorPwm(modelData.key) < 0 ? "—" : root.motorDrive(modelData.key) + "%"; color: "#eef5f9"; font.pixelSize: 27; font.bold: true }
+                            ColumnLayout { Layout.fillWidth: true; spacing: 1
+                                Text { text: "APPLIED DRIVE"; color: "#91a9b9"; font.pixelSize: 9; font.bold: true }
+                                Text { text: root.motorPwm(modelData.key) < 0 ? "PWM unavailable" : "PWM " + root.motorPwm(modelData.key) + " / 255"; color: "#91a9b9"; font.pixelSize: 10 }
+                            }
+                        }
+                        Rectangle { Layout.fillWidth: true; height: 1; color: "#2a4051" }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Text { text: "Motor orientation"; color: "#dbe8ef"; font.pixelSize: 11; Layout.fillWidth: true }
+                            Text { text: root.profileFor(modelData.key).reversed ? "REVERSED" : "NORMAL"; color: root.profileFor(modelData.key).reversed ? "#f2bb74" : "#78ddb2"; font.pixelSize: 9; font.bold: true }
+                            Switch {
+                                id: orientationSwitch
+                                checked: root.profileFor(modelData.key).reversed
+                                enabled: root.profileFor(modelData.key).loaded && !root.testRunning
+                                onToggled: root.setProfile(modelData.key, "reversed", checked)
+                                indicator: Rectangle {
+                                    implicitWidth: 44; implicitHeight: 22; x: orientationSwitch.leftPadding; y: parent.height / 2 - height / 2
+                                    radius: 11; color: orientationSwitch.checked ? "#8b572d" : "#34495b"; border.color: orientationSwitch.checked ? "#f2bb74" : "#61798c"
+                                    Rectangle { x: orientationSwitch.checked ? parent.width - width - 3 : 3; y: 3; width: 16; height: 16; radius: 8; color: "#f2f6f9" }
                                 }
                             }
-
-                            RowLayout {
-                                Layout.fillWidth: true
-                                Text { text: "MOTOR ORIENTATION"; color: "#aebdca"; font.pixelSize: 10; font.bold: true; Layout.fillWidth: true }
-                                Text { text: root.profileFor(modelData.key).reversed ? "REVERSED" : "NORMAL"; color: root.profileFor(modelData.key).reversed ? "#efb76f" : "#79d3a6"; font.pixelSize: 10; font.bold: true }
-                                Switch {
-                                    id: orientationSwitch
-                                    checked: root.profileFor(modelData.key).reversed
-                                    enabled: root.profileFor(modelData.key).loaded && !root.testRunning
-                                    onToggled: root.setProfile(modelData.key, "reversed", checked)
-                                    indicator: Rectangle {
-                                        implicitWidth: 44; implicitHeight: 22; x: orientationSwitch.leftPadding; y: parent.height / 2 - height / 2
-                                        radius: 11; color: orientationSwitch.checked ? "#8b572d" : "#34495b"; border.color: orientationSwitch.checked ? "#efb76f" : "#61798c"
-                                        Rectangle { x: orientationSwitch.checked ? parent.width - width - 3 : 3; y: 3; width: 16; height: 16; radius: 8; color: "#f2f6f9" }
+                        }
+                        GridLayout {
+                            Layout.fillWidth: true; columns: 2; columnSpacing: 8; rowSpacing: 7
+                            Text { text: "Start PWM"; color: "#91a9b9"; font.pixelSize: 10 }
+                            PwmValueInput { Layout.fillWidth: true; from: root.profileFor(modelData.key).minimum; to: root.profileFor(modelData.key).maximum; value: root.profileFor(modelData.key).startPwm; editable: true; enabled: root.profileFor(modelData.key).loaded && !root.testRunning; onValueModified: root.setProfile(modelData.key, "startPwm", value) }
+                            Text { text: "Minimum PWM"; color: "#91a9b9"; font.pixelSize: 10 }
+                            PwmValueInput { Layout.fillWidth: true; from: 0; to: root.profileFor(modelData.key).maximum; value: root.profileFor(modelData.key).minimum; editable: true; enabled: root.profileFor(modelData.key).loaded && !root.testRunning; onValueModified: root.setProfile(modelData.key, "minimum", value) }
+                            Text { text: "Maximum PWM"; color: "#91a9b9"; font.pixelSize: 10 }
+                            PwmValueInput { Layout.fillWidth: true; from: root.profileFor(modelData.key).minimum; to: 255; value: root.profileFor(modelData.key).maximum; editable: true; enabled: root.profileFor(modelData.key).loaded && !root.testRunning; onValueModified: root.setProfile(modelData.key, "maximum", value) }
+                        }
+                        Rectangle {
+                            Layout.fillWidth: true; Layout.preferredHeight: 84
+                            radius: 9; color: "#0c1823"; border.color: "#2a4051"
+                            Column {
+                                anchors.fill: parent; anchors.margins: 10; spacing: 5
+                                Text { text: "PWM OPERATING BAND"; color: "#91a9b9"; font.pixelSize: 9; font.bold: true }
+                                Item {
+                                    width: parent.width; height: 15
+                                    Rectangle { anchors.verticalCenter: parent.verticalCenter; width: parent.width; height: 5; radius: 3; color: "#2a4051" }
+                                    Rectangle {
+                                        anchors.verticalCenter: parent.verticalCenter; height: 5; radius: 3
+                                        x: root.profileFor(modelData.key).minimum / 255 * parent.width
+                                        width: Math.max(2, (root.profileFor(modelData.key).maximum - root.profileFor(modelData.key).minimum) / 255 * parent.width)
+                                        color: "#236d76"
+                                    }
+                                    Rectangle {
+                                        x: Math.max(0, Math.min(parent.width - width, root.motorPwm(modelData.key) / 255 * parent.width - width / 2))
+                                        y: 0; width: 5; height: 15; radius: 2; color: "#65d4da"
+                                        visible: root.motorPwm(modelData.key) >= 0
                                     }
                                 }
-                            }
-
-                            Rectangle { Layout.fillWidth: true; height: 1; color: "#263949" }
-
-                            GridLayout {
-                                Layout.fillWidth: true
-                                columns: 2
-                                columnSpacing: 9
-                                rowSpacing: 5
-                                Text { text: "Start PWM"; color: "#aebdca"; font.pixelSize: 11 }
-                                PwmValueInput {
-                                    Layout.fillWidth: true; from: root.profileFor(modelData.key).minimum; to: root.profileFor(modelData.key).maximum
-                                    value: root.profileFor(modelData.key).startPwm; editable: true; enabled: root.profileFor(modelData.key).loaded && !root.testRunning
-                                    onValueModified: root.setProfile(modelData.key, "startPwm", value)
-                                }
-                                Text { text: "Minimum PWM"; color: "#aebdca"; font.pixelSize: 11 }
-                                PwmValueInput {
-                                    Layout.fillWidth: true; from: 0; to: root.profileFor(modelData.key).maximum
-                                    value: root.profileFor(modelData.key).minimum; editable: true; enabled: root.profileFor(modelData.key).loaded && !root.testRunning
-                                    onValueModified: root.setProfile(modelData.key, "minimum", value)
-                                }
-                                Text { text: "Maximum PWM"; color: "#aebdca"; font.pixelSize: 11 }
-                                PwmValueInput {
-                                    Layout.fillWidth: true; from: root.profileFor(modelData.key).minimum; to: 255
-                                    value: root.profileFor(modelData.key).maximum; editable: true; enabled: root.profileFor(modelData.key).loaded && !root.testRunning
-                                    onValueModified: root.setProfile(modelData.key, "maximum", value)
+                                RowLayout {
+                                    width: parent.width
+                                    Text { text: "Min " + root.profileFor(modelData.key).minimum; color: "#91a9b9"; font.pixelSize: 9; Layout.fillWidth: true }
+                                    Text { text: "Curve " + Number(root.profileFor(modelData.key).curve).toFixed(1) + " · Ramp " + Number(root.profileFor(modelData.key).rampSeconds).toFixed(1) + "s"; color: "#91a9b9"; font.pixelSize: 9 }
                                 }
                             }
-
-                            RowLayout {
-                                Layout.fillWidth: true
-                                Layout.topMargin: 2
-                                Button {
-                                    Layout.fillWidth: true
-                                    text: "REVERSE"
-                                    enabled: root.isConnected() && root.profileFor(modelData.key).loaded && !root.dirtyProfiles[modelData.key] && (!root.activeMotorKey || (root.activeMotorKey === modelData.key && root.activeDirection === "reverse"))
-                                    onPressed: root.beginMotorTest(modelData.key, -1)
-                                    onReleased: root.endMotorTest(modelData.key, "released")
-                                    onCanceled: root.endMotorTest(modelData.key, "canceled")
-                                    background: Rectangle { radius: 6; color: parent.down ? "#74363b" : "#552a31"; border.color: "#b65962" }
-                                    contentItem: Text { text: parent.text; color: "#ffe9eb"; font.pixelSize: 11; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                                }
-                                Button {
-                                    Layout.fillWidth: true
-                                    text: "FORWARD"
-                                    enabled: root.isConnected() && root.profileFor(modelData.key).loaded && !root.dirtyProfiles[modelData.key] && (!root.activeMotorKey || (root.activeMotorKey === modelData.key && root.activeDirection === "forward"))
-                                    onPressed: root.beginMotorTest(modelData.key, 1)
-                                    onReleased: root.endMotorTest(modelData.key, "released")
-                                    onCanceled: root.endMotorTest(modelData.key, "canceled")
-                                    background: Rectangle { radius: 6; color: parent.down ? "#23604d" : "#174536"; border.color: "#3e9473" }
-                                    contentItem: Text { text: parent.text; color: "#e4fff3"; font.pixelSize: 11; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                                }
+                        }
+                        Item { Layout.fillHeight: true }
+                        RowLayout {
+                            Layout.fillWidth: true; spacing: 7
+                            PanelButton {
+                                Layout.fillWidth: true; text: "REVERSE"; danger: true
+                                enabled: root.isConnected() && root.profileFor(modelData.key).loaded && !root.dirtyProfiles[modelData.key] && (!root.activeMotorKey || (root.activeMotorKey === modelData.key && root.activeDirection === "reverse"))
+                                onPressed: root.beginMotorTest(modelData.key, -1)
+                                onReleased: root.endMotorTest(modelData.key, "released")
+                                onCanceled: root.endMotorTest(modelData.key, "canceled")
                             }
-
-                            Rectangle {
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: 42
-                                radius: 6
-                                color: "#0b131d"
-                                border.color: "#263949"
-                                ColumnLayout {
-                                    anchors.fill: parent; anchors.leftMargin: 9; anchors.rightMargin: 9; anchors.topMargin: 4; anchors.bottomMargin: 4; spacing: 1
-                                    Text { text: "APPLIED OUTPUT"; color: "#7890a3"; font.pixelSize: 9; font.bold: true }
-                                    Text { text: root.motorTelemetry(modelData.key); color: "#d5e3ec"; font.pixelSize: 11; elide: Text.ElideRight; Layout.fillWidth: true }
-                                }
+                            PanelButton {
+                                Layout.fillWidth: true; text: "FORWARD"; primary: true
+                                enabled: root.isConnected() && root.profileFor(modelData.key).loaded && !root.dirtyProfiles[modelData.key] && (!root.activeMotorKey || (root.activeMotorKey === modelData.key && root.activeDirection === "forward"))
+                                onPressed: root.beginMotorTest(modelData.key, 1)
+                                onReleased: root.endMotorTest(modelData.key, "released")
+                                onCanceled: root.endMotorTest(modelData.key, "canceled")
                             }
-
-                            RowLayout {
-                                Layout.fillWidth: true
-                                Button {
-                                    text: "Apply to buoy"
-                                    enabled: root.isConnected() && root.profileFor(modelData.key).loaded && !root.testRunning
-                                    onClicked: root.saveProfile(modelData.key)
-                                    background: Rectangle { radius: 6; color: parent.enabled ? (parent.down ? "#244a63" : "#1b3448") : "#17232e"; border.color: parent.enabled ? "#55748d" : "#2d3e4b" }
-                                    contentItem: Text { text: parent.text; color: parent.enabled ? "#e6ecf2" : "#71889b"; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                                }
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: root.dirtyProfiles[modelData.key] ? "Apply changes before testing" : (root.profileFor(modelData.key).loaded ? "Saved settings" : "Read settings from buoy")
-                                    color: root.dirtyProfiles[modelData.key] ? "#efb76f" : "#829aad"; font.pixelSize: 9; elide: Text.ElideRight
-                                }
-                            }
+                        }
+                        Rectangle { Layout.fillWidth: true; height: 1; color: "#2a4051" }
+                        RowLayout {
+                            Layout.fillWidth: true; spacing: 8
+                            PanelButton { text: "Apply to buoy"; enabled: root.isConnected() && root.profileFor(modelData.key).loaded && !root.testRunning; onClicked: root.saveProfile(modelData.key) }
+                            Text { text: root.dirtyProfiles[modelData.key] ? "Changes pending" : root.profileFor(modelData.key).loaded ? "RAM only" : "Read settings"; color: root.dirtyProfiles[modelData.key] ? "#f2bb74" : "#91a9b9"; font.pixelSize: 10; Layout.fillWidth: true; horizontalAlignment: Text.AlignRight }
                         }
                     }
                 }
             }
         }
+
+        Text { Layout.fillWidth: true; text: "Motor settings are currently applied in buoy RAM and reset on reboot. An SD profile and GPS/heading based water calibration are planned."; color: "#91a9b9"; font.pixelSize: 10; wrapMode: Text.WordWrap }
     }
 
     Connections {

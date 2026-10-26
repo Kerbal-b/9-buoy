@@ -12,16 +12,68 @@ ApplicationWindow {
 
     readonly property var s: backend.state
     readonly property string buoyCanvasKey: [
+        s.controlInputMode,
         s.turn, s.thrust, s.yaw,
         s.frontLeftMotor, s.frontLeftMotorPwm,
         s.frontRightMotor, s.frontRightMotorPwm,
         s.rearMotor, s.rearMotorPwm,
-        s.motorOutputTelemetry
+        s.rearMotorActualDrive, s.frontLeftMotorActualDrive, s.frontRightMotorActualDrive,
+        s.motorOutputTelemetry, JSON.stringify(s.radioBuoyState || {})
     ].join("|")
     onBuoyCanvasKeyChanged: if (buoyCanvas) buoyCanvas.requestPaint()
 
     function clamp(v, minv, maxv) {
         return Math.max(minv, Math.min(maxv, v))
+    }
+
+    function hasObservedMotorOutput() {
+        return Boolean(s.motorOutputTelemetry) || Boolean(s.radioBuoyState && s.radioBuoyState.motor_pwm)
+    }
+
+    function displayMotorDrive(index) {
+        if (s.motorOutputTelemetry) {
+            const values = [s.rearMotorActualDrive, s.frontLeftMotorActualDrive, s.frontRightMotorActualDrive]
+            const value = Number(values[index]) || 0
+            const pwm = Math.max(0, Number([s.rearMotorPwm, s.frontLeftMotorPwm, s.frontRightMotorPwm][index]) || 0)
+            return value === 0 || pwm === 0 ? 0 : Math.sign(value) * Math.max(1, Math.round(pwm * 100 / 255))
+        }
+        if (s.radioBuoyState && s.radioBuoyState.motor_pwm) {
+            const value = Number(s.radioBuoyState.motor_pwm[index]) || 0
+            return value === 0 ? 0 : Math.sign(value) * Math.max(1, Math.round(Math.abs(value) * 100 / 255))
+        }
+        if (s.controlInputMode === "keyboard") {
+            return Number([s.rearMotor, s.frontLeftMotor, s.frontRightMotor][index]) || 0
+        }
+        return 0
+    }
+
+    function displayMotorPwm(index) {
+        if (s.motorOutputTelemetry) {
+            return Number([s.rearMotorPwm, s.frontLeftMotorPwm, s.frontRightMotorPwm][index])
+        }
+        if (s.radioBuoyState && s.radioBuoyState.motor_pwm) {
+            return Math.abs(Number(s.radioBuoyState.motor_pwm[index]) || 0)
+        }
+        return -1
+    }
+
+    function displayMotion() {
+        if (!hasObservedMotorOutput()) {
+            return { turn: Number(s.turn) || 0, thrust: Number(s.thrust) || 0, yaw: Number(s.yaw) || 0 }
+        }
+        // Invert the active three-motor mix to estimate the commanded motion
+        // represented by the observed output. Saturation makes this approximate.
+        const rear = displayMotorDrive(0) / 100
+        const left = displayMotorDrive(1) / 100
+        const right = displayMotorDrive(2) / 100
+        const turn = (rear + (left - right) / 2) / 2
+        const thrust = (left + right) / (8 * 0.8660254 / 3)
+        const yaw = rear - 4 * turn / 3
+        return {
+            turn: Math.round(clamp(turn * 100, -100, 100)),
+            thrust: Math.round(clamp(thrust * 100, -100, 100)),
+            yaw: Math.round(clamp(yaw * 100, -100, 100))
+        }
     }
 
     function keyName(key) {
@@ -37,8 +89,9 @@ ApplicationWindow {
         if (tab === "power") return 2
         if (tab === "motors") return 3
         if (tab === "navigation") return 4
-        if (tab === "instrument_debug") return 5
-        if (tab === "sd_debug") return 6
+        if (tab === "missions") return 5
+        if (tab === "instrument_debug") return 6
+        if (tab === "sd_debug") return 7
         return 0
     }
 
@@ -47,8 +100,9 @@ ApplicationWindow {
         if (index === 2) return "power"
         if (index === 3) return "motors"
         if (index === 4) return "navigation"
-        if (index === 5) return "instrument_debug"
-        if (index === 6) return "sd_debug"
+        if (index === 5) return "missions"
+        if (index === 6) return "instrument_debug"
+        if (index === 7) return "sd_debug"
         return "overview"
     }
 
@@ -80,7 +134,7 @@ ApplicationWindow {
 
     function batteryIsDischarging() {
         const value = currentDrawValue()
-        return Number.isFinite(value) && value < 0
+        return Number.isFinite(value) && value > 0.05
     }
 
     function batteryPercentText() {
@@ -139,7 +193,10 @@ ApplicationWindow {
         Text {
             x: 20
             y: 50
-            text: "LATERAL  " + s.turn + "%    |    THRUST  " + s.thrust + "%    |    YAW  " + (s.yaw || 0) + "%"
+            text: (window.hasObservedMotorOutput() ? "MOTOR OUTPUT EST.  "
+                  : (s.controlInputMode === "tx12" ? "TX12 OUTPUT UNKNOWN  " : "KEYBOARD REQUEST  "))
+                  + "LATERAL " + window.displayMotion().turn + "%  |  THRUST "
+                  + window.displayMotion().thrust + "%  |  YAW " + window.displayMotion().yaw + "%"
             color: "#7f99ad"
             font.pixelSize: 11
             font.bold: true
@@ -193,9 +250,10 @@ ApplicationWindow {
 
                 const cx = width / 2
                 const hullCy = height * 0.45
-                const turn = clamp(s.turn / 100.0, -1, 1)
-                const thrust = clamp(s.thrust / 100.0, -1, 1)
-                const yaw = clamp((Number(s.yaw) || 0) / 100.0, -1, 1)
+                const motion = window.displayMotion()
+                const turn = clamp(motion.turn / 100.0, -1, 1)
+                const thrust = clamp(motion.thrust / 100.0, -1, 1)
+                const yaw = clamp(motion.yaw / 100.0, -1, 1)
                 const frontOffsetX = Math.min(100, width * 0.23)
                 const frontOffsetY = 40
                 const rearOffsetY = 95
@@ -382,11 +440,11 @@ ApplicationWindow {
                 ctx.lineCap = "butt"
 
                 drawPowerLink([cx - 34, hullCy - 45], frontLeft,
-                              s.frontLeftMotor || 0, s.frontLeftMotorPwm)
+                              window.displayMotorDrive(1), window.displayMotorPwm(1))
                 drawPowerLink([cx + 34, hullCy - 45], frontRight,
-                              s.frontRightMotor || 0, s.frontRightMotorPwm)
+                              window.displayMotorDrive(2), window.displayMotorPwm(2))
                 drawPowerLink([cx, hullCy + 58], rear,
-                              s.rearMotor || 0, s.rearMotorPwm)
+                              window.displayMotorDrive(0), window.displayMotorPwm(0))
 
                 // Yaw is rotational, so visualize it independently from the
                 // blue translation vector as a direction-aware arc on the hull.
@@ -461,21 +519,21 @@ ApplicationWindow {
                 ctx.textBaseline = "middle"
                 ctx.font = "bold 9px sans-serif"
                 ctx.fillStyle = yawMagnitude > 0.005 ? "#d8b8ff" : "#60788d"
-                ctx.fillText("YAW " + signedValue(Number(s.yaw) || 0) + "%", cx, hullCy + 41)
+                ctx.fillText("YAW " + signedValue(motion.yaw) + "%", cx, hullCy + 41)
 
                 drawMotorDuct(frontLeft, 0.5, 0.8660254,
-                              s.frontLeftMotor || 0, s.frontLeftMotorPwm,
+                              window.displayMotorDrive(1), window.displayMotorPwm(1),
                               "FRONT LEFT", frontLeft[0], frontLeft[1] - 58)
                 drawMotorDuct(frontRight, -0.5, 0.8660254,
-                              s.frontRightMotor || 0, s.frontRightMotorPwm,
+                              window.displayMotorDrive(2), window.displayMotorPwm(2),
                               "FRONT RIGHT", frontRight[0], frontRight[1] - 58)
                 drawMotorDuct(rear, 1.0, 0.0,
-                              s.rearMotor || 0, s.rearMotorPwm,
+                              window.displayMotorDrive(0), window.displayMotorPwm(0),
                               "REAR / WATER LEFT", rear[0], rear[1] + 34)
 
-                const rearPwm = Math.max(0, Math.round(Number(s.rearMotorPwm) || 0))
-                const leftPwm = Math.max(0, Math.round(Number(s.frontLeftMotorPwm) || 0))
-                const rightPwm = Math.max(0, Math.round(Number(s.frontRightMotorPwm) || 0))
+                const rearPwm = Math.max(0, Math.round(window.displayMotorPwm(0) || 0))
+                const leftPwm = Math.max(0, Math.round(window.displayMotorPwm(1) || 0))
+                const rightPwm = Math.max(0, Math.round(window.displayMotorPwm(2) || 0))
                 const activeMotors = (rearPwm > 0 ? 1 : 0) + (leftPwm > 0 ? 1 : 0) + (rightPwm > 0 ? 1 : 0)
                 const totalPwm = rearPwm + leftPwm + rightPwm
                 const measuredCurrent = currentDrawValue()
@@ -484,7 +542,7 @@ ApplicationWindow {
                 ctx.textAlign = "left"
                 ctx.textBaseline = "middle"
                 ctx.fillStyle = "#71899b"
-                let demandText = Boolean(s.motorOutputTelemetry)
+                let demandText = window.hasObservedMotorOutput()
                     ? activeMotors + " ACTIVE  |  ACTUAL PWM " + totalPwm
                     : "WAITING FOR MOTOR OUTPUT"
                 if (Number.isFinite(measuredCurrent)) demandText += "  |  " + Math.abs(measuredCurrent).toFixed(1) + " A"
@@ -548,14 +606,13 @@ ApplicationWindow {
 
                 Repeater {
                     model: [
-                        { key: "keyboard", label: "Keyboard" },
-                        { key: "controller", label: "Controller" },
-                        { key: "auto", label: "Auto" }
+                        { key: "tx12", label: "TX12 radio" },
+                        { key: "keyboard", label: "Wi-Fi keyboard" }
                     ]
 
                     delegate: Rectangle {
                         required property var modelData
-                        width: (parent.width - 12) / 3
+                        width: (parent.width - 6) / 2
                         height: parent.height
                         radius: 8
                         color: s.controlInputMode === modelData.key ? "#1d5270" : "#172331"
@@ -755,8 +812,9 @@ ApplicationWindow {
             TabButton { text: "Overview"; font.pixelSize: 12 }
             TabButton { text: "Communications"; font.pixelSize: 12 }
             TabButton { text: "Power"; font.pixelSize: 12 }
-            TabButton { text: "Motor Test"; font.pixelSize: 12 }
+            TabButton { text: "Propulsion"; font.pixelSize: 12 }
             TabButton { text: "Navigation"; font.pixelSize: 12 }
+            TabButton { text: "Mission"; font.pixelSize: 12 }
             TabButton { text: "Instrument Debugging"; font.pixelSize: 12 }
             TabButton { text: "SD Card"; font.pixelSize: 12 }
         }
@@ -785,6 +843,7 @@ ApplicationWindow {
             PowerPanel {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+                backendObject: backend
                 backendState: s
             }
 
@@ -796,7 +855,14 @@ ApplicationWindow {
                 backendState: s
             }
 
-            NavigationTestPanel {
+            NavigationDashboardPanel {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                backendObject: backend
+                backendState: s
+            }
+
+            MissionHubPanel {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 backendObject: backend

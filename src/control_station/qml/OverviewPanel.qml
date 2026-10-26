@@ -10,7 +10,7 @@ Item {
         { title: "Communications", tab: "communications" },
         { title: "Power", tab: "power" },
         { title: "Instruments", tab: "instrument_debug" },
-        { title: "Movement", tab: "motors" },
+        { title: "Propulsion", tab: "motors" },
         { title: "Navigation", tab: "navigation" },
         { title: "SD Card", tab: "sd_debug" }
     ]

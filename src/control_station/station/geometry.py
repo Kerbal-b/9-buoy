@@ -3,8 +3,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .controller import clamp_unit
 from .models import ManualCommand
+
+
+def clamp_unit(value: float) -> float:
+    return max(-1.0, min(1.0, value))
 
 
 MOTOR_OUTPUT_BOOST = 2.0
@@ -49,7 +52,7 @@ def build_manual_command(
     yaw: float = 0.0,
     motor_mix: MotorMixGeometry = ACTIVE_MOTOR_MIX,
 ) -> ManualCommand:
-    # Inputs are already -1 to 1 from controller
+    # Inputs are normalized to -1..1 by the explicit Wi-Fi keyboard mode.
     raw_x = turn
     raw_y = thrust
     

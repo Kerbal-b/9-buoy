@@ -10,6 +10,9 @@
 #include <math.h>
 #include <driver/i2s.h>
 #include <esp_timer.h>
+#include <lwip/sockets.h>
+#include <stdlib.h>
+#include <string.h>
 #include "elrs_link.h"
 #include "firmware_version.h"
 #if __has_include(<esp_arduino_version.h>)
@@ -45,6 +48,7 @@ const int I2S_BCLK_PIN = 5;
 const int I2S_WS_PIN = 4;
 const int I2S_DATA_IN_PIN = 36;  // VP / GPIO36
 const uint8_t MPU6050_I2C_ADDRESS = 0x68;
+const uint8_t QMC5883_I2C_ADDRESS = 0x0D;
 const uint8_t MPU6050_REG_PWR_MGMT_1 = 0x6B;
 const uint8_t MPU6050_REG_ACCEL_CONFIG = 0x1C;
 const uint8_t MPU6050_REG_GYRO_CONFIG = 0x1B;
@@ -79,7 +83,7 @@ const uint32_t AUDIO_PRIORITY_SENSOR_INTERVAL_MS = 30000;
 const int GPS_RX_PIN = 16;
 const int GPS_TX_PIN = -1;  // Receive-only; GPIO17 is the SD clock.
 
-const long GPS_BAUDRATE = 9600;
+const long GPS_BAUDRATE = 115200;
 const char* const WIFI_STA_SSID = "Bouy";
 const char* const WIFI_STA_PASSWORD = "SuperMonkey";
 const uint16_t WIFI_TCP_PORT = 5000;
@@ -90,13 +94,14 @@ const uint16_t WIFI_SD_FILE_PORT = 5003;
 const float ADC_REFERENCE_VOLTAGE = 3.3;
 const float ADC_COUNTS = 4095.0;
 const float ACS712_SENSITIVITY_VOLTS_PER_AMP = 0.066;  // 30A module
-const float BATTERY_SENSOR_MAX_VOLTAGE = 16.52f;  // Calibrated to match measured pack voltage at the ADC
+const float BATTERY_SENSOR_MAX_VOLTAGE = 16.72f;  // 12.39 V pack at 2.445 V on ADS1115 A1
 const float BATTERY_FULL_VOLTAGE = 12.6;
 const float BATTERY_EMPTY_VOLTAGE = 9.6;
 const int CURRENT_SENSOR_SAMPLE_COUNT = 8;
 const int BATTERY_VOLTAGE_SAMPLE_COUNT = 4;
 const int CURRENT_SENSOR_ZERO_CALIBRATION_SAMPLES = 64;
 const float CURRENT_SENSOR_NOISE_FLOOR_AMPS = 0.15;
+const float CURRENT_SENSOR_STARTUP_LOAD_AMPS = 0.21f;  // Measured at battery feed with motors off
 
 const int MOTOR_OUTPUT_LIMIT = 255;
 const int VECTOR_SCALE = 100;
@@ -106,10 +111,11 @@ const uint32_t MOTOR_RAMP_INTERVAL_MS = 20;
 const int MOTOR_RAMP_UP_PER_SECOND = 120;
 const int MOTOR_RAMP_DOWN_PER_SECOND = 200;
 const uint32_t MOTOR_COMMAND_WATCHDOG_MS = 1000;
-const int ELRS_MOTOR_POWER_LIMIT_PERCENT = 50;
+const int ELRS_MOTOR_POWER_LIMIT_PERCENT = 100;
 const uint32_t ELRS_TELEMETRY_INTERVAL_MS = 1000;
 const uint32_t ELRS_BATTERY_INTERVAL_MS = 5000;
 const uint32_t ELRS_GPS_INTERVAL_MS = 5000;
+const uint32_t ELRS_SCIENCE_INTERVAL_MS = 1000;
 
 const int PWM_FREQ_HZ = 20000;
 const int PWM_RES_BITS = 8;
@@ -128,8 +134,10 @@ const uint32_t WATER_CHEMISTRY_STREAM_INTERVAL_MS = 2000;
 const uint32_t POWER_STREAM_INTERVAL_MS = 500;
 const uint32_t STATE_STREAM_INTERVAL_MS = 500;
 const uint32_t MOTOR_OUTPUT_STREAM_INTERVAL_MS = 100;
+const uint32_t ELRS_CHANNEL_STREAM_INTERVAL_MS = 100;
 const uint32_t GPS_STREAM_INTERVAL_MS = 500;
-const size_t TCP_COMMAND_BUFFER_LIMIT = 96;
+const uint32_t MAGNETOMETER_STREAM_INTERVAL_MS = 500;
+const size_t TCP_COMMAND_BUFFER_LIMIT = 600;
 const i2s_port_t AUDIO_I2S_PORT = I2S_NUM_0;
 const uint32_t AUDIO_DEFAULT_SAMPLE_RATE = 16000;
 const size_t AUDIO_FRAME_SAMPLES = 256;
@@ -181,6 +189,12 @@ struct ImuReadings {
   float temperatureC;
 };
 
+struct MagnetometerReadings {
+  int16_t x;
+  int16_t y;
+  int16_t z;
+};
+
 enum ControlMode {
   CONTROL_MODE_IDLE,
   CONTROL_MODE_MANUAL,
@@ -194,6 +208,7 @@ enum PacketType : uint8_t {
   PACKET_TYPE_POWER = 3,
   PACKET_TYPE_STATE = 4,
   PACKET_TYPE_GPS = 5,
+  PACKET_TYPE_ELRS_CHANNELS = 6,
   PACKET_TYPE_AUDIO = 10,
 };
 
@@ -233,6 +248,10 @@ struct __attribute__((packed)) GpsPacketPayload {
   int32_t lonE7;
 };
 
+struct __attribute__((packed)) ElrsChannelsPacketPayload {
+  uint16_t channels[16];
+};
+
 struct __attribute__((packed)) RangePacketPayload {
   uint16_t distanceMm;
   uint8_t valid;
@@ -268,9 +287,9 @@ struct __attribute__((packed)) AudioIndexRecord {
 MotorChannel motors[] = {
   // Rear motor is the first tuning target. Adjust these values before
   // changing the front motors if the drivetrain is being balanced.
-  {REAR_IN1_PIN, REAR_IN2_PIN, REAR_IN1_PWM_CHANNEL, REAR_IN2_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, true, 0, 171, 171, 260, 260, 130, 130, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 125, 125},
-  {FRONT_LEFT_IN1_PIN, FRONT_LEFT_IN2_PIN, FRONT_LEFT_IN1_PWM_CHANNEL, FRONT_LEFT_IN2_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, true, 0, 171, 171, 260, 260, 130, 130, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 125, 125},
-  {FRONT_RIGHT_IN1_PIN, FRONT_RIGHT_IN2_PIN, FRONT_RIGHT_IN1_PWM_CHANNEL, FRONT_RIGHT_IN2_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, false, 0, 171, 171, 260, 260, 130, 130, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 125, 125},
+  {REAR_IN1_PIN, REAR_IN2_PIN, REAR_IN1_PWM_CHANNEL, REAR_IN2_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, false, 0, 171, 171, 260, 260, 130, 130, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 125, 125},
+  {FRONT_LEFT_IN1_PIN, FRONT_LEFT_IN2_PIN, FRONT_LEFT_IN1_PWM_CHANNEL, FRONT_LEFT_IN2_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, false, 0, 171, 171, 260, 260, 130, 130, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 125, 125},
+  {FRONT_RIGHT_IN1_PIN, FRONT_RIGHT_IN2_PIN, FRONT_RIGHT_IN1_PWM_CHANNEL, FRONT_RIGHT_IN2_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, true, 0, 171, 171, 260, 260, 130, 130, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 125, 125},
 };
 
 const int MOTOR_COUNT = sizeof(motors) / sizeof(motors[0]);
@@ -307,12 +326,26 @@ ElrsLink elrs(elrsSerial);
 
 enum ControlSource { CONTROL_SOURCE_NONE, CONTROL_SOURCE_WIFI, CONTROL_SOURCE_ELRS };
 ControlSource controlSource = CONTROL_SOURCE_NONE;
+enum TelemetryMode { TELEMETRY_MODE_WIFI, TELEMETRY_MODE_MAVLINK };
+TelemetryMode telemetryMode = TELEMETRY_MODE_WIFI;
 bool elrsArmReady = false;
 bool elrsArmed = false;
+bool magnetometerAvailable = false;
+bool magnetometerCalibrationLoaded = false;
+float magnetometerOffsetX = 0.0f;
+float magnetometerOffsetY = 0.0f;
+float magnetometerScaleX = 1.0f;
+float magnetometerScaleY = 1.0f;
+bool missionModeRequested = false;
+bool manualLinkLossStop = false;
+uint32_t elrsFailsafeCount = 0;
+String lastElrsFailsafeStatus = "NONE";
 uint32_t lastElrsAppliedRcMs = 0;
 uint32_t lastElrsTelemetryMs = 0;
 uint32_t lastElrsBatteryMs = 0;
 uint32_t lastElrsGpsMs = 0;
+uint32_t lastElrsScienceMs = 0;
+uint8_t elrsScienceField = 0;
 
 double gpsLatitude = 0.0;
 double gpsLongitude = 0.0;
@@ -327,6 +360,35 @@ bool holdPositionEnabled = false;
 bool targetLocationSet = false;
 float targetLatitude = 0.0;
 float targetLongitude = 0.0;
+const uint8_t MAX_MISSION_WAYPOINTS = 64;
+const uint8_t MAX_MISSION_BOUNDARY_POINTS = 64;
+struct MissionCoordinate { float latitude; float longitude; };
+struct MissionWaypoint { float latitude; float longitude; uint16_t measurementMask; bool collectData; uint16_t holdSeconds; uint8_t speedPercent; };
+struct MissionMetadata {
+  bool hasHome = false;
+  bool hasEnd = false;
+  MissionCoordinate home = {};
+  MissionCoordinate end = {};
+  uint8_t boundaryCount = 0;
+  MissionCoordinate boundary[MAX_MISSION_BOUNDARY_POINTS] = {};
+};
+MissionWaypoint missionWaypoints[MAX_MISSION_WAYPOINTS] = {};
+MissionWaypoint stagedMissionWaypoints[MAX_MISSION_WAYPOINTS] = {};
+MissionMetadata missionMetadata;
+MissionMetadata stagedMissionMetadata;
+uint8_t missionWaypointCount = 0;
+uint8_t stagedMissionWaypointCount = 0;
+uint64_t stagedMissionWaypointMask = 0;
+uint64_t stagedMissionBoundaryMask = 0;
+uint8_t stagedMissionBoundaryCount = 0;
+bool stagedMissionHasHome = false;
+bool stagedMissionHasEnd = false;
+bool stagedMissionHomeReceived = false;
+bool stagedMissionEndReceived = false;
+bool missionUploadInProgress = false;
+char missionId[37] = "";
+char stagedMissionId[37] = "";
+char runningMissionId[37] = "";
 
 float currentSensorZeroVoltage = ADC_REFERENCE_VOLTAGE / 2.0;
 bool mpu6050Available = false;
@@ -340,11 +402,19 @@ volatile uint32_t audioSampleRateHz = AUDIO_DEFAULT_SAMPLE_RATE;
 bool ads1115Available = false;
 WiFiServer tcpServer(WIFI_TCP_PORT);
 WiFiClient tcpClient;
+// Queue TCP telemetry so a weak Wi-Fi connection cannot stall ELRS control.
+constexpr size_t TCP_TELEMETRY_BUFFER_SIZE = 4096;
+char tcpTelemetryBuffer[TCP_TELEMETRY_BUFFER_SIZE];
+size_t tcpTelemetryBuffered = 0;
 WiFiServer sdFileServer(WIFI_SD_FILE_PORT);
 WiFiClient sdFileClient;
 WiFiUDP udpTelemetry;
 IPAddress udpRemoteIp(0, 0, 0, 0);
 String tcpCommandBuffer;
+File missionUploadFile;
+uint32_t missionUploadExpectedBytes = 0;
+uint32_t missionUploadExpectedCrc = 0;
+uint32_t missionUploadReceivedBytes = 0;
 uint16_t udpPacketSequence = 0;
 uint16_t udpAudioPacketSequence = 0;
 bool ledState = false;
@@ -357,7 +427,10 @@ uint32_t lastWaterChemistryStreamMs = 0;
 uint32_t lastPowerStreamMs = 0;
 uint32_t lastStateStreamMs = 0;
 uint32_t lastMotorOutputStreamMs = 0;
+uint32_t lastElrsChannelStreamMs = 0;
 uint32_t lastGpsStreamMs = 0;
+uint32_t lastMagnetometerStreamMs = 0;
+uint32_t lastMagnetometerRetryMs = 0;
 uint32_t lastDs18b20RequestMs = 0;
 uint32_t lastSerialSensorTestMs = 0;
 uint32_t lastMotorRampUpdateMs = 0;
@@ -419,6 +492,9 @@ float latestCurrentAmps = 0.0f;
 
 bool readMpu6050(ImuReadings& readings);
 bool setupMpu6050();
+bool setupQmc5883();
+bool readQmc5883(MagnetometerReadings& readings);
+void emitMagnetometerTelemetry();
 bool setupDs18b20();
 void updateDs18b20Sensor(uint32_t nowMs);
 void emitWaterTemperatureTelemetry();
@@ -442,6 +518,10 @@ void sendMotorOutputTelemetry();
 void sendUdpGpsTelemetry();
 void sendUdpAudioPacket(const int16_t* samples, uint16_t frameCount);
 bool mountSdCard();
+bool saveMissionToSd(const char* id, const MissionWaypoint* points, uint8_t count, const MissionMetadata* metadata = nullptr);
+bool loadMissionFromSd(const char* id);
+bool loadSelectedMissionFromSd();
+void emitMissionList();
 bool startSdRecorder(const String& startUtc);
 bool saveSdRecorder(const String& saveUtc);
 void serviceSdRecorder(uint32_t nowMs);
@@ -560,6 +640,426 @@ bool mountSdCard() {
   return true;
 }
 
+bool validMagnetometerCalibration(float offsetX, float offsetY, float scaleX, float scaleY) {
+  return isfinite(offsetX) && isfinite(offsetY) && isfinite(scaleX) && isfinite(scaleY) &&
+    fabsf(offsetX) <= 32768.0f && fabsf(offsetY) <= 32768.0f &&
+    scaleX >= 0.1f && scaleX <= 10.0f && scaleY >= 0.1f && scaleY <= 10.0f;
+}
+
+bool readMagnetometerCalibrationFile(const char* path, float& offsetX, float& offsetY, float& scaleX, float& scaleY) {
+  File file = SD.open(path, FILE_READ);
+  if (!file) return false;
+  String header = file.readStringUntil('\n');
+  header.trim();
+  String values = file.readStringUntil('\n');
+  file.close();
+  if (header != "BUOY_NAV_CONFIG_V1") return false;
+  if (sscanf(values.c_str(), "MAG_CAL,%f,%f,%f,%f", &offsetX, &offsetY, &scaleX, &scaleY) != 4) return false;
+  return validMagnetometerCalibration(offsetX, offsetY, scaleX, scaleY);
+}
+
+bool loadNavigationConfigFromSd() {
+  if (!sdCardMounted) return false;
+  float offsetX = 0.0f, offsetY = 0.0f, scaleX = 1.0f, scaleY = 1.0f;
+  if (readMagnetometerCalibrationFile("/config/navigation.cfg", offsetX, offsetY, scaleX, scaleY) ||
+      readMagnetometerCalibrationFile("/config/navigation.bak", offsetX, offsetY, scaleX, scaleY)) {
+    magnetometerOffsetX = offsetX;
+    magnetometerOffsetY = offsetY;
+    magnetometerScaleX = scaleX;
+    magnetometerScaleY = scaleY;
+    magnetometerCalibrationLoaded = true;
+    return true;
+  }
+  magnetometerCalibrationLoaded = false;
+  return false;
+}
+
+bool saveMagnetometerCalibrationToSd(float offsetX, float offsetY, float scaleX, float scaleY) {
+  if (!sdCardMounted || !validMagnetometerCalibration(offsetX, offsetY, scaleX, scaleY)) return false;
+  if (!SD.exists("/config") && !SD.mkdir("/config")) return false;
+  const char* temporaryPath = "/config/navigation.tmp";
+  const char* configPath = "/config/navigation.cfg";
+  const char* backupPath = "/config/navigation.bak";
+  SD.remove(temporaryPath);
+  File file = SD.open(temporaryPath, FILE_WRITE);
+  if (!file) return false;
+  bool writeOk = file.println("BUOY_NAV_CONFIG_V1") > 0;
+  if (writeOk) {
+    writeOk = file.printf("MAG_CAL,%.6f,%.6f,%.6f,%.6f\n", offsetX, offsetY, scaleX, scaleY) > 0;
+  }
+  file.flush();
+  file.close();
+  float verifyX = 0.0f, verifyY = 0.0f, verifyScaleX = 1.0f, verifyScaleY = 1.0f;
+  if (!writeOk || !readMagnetometerCalibrationFile(temporaryPath, verifyX, verifyY, verifyScaleX, verifyScaleY)) {
+    SD.remove(temporaryPath);
+    return false;
+  }
+  SD.remove(backupPath);
+  const bool hadPrevious = SD.exists(configPath);
+  if (hadPrevious && !SD.rename(configPath, backupPath)) {
+    SD.remove(temporaryPath);
+    return false;
+  }
+  if (!SD.rename(temporaryPath, configPath)) {
+    if (hadPrevious) SD.rename(backupPath, configPath);
+    SD.remove(temporaryPath);
+    return false;
+  }
+  SD.remove(backupPath);
+  magnetometerOffsetX = offsetX;
+  magnetometerOffsetY = offsetY;
+  magnetometerScaleX = scaleX;
+  magnetometerScaleY = scaleY;
+  magnetometerCalibrationLoaded = true;
+  return true;
+}
+
+bool validMissionId(const char* id) {
+  if (id == nullptr || strlen(id) != 36) return false;
+  for (size_t i = 0; i < 36; ++i) {
+    const char c = id[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+          (c >= 'A' && c <= 'F') || c == '-')) return false;
+  }
+  return true;
+}
+
+String missionFilePath(const char* id, const char* suffix = ".csv") {
+  if (!validMissionId(id)) return "";
+  return String("/missions/") + id + suffix;
+}
+
+String currentMissionFilePath(const char* suffix = ".csv") {
+  return String("/missions/current") + suffix;
+}
+
+void cleanupObsoleteMissionFiles() {
+  if (!sdCardMounted || !SD.exists("/missions")) return;
+  while (true) {
+    File directory = SD.open("/missions");
+    if (!directory || !directory.isDirectory()) {
+      if (directory) directory.close();
+      return;
+    }
+    String obsoletePath = "";
+    File entry;
+    while ((entry = directory.openNextFile())) {
+      String filename = String(entry.name());
+      int slash = filename.lastIndexOf('/');
+      if (slash >= 0) filename = filename.substring(slash + 1);
+      entry.close();
+      if (!filename.endsWith(".csv")) continue;
+      String id = filename.substring(0, filename.length() - 4);
+      if (validMissionId(id.c_str())) {
+        obsoletePath = missionFilePath(id.c_str());
+        break;
+      }
+    }
+    directory.close();
+    if (obsoletePath.length() == 0) break;
+    if (!SD.remove(obsoletePath.c_str())) break;
+  }
+}
+
+bool readMissionFile(const char* path, MissionWaypoint* points, uint8_t& count, char* idOut, MissionMetadata* metadataOut = nullptr) {
+  File file = SD.open(path, FILE_READ);
+  if (!file) return false;
+  String header = file.readStringUntil('\n');
+  header.trim();
+  char parsedId[37] = "";
+  unsigned int parsedCount = 0;
+  unsigned int boundaryCount = 0, hasHome = 0, hasEnd = 0;
+  MissionMetadata parsedMetadata;
+  const bool version3 = header.startsWith("BUOY_MISSION_V3,");
+  const bool version2 = version3 || header.startsWith("BUOY_MISSION_V2,");
+  const int headerFields = version2
+    ? sscanf(header.c_str(), version3 ? "BUOY_MISSION_V3,%36[^,],%u,%u,%u,%u" : "BUOY_MISSION_V2,%36[^,],%u,%u,%u,%u", parsedId, &parsedCount, &boundaryCount, &hasHome, &hasEnd)
+    : sscanf(header.c_str(), "BUOY_MISSION_V1,%36[^,],%u", parsedId, &parsedCount);
+  if (headerFields != (version2 ? 5 : 2) ||
+      !validMissionId(parsedId) || parsedCount == 0 || parsedCount > MAX_MISSION_WAYPOINTS) {
+    file.close();
+    return false;
+  }
+  if (boundaryCount > MAX_MISSION_BOUNDARY_POINTS || hasHome > 1 || hasEnd > 1) { file.close(); return false; }
+  if (version2) {
+    parsedMetadata.hasHome = hasHome != 0;
+    parsedMetadata.hasEnd = hasEnd != 0;
+    for (uint8_t kind = 0; kind < 2; ++kind) {
+      if ((kind == 0 && !parsedMetadata.hasHome) || (kind == 1 && !parsedMetadata.hasEnd)) continue;
+      String line = file.readStringUntil('\n'); line.trim();
+      float lat = 0, lon = 0;
+      if (sscanf(line.c_str(), kind == 0 ? "HOME,%f,%f" : "END,%f,%f", &lat, &lon) != 2 ||
+          !isfinite(lat) || !isfinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) { file.close(); return false; }
+      if (kind == 0) parsedMetadata.home = {lat, lon}; else parsedMetadata.end = {lat, lon};
+    }
+    for (unsigned int i = 0; i < boundaryCount; ++i) {
+      String line = file.readStringUntil('\n'); line.trim();
+      unsigned int index = 0; float lat = 0, lon = 0;
+      if (sscanf(line.c_str(), "BOUNDARY,%u,%f,%f", &index, &lat, &lon) != 3 || index != i ||
+          !isfinite(lat) || !isfinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) { file.close(); return false; }
+      parsedMetadata.boundary[i] = {lat, lon};
+    }
+    parsedMetadata.boundaryCount = static_cast<uint8_t>(boundaryCount);
+  }
+  for (unsigned int i = 0; i < parsedCount; ++i) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    float latitude = 0.0f, longitude = 0.0f; unsigned int measurementMask = 0, collectData = 0, holdSeconds = 0, speedPercent = 0;
+    const int pointFields = version3
+      ? sscanf(line.c_str(), "POINT,%f,%f,%u,%u,%u,%u", &latitude, &longitude, &measurementMask, &collectData, &holdSeconds, &speedPercent)
+      : (version2 ? sscanf(line.c_str(), "POINT,%f,%f,%u,%u,%u", &latitude, &longitude, &measurementMask, &holdSeconds, &speedPercent)
+      : sscanf(line.c_str(), "%f,%f", &latitude, &longitude));
+    if (pointFields != (version3 ? 6 : (version2 ? 5 : 2)) || measurementMask > 31 || collectData > 1 || holdSeconds > 3600 || speedPercent > 100 ||
+        !isfinite(latitude) || !isfinite(longitude) || latitude < -90.0f ||
+        latitude > 90.0f || longitude < -180.0f || longitude > 180.0f) {
+      file.close();
+      return false;
+    }
+    points[i] = {latitude, longitude, static_cast<uint16_t>(measurementMask), version3 ? collectData != 0 : (version2 ? holdSeconds > 0 : false), static_cast<uint16_t>(holdSeconds), static_cast<uint8_t>(version2 ? speedPercent : 50)};
+  }
+  String extra = file.readStringUntil('\n');
+  extra.trim();
+  file.close();
+  if (extra.length() != 0) return false;
+  count = static_cast<uint8_t>(parsedCount);
+  if (idOut) strlcpy(idOut, parsedId, 37);
+  if (metadataOut) *metadataOut = parsedMetadata;
+  return true;
+}
+
+bool saveMissionToSd(const char* id, const MissionWaypoint* points, uint8_t count, const MissionMetadata* metadata) {
+  if (!sdCardMounted || !validMissionId(id) || points == nullptr || count == 0 || count > MAX_MISSION_WAYPOINTS) return false;
+  MissionMetadata emptyMetadata;
+  if (!metadata) metadata = &emptyMetadata;
+  if (metadata->boundaryCount > MAX_MISSION_BOUNDARY_POINTS) return false;
+  if (!SD.exists("/missions") && !SD.mkdir("/missions")) return false;
+  const String missionPath = currentMissionFilePath();
+  const String backupPath = currentMissionFilePath(".bak");
+  const char* temporaryPath = "/missions/upload.tmp";
+  SD.remove(temporaryPath);
+  File file = SD.open(temporaryPath, FILE_WRITE);
+  if (!file) return false;
+  bool writeOk = file.println(String("BUOY_MISSION_V3,") + id + "," + String(count) + "," + String(metadata->boundaryCount) + "," + String(metadata->hasHome ? 1 : 0) + "," + String(metadata->hasEnd ? 1 : 0)) > 0;
+  if (writeOk && metadata->hasHome) writeOk = file.println(String("HOME,") + String(metadata->home.latitude, 7) + "," + String(metadata->home.longitude, 7)) > 0;
+  if (writeOk && metadata->hasEnd) writeOk = file.println(String("END,") + String(metadata->end.latitude, 7) + "," + String(metadata->end.longitude, 7)) > 0;
+  for (uint8_t i = 0; writeOk && i < metadata->boundaryCount; ++i)
+    writeOk = file.println(String("BOUNDARY,") + String(i) + "," + String(metadata->boundary[i].latitude, 7) + "," + String(metadata->boundary[i].longitude, 7)) > 0;
+  for (uint8_t i = 0; writeOk && i < count; ++i) {
+    writeOk = file.println(String("POINT,") + String(points[i].latitude, 7) + "," + String(points[i].longitude, 7) + "," + String(points[i].measurementMask) + "," + String(points[i].collectData ? 1 : 0) + "," + String(points[i].holdSeconds) + "," + String(points[i].speedPercent)) > 0;
+  }
+  file.flush();
+  file.close();
+  if (!writeOk) {
+    SD.remove(temporaryPath);
+    return false;
+  }
+  MissionWaypoint verified[MAX_MISSION_WAYPOINTS] = {};
+  uint8_t verifiedCount = 0;
+  char verifiedId[37] = "";
+  MissionMetadata verifiedMetadata;
+  if (!readMissionFile(temporaryPath, verified, verifiedCount, verifiedId, &verifiedMetadata) ||
+      verifiedCount != count || strcmp(verifiedId, id) != 0) {
+    SD.remove(temporaryPath);
+    return false;
+  }
+  if (verifiedMetadata.hasHome != metadata->hasHome || verifiedMetadata.hasEnd != metadata->hasEnd || verifiedMetadata.boundaryCount != metadata->boundaryCount ||
+      (metadata->hasHome && (fabsf(verifiedMetadata.home.latitude - metadata->home.latitude) > 0.000001f || fabsf(verifiedMetadata.home.longitude - metadata->home.longitude) > 0.000001f)) ||
+      (metadata->hasEnd && (fabsf(verifiedMetadata.end.latitude - metadata->end.latitude) > 0.000001f || fabsf(verifiedMetadata.end.longitude - metadata->end.longitude) > 0.000001f))) { SD.remove(temporaryPath); return false; }
+  for (uint8_t i = 0; i < metadata->boundaryCount; ++i) {
+    if (fabsf(verifiedMetadata.boundary[i].latitude - metadata->boundary[i].latitude) > 0.000001f ||
+        fabsf(verifiedMetadata.boundary[i].longitude - metadata->boundary[i].longitude) > 0.000001f) { SD.remove(temporaryPath); return false; }
+  }
+  for (uint8_t i = 0; i < count; ++i) {
+    if (fabsf(verified[i].latitude - points[i].latitude) > 0.000001f ||
+        fabsf(verified[i].longitude - points[i].longitude) > 0.000001f ||
+        verified[i].measurementMask != points[i].measurementMask || verified[i].collectData != points[i].collectData ||
+        verified[i].holdSeconds != points[i].holdSeconds || verified[i].speedPercent != points[i].speedPercent) {
+      SD.remove(temporaryPath);
+      return false;
+    }
+  }
+
+  SD.remove(backupPath.c_str());
+  const bool hadPrevious = SD.exists(missionPath.c_str());
+  if (hadPrevious && !SD.rename(missionPath.c_str(), backupPath.c_str())) {
+    SD.remove(temporaryPath);
+    return false;
+  }
+  if (!SD.rename(temporaryPath, missionPath.c_str())) {
+    if (hadPrevious) SD.rename(backupPath.c_str(), missionPath.c_str());
+    SD.remove(temporaryPath);
+    return false;
+  }
+  return true;
+}
+
+bool loadMissionFromSd(const char* id) {
+  if (!sdCardMounted) return false;
+  const String missionPath = currentMissionFilePath();
+  const String backupPath = currentMissionFilePath(".bak");
+  MissionWaypoint loaded[MAX_MISSION_WAYPOINTS] = {};
+  uint8_t loadedCount = 0;
+  char loadedId[37] = "";
+  MissionMetadata loadedMetadata;
+  if (readMissionFile(missionPath.c_str(), loaded, loadedCount, loadedId, &loadedMetadata) && strcmp(loadedId, id) == 0) {
+    memcpy(missionWaypoints, loaded, loadedCount * sizeof(MissionWaypoint));
+    missionWaypointCount = loadedCount;
+    missionMetadata = loadedMetadata;
+    strlcpy(missionId, loadedId, sizeof(missionId));
+    SD.remove(backupPath.c_str());
+    cleanupObsoleteMissionFiles();
+    return true;
+  }
+  if (readMissionFile(backupPath.c_str(), loaded, loadedCount, loadedId, &loadedMetadata) && strcmp(loadedId, id) == 0) {
+    memcpy(missionWaypoints, loaded, loadedCount * sizeof(MissionWaypoint));
+    missionWaypointCount = loadedCount;
+    missionMetadata = loadedMetadata;
+    strlcpy(missionId, loadedId, sizeof(missionId));
+    SD.remove(missionPath.c_str());
+    SD.rename(backupPath.c_str(), missionPath.c_str());
+    cleanupObsoleteMissionFiles();
+    return true;
+  }
+  missionWaypointCount = 0;
+  missionMetadata = MissionMetadata();
+  missionId[0] = '\0';
+  return false;
+}
+
+bool deleteMissionFromSd(const char* id) {
+  if (!sdCardMounted || !validMissionId(id)) return false;
+  if (runningMissionId[0] && strcmp(runningMissionId, id) == 0) return false;
+  const String path = currentMissionFilePath();
+  const String backupPath = currentMissionFilePath(".bak");
+  if (!SD.exists(path.c_str()) && !SD.exists(backupPath.c_str())) return false;
+  MissionWaypoint currentPoints[MAX_MISSION_WAYPOINTS] = {};
+  uint8_t currentCount = 0;
+  char currentId[37] = "";
+  bool matchesCurrent = readMissionFile(path.c_str(), currentPoints, currentCount, currentId) && strcmp(currentId, id) == 0;
+  if (!matchesCurrent) {
+    matchesCurrent = readMissionFile(backupPath.c_str(), currentPoints, currentCount, currentId) && strcmp(currentId, id) == 0;
+  }
+  if (!matchesCurrent) return false;
+  if (SD.exists(path.c_str()) && !SD.remove(path.c_str())) return false;
+  if (SD.exists(backupPath.c_str()) && !SD.remove(backupPath.c_str())) return false;
+
+  if (missionId[0] && strcmp(missionId, id) == 0) {
+    missionWaypointCount = 0;
+    missionMetadata = MissionMetadata();
+    missionId[0] = '\0';
+  }
+  File selection = SD.open("/missions/selected.txt", FILE_READ);
+  if (selection) {
+    String selectedId = selection.readStringUntil('\n');
+    selection.close();
+    selectedId.trim();
+    if (selectedId.equalsIgnoreCase(id) && SD.exists("/missions/selected.txt")) {
+      SD.remove("/missions/selected.txt");
+    }
+  }
+  return true;
+}
+
+bool persistMissionSelection(const char* id) {
+  if (!sdCardMounted || !validMissionId(id)) return false;
+  if (!SD.exists("/missions") && !SD.mkdir("/missions")) return false;
+  SD.remove("/missions/selected.tmp");
+  File file = SD.open("/missions/selected.tmp", FILE_WRITE);
+  if (!file) return false;
+  const bool written = file.println(id) > 0;
+  file.flush();
+  file.close();
+  if (!written) return false;
+  SD.remove("/missions/selected.txt");
+  if (!SD.rename("/missions/selected.tmp", "/missions/selected.txt")) {
+    SD.remove("/missions/selected.tmp");
+    return false;
+  }
+  return true;
+}
+
+bool loadSelectedMissionFromSd() {
+  if (!sdCardMounted) return false;
+  File file = SD.open("/missions/selected.txt", FILE_READ);
+  if (!file) return false;
+  String selectedId = file.readStringUntil('\n');
+  file.close();
+  selectedId.trim();
+  return loadMissionFromSd(selectedId.c_str());
+}
+
+bool migrateSelectedMissionCollectionFromSd() {
+  if (!sdCardMounted) return false;
+  File selection = SD.open("/missions/selected.txt", FILE_READ);
+  if (!selection) return false;
+  String selectedId = selection.readStringUntil('\n');
+  selection.close();
+  selectedId.trim();
+  if (!validMissionId(selectedId.c_str())) return false;
+  const String oldPath = missionFilePath(selectedId.c_str());
+  MissionWaypoint points[MAX_MISSION_WAYPOINTS] = {};
+  uint8_t count = 0;
+  char fileId[37] = "";
+  if (!readMissionFile(oldPath.c_str(), points, count, fileId) || strcmp(fileId, selectedId.c_str()) != 0) return false;
+  if (!saveMissionToSd(fileId, points, count) ||
+      !persistMissionSelection(fileId) || !loadMissionFromSd(fileId)) return false;
+  SD.remove(currentMissionFilePath(".bak").c_str());
+  cleanupObsoleteMissionFiles();
+  return true;
+}
+
+bool migrateLegacyMissionFromSd() {
+  const char* legacyId = "00000000-0000-4000-8000-000000000001";
+  if (!sdCardMounted || !SD.exists("/mission.txt")) return false;
+  MissionWaypoint points[MAX_MISSION_WAYPOINTS] = {};
+  uint8_t count = 0;
+  File file = SD.open("/mission.txt", FILE_READ);
+  if (!file) return false;
+  String header = file.readStringUntil('\n');
+  header.trim();
+  unsigned int parsedCount = 0;
+  if (sscanf(header.c_str(), "BUOY_MISSION_V1,%u", &parsedCount) != 1 ||
+      parsedCount == 0 || parsedCount > MAX_MISSION_WAYPOINTS) {
+    file.close();
+    return false;
+  }
+  for (unsigned int i = 0; i < parsedCount; ++i) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    float latitude = 0.0f, longitude = 0.0f;
+    if (sscanf(line.c_str(), "%f,%f", &latitude, &longitude) != 2 ||
+        !isfinite(latitude) || !isfinite(longitude) || latitude < -90.0f ||
+        latitude > 90.0f || longitude < -180.0f || longitude > 180.0f) {
+      file.close();
+      return false;
+    }
+    points[i] = {latitude, longitude};
+  }
+  file.close();
+  if (!saveMissionToSd(legacyId, points, static_cast<uint8_t>(parsedCount)) ||
+      !persistMissionSelection(legacyId) || !loadMissionFromSd(legacyId)) return false;
+  SD.remove(currentMissionFilePath(".bak").c_str());
+  SD.rename("/mission.txt", "/mission.legacy.bak");
+  cleanupObsoleteMissionFiles();
+  return true;
+}
+
+void emitMissionList() {
+  if (!sdCardMounted) {
+    emitLine("ERR MISSION SD UNAVAILABLE");
+    return;
+  }
+  MissionWaypoint points[MAX_MISSION_WAYPOINTS] = {};
+  uint8_t pointCount = 0;
+  char currentId[37] = "";
+  bool hasMission = readMissionFile(currentMissionFilePath().c_str(), points, pointCount, currentId);
+  if (!hasMission) hasMission = readMissionFile(currentMissionFilePath(".bak").c_str(), points, pointCount, currentId);
+  emitLine(String("ACK MISSION LIST ") + (hasMission ? "1" : "0"));
+  if (hasMission) emitLine("TEL MISSION ITEM " + String(currentId) + " " + String(pointCount));
+  emitLine("TEL MISSION ACTIVE " + String(runningMissionId[0] ? runningMissionId : "NONE") +
+    " LOADED " + String(hasMission ? currentId : "NONE"));
+}
+
 bool startSdRecorder(const String& startUtc) {
   if (!sdCardMounted || scienceExperimentState != 0) return false;
   sdSessionDirectory = "";
@@ -640,14 +1140,49 @@ bool saveSdRecorder(const String& saveUtc) {
   return true;
 }
 
+void stopRecordingForManualLinkLoss() {
+  if (scienceExperimentState != 1) return;
+  audioRecordingEnabled = false;
+  const String stoppedAt = "LINKLOSS-" + String(millis());
+  if (!flushAudioWriteBuffer()) return;
+  updateWavHeader();
+  sdAudioFile.flush();
+  sdAudioIndexFile.flush();
+  sdScienceFile.flush();
+  sdTelemetryFile.flush();
+  File manifest = SD.open((sdSessionDirectory + "/manifest.txt").c_str(), FILE_APPEND);
+  if (manifest) {
+    manifest.println("stopped_at=" + stoppedAt);
+    manifest.println(F("stop_reason=manual_elrs_link_loss"));
+    manifest.close();
+  }
+  scienceExperimentState = 2;
+  saveSdRecorder(stoppedAt);
+}
+
 void recordLogLine(const String& line) {
   (void)line;
 }
 
 void emitLine(const String& line) {
-  if (controlClientConnected()) {
-    tcpClient.print(line);
-    tcpClient.print("\n");
+  if (!controlClientConnected()) return;
+  const size_t length = line.length();
+  if (length + 1 > TCP_TELEMETRY_BUFFER_SIZE - tcpTelemetryBuffered) return;
+  memcpy(tcpTelemetryBuffer + tcpTelemetryBuffered, line.c_str(), length);
+  tcpTelemetryBuffered += length;
+  tcpTelemetryBuffer[tcpTelemetryBuffered++] = '\n';
+}
+
+void flushTcpTelemetry() {
+  if (!tcpTelemetryBuffered || !controlClientConnected()) return;
+  const int socketFd = tcpClient.fd();
+  if (socketFd < 0) return;
+  const size_t writeLength = min(tcpTelemetryBuffered, static_cast<size_t>(512));
+  const int written = send(socketFd, tcpTelemetryBuffer, writeLength, MSG_DONTWAIT);
+  if (written <= 0) return;
+  tcpTelemetryBuffered -= static_cast<size_t>(written);
+  if (tcpTelemetryBuffered) {
+    memmove(tcpTelemetryBuffer, tcpTelemetryBuffer + written, tcpTelemetryBuffered);
   }
 }
 
@@ -769,24 +1304,59 @@ void sendMotorOutputTelemetry() {
   if (!controlClientConnected()) {
     return;
   }
-  tcpClient.print("TEL MOTOR OUT ");
+  String line = "TEL MOTOR OUT";
   for (int i = 0; i < MOTOR_COUNT; i++) {
-    if (i > 0) {
-      tcpClient.print(" ");
-    }
-    tcpClient.print(driveValues[i]);
-    tcpClient.print(" ");
-    tcpClient.print(appliedMotorPwm[i]);
+    line += " " + String(driveValues[i]) + " " + String(appliedMotorPwm[i]);
   }
-  tcpClient.print("\n");
+  emitLine(line);
 }
 
 void sendStatusSnapshot() {
   emitLine(firmwareVersionStatusLine());
+  emitLine(String("TEL STATUS TELEMETRY_MODE ") +
+    (telemetryMode == TELEMETRY_MODE_MAVLINK ? "MAVLINK" : "WIFI"));
+  emitLine(String("TEL STATUS CONTROL_SOURCE ") +
+    (controlSource == CONTROL_SOURCE_ELRS ? "TX12" :
+     controlSource == CONTROL_SOURCE_WIFI ? "WIFI" : "NONE"));
+  emitLine(String("TEL STATUS ELRS_ARM ") + (elrsArmed ? "ARMED" : "DISARMED"));
+  emitLine(String("TEL STATUS RECOVERY ") + (manualLinkLossStop ? "MANUAL_STOP" : "READY"));
+  emitLine(String("TEL STATUS MAGNETOMETER ") + (magnetometerAvailable ? "READY" : "UNAVAILABLE"));
+  emitLine(String("TEL STATUS MAGCAL ") + (magnetometerCalibrationLoaded ? "LOADED SD" : "DEFAULT"));
+  emitLine(String("TEL STATUS ELRS_FAILSAFE ") + lastElrsFailsafeStatus);
   emitLine(String("TEL STATUS ELRS BYTES ") + String(elrs.receivedBytes()) +
     " RADIO " + String(elrs.validRadioStatus()) +
     " RC " + String(elrs.validRcFrames()) +
     " CRCERR " + String(elrs.crcErrors()));
+  const char* rcReject = "NONE";
+  switch (elrs.lastRcRejectCode()) {
+    case 1: rcReject = "CRC"; break;
+    case 2: rcReject = "SHORT"; break;
+    case 3: rcReject = "TARGET"; break;
+    case 4: rcReject = "CHANNEL"; break;
+  }
+  emitLine(String("TEL STATUS ELRS_RC_DIAG OVERRIDE ") + String(elrs.rcOverrideFrames()) +
+    " CRC_OK " + String(elrs.rcOverrideCrcOk()) +
+    " CRC_BAD " + String(elrs.rcOverrideCrcBad()) +
+    " SHORT " + String(elrs.rcOverrideShort()) +
+    " TARGET_BAD " + String(elrs.rcOverrideTargetReject()) +
+    " CHANNEL_BAD " + String(elrs.rcOverrideChannelReject()) +
+    " ACCEPTED " + String(elrs.validRcFrames()) +
+    " LAST_REJECT " + rcReject +
+    " TARGET " + String(elrs.lastRcTargetSystem()) + " " + String(elrs.lastRcTargetComponent()) +
+    " BAD_CH " + String(elrs.lastRcInvalidChannel()) + " VALUE " + String(elrs.lastRcInvalidValue()));
+  // In Backpack mode the Wi-Fi heartbeat reports only control and safety.
+  // Power, position, motor state and channels travel over MAVLink instead.
+  if (telemetryMode == TELEMETRY_MODE_MAVLINK) return;
+  const uint32_t linkAgeMs = elrs.lastLinkMs() == 0 ? UINT32_MAX : millis() - elrs.lastLinkMs();
+  emitLine(String("TEL STATUS ELRS_LINK LQ ") + String(elrs.linkQuality()) +
+    " AGE_MS " + (linkAgeMs == UINT32_MAX ? String("UNKNOWN") : String(linkAgeMs)) +
+    " RSSI_DBM " + String(elrs.rssiDbm()) +
+    " SNR_DB " + String(elrs.snrDb()));
+  String channelLine = "TEL STATUS ELRS_CHANNELS";
+  for (uint8_t channel = 0; channel < 10; ++channel) {
+    channelLine += " " + String(elrs.channel(channel));
+  }
+  emitLine(channelLine);
   const char* audioChannelName = audioChannelSelection == 1 ? "LEFT" : (audioChannelSelection == 2 ? "RIGHT" : "BOTH");
   emitLine(
     String("TEL STATUS AUDIO ") + audioChannelName +
@@ -812,12 +1382,22 @@ void sendStatusSnapshot() {
       break;
   }
   emitLine(modeLine);
+  emitLine(String("TEL STATUS MISSION_CONTROL ") +
+    (missionModeRequested ? "MISSION_REQUEST_BLOCKED" : "MANUAL"));
+  emitLine(String("TEL STATUS MISSION ") + String(missionWaypointCount) +
+    " UPLOAD " + (missionUploadInProgress ? "RECEIVING" : "READY") +
+    " LOADED " + String(missionId[0] ? missionId : "NONE") +
+    " RUNNING " + String(runningMissionId[0] ? runningMissionId : "NONE"));
 
   if (gps.location.isValid()) {
     emitLine("TEL STATUS POS " + String(gps.location.lat(), 6) + " " + String(gps.location.lng(), 6));
   } else {
     emitLine("TEL STATUS POS UNKNOWN UNKNOWN");
   }
+  emitLine(String("TEL STATUS GPS ") +
+    (gps.satellites.isValid() ? String(gps.satellites.value()) : String("UNKNOWN")) + " " +
+    (gps.hdop.isValid() ? String(gps.hdop.hdop(), 1) : String("UNKNOWN")) + " " +
+    (gps.location.isValid() ? "FIX" : "NOFIX"));
 
   if (targetLocationSet) {
     emitLine("TEL STATUS TARGET " + String(targetLatitude, 6) + " " + String(targetLongitude, 6));
@@ -862,6 +1442,7 @@ void sendStatusSnapshot() {
     emitLine("TEL SCI IMU_GYRO UNKNOWN UNKNOWN UNKNOWN");
     emitLine("TEL SCI IMU_TEMP UNKNOWN");
   }
+  emitMagnetometerTelemetry();
 }
 
 bool setupDs18b20() {
@@ -927,6 +1508,22 @@ void emitImuTelemetry() {
     emitLine("TEL SCI IMU_ACCEL UNKNOWN UNKNOWN UNKNOWN");
     emitLine("TEL SCI IMU_GYRO UNKNOWN UNKNOWN UNKNOWN");
     emitLine("TEL SCI IMU_TEMP UNKNOWN");
+  }
+}
+
+void emitMagnetometerTelemetry() {
+  MagnetometerReadings readings = {};
+  if (readQmc5883(readings)) {
+    emitLine("TEL SCI MAG_RAW " + String(readings.x) + " " + String(readings.y) + " " + String(readings.z));
+    if (magnetometerCalibrationLoaded) {
+      const float calibratedX = (static_cast<float>(readings.x) - magnetometerOffsetX) * magnetometerScaleX;
+      const float calibratedY = (static_cast<float>(readings.y) - magnetometerOffsetY) * magnetometerScaleY;
+      float headingDegrees = atan2f(calibratedY, calibratedX) * 180.0f / PI;
+      if (headingDegrees < 0.0f) headingDegrees += 360.0f;
+      emitLine("TEL SCI MAG_HEADING " + String(headingDegrees, 1));
+    }
+  } else {
+    emitLine("TEL SCI MAG_RAW UNKNOWN UNKNOWN UNKNOWN");
   }
 }
 
@@ -1353,10 +1950,36 @@ void stopMotorsForSafety(const __FlashStringHelper* reason) {
   }
 }
 
+void stopElrsForFailsafe(uint32_t now) {
+  const bool rcTimedOut = !elrs.rcFresh(now);
+  const bool linkFresh = elrs.linkFresh(now);
+  const bool zeroLinkQuality = linkFresh && elrs.linkQuality() == 0;
+  const char* reason = rcTimedOut && zeroLinkQuality ? "RC_TIMEOUT_AND_ZERO_LQ" :
+                       rcTimedOut ? "RC_TIMEOUT" :
+                       zeroLinkQuality ? "ZERO_LQ" : "ARM_STATE_LOST";
+  const String rcAge = elrs.lastRcMs() == 0 ? String("UNKNOWN") : String(now - elrs.lastRcMs());
+  const String linkAge = elrs.lastLinkMs() == 0 ? String("UNKNOWN") : String(now - elrs.lastLinkMs());
+  stopMotorsForSafety(F("ELRS FAILSAFE"));
+  manualLinkLossStop = true;
+  ++elrsFailsafeCount;
+  lastElrsFailsafeStatus = String("COUNT ") + String(elrsFailsafeCount) +
+    " REASON " + reason +
+    " RC_AGE_MS " + rcAge +
+    " LQ " + String(elrs.linkQuality()) +
+    " LINK_AGE_MS " + linkAge +
+    " RC " + String(elrs.validRcFrames()) +
+    " RADIO " + String(elrs.validRadioStatus()) +
+    " CRCERR " + String(elrs.crcErrors()) +
+    " UPTIME_MS " + String(now);
+  emitLine(String("TEL EVENT ELRS_FAILSAFE ") + lastElrsFailsafeStatus);
+  stopRecordingForManualLinkLoss();
+}
+
 void updateMotorCommandWatchdog() {
   if (controlSource == CONTROL_SOURCE_ELRS) {
-    if (!elrsArmed || !elrs.rcFresh(millis()) || !elrs.linkFresh(millis()) || elrs.linkQuality() == 0) {
-      stopMotorsForSafety(F("ELRS LINK LOST"));
+    const uint32_t now = millis();
+    if (!elrsArmed || !elrs.rcFresh(now) || (elrs.linkFresh(now) && elrs.linkQuality() == 0)) {
+      stopElrsForFailsafe(now);
     }
     return;
   }
@@ -1385,6 +2008,7 @@ void processTcpControl() {
       tcpClient.stop();
     }
     tcpCommandBuffer = "";
+    tcpTelemetryBuffered = 0;
     return;
   }
 
@@ -1395,6 +2019,7 @@ void processTcpControl() {
     if (controlSource == CONTROL_SOURCE_WIFI) stopMotorsForSafety(F("TCP CLIENT DISCONNECTED"));
     tcpClient.stop();
     tcpCommandBuffer = "";
+    tcpTelemetryBuffered = 0;
     hadControlClient = false;
   }
 
@@ -1408,6 +2033,7 @@ void processTcpControl() {
       tcpClient.stop();
     }
     tcpClient = newClient;
+    tcpTelemetryBuffered = 0;
     tcpClient.setNoDelay(true);
     udpRemoteIp = tcpClient.remoteIP();
     tcpCommandBuffer = "";
@@ -1416,12 +2042,17 @@ void processTcpControl() {
     emitLine("ACK BOOT");
   }
 
-  while (controlClientConnected() && tcpClient.available() > 0) {
+  unsigned inputBytes = 0;
+  unsigned inputCommands = 0;
+  while (inputBytes < 256 && inputCommands < 2 &&
+         controlClientConnected() && tcpClient.available() > 0) {
+    ++inputBytes;
     char c = static_cast<char>(tcpClient.read());
     if (c == '\r') {
       continue;
     }
     if (c == '\n') {
+      ++inputCommands;
       String command = tcpCommandBuffer;
       tcpCommandBuffer = "";
       command.trim();
@@ -1636,9 +2267,41 @@ int elrsStickPercent(uint16_t microseconds) {
 void processElrsControl() {
   elrs.poll();
   const uint32_t now = millis();
-  if (!elrs.rcFresh(now) || !elrs.linkFresh(now) || elrs.linkQuality() == 0) {
-    if (controlSource == CONTROL_SOURCE_ELRS) stopMotorsForSafety(F("ELRS RC FAILSAFE"));
+  if (elrs.rcFresh(now)) {
+    const uint16_t telemetryChannel = elrs.channel(5);  // SF / CH6
+    if (telemetryChannel >= 900 && telemetryChannel <= 2100) {
+      const TelemetryMode requestedMode = telemetryChannel >= 1700
+        ? TELEMETRY_MODE_MAVLINK : TELEMETRY_MODE_WIFI;
+      if (requestedMode != telemetryMode) {
+        telemetryMode = requestedMode;
+        emitLine(String("TEL EVENT TELEMETRY_MODE ") +
+          (telemetryMode == TELEMETRY_MODE_MAVLINK ? "MAVLINK" : "WIFI"));
+      }
+    }
+  }
+  if (!elrs.rcFresh(now) || (elrs.linkFresh(now) && elrs.linkQuality() == 0)) {
+    if (controlSource == CONTROL_SOURCE_ELRS) {
+      stopElrsForFailsafe(now);
+    }
     return;
+  }
+
+  // CH7 is the TX12 SB mode selector. Mission execution is unavailable until
+  // the buoy has a tested waypoint guidance controller, so fail closed here.
+  const uint16_t missionModeChannel = elrs.channel(6);
+  if (missionModeChannel >= 1700) {
+    if (!missionModeRequested) {
+      stopMotorsForSafety(F("MISSION MODE UNAVAILABLE"));
+      emitLine("TEL EVENT MISSION_MODE REQUESTED_UNAVAILABLE");
+    }
+    missionModeRequested = true;
+    elrsArmed = false;
+    elrsArmReady = false;
+    return;
+  }
+  if (missionModeRequested) {
+    missionModeRequested = false;
+    emitLine("TEL EVENT MISSION_MODE MANUAL");
   }
 
   const uint16_t armChannel = elrs.channel(4);  // CH5: low disarm, high arm
@@ -1668,6 +2331,7 @@ void processElrsControl() {
     if (!elrsArmReady || powerChannel > 1100 || lateral || thrust || yaw) return;
     elrsArmed = true;
     elrsArmReady = false;
+    manualLinkLossStop = false;
     controlSource = CONTROL_SOURCE_ELRS;
     controlMode = CONTROL_MODE_MANUAL;
     holdPositionEnabled = false;
@@ -1772,7 +2436,30 @@ bool ads1115ReadRaw(uint8_t channel, int16_t& rawValue) {
     return false;
   }
 
-  delayMicroseconds(1400);
+  // The conversion register retains the previous channel's result until the
+  // new single-shot conversion finishes. Poll OS instead of assuming that a
+  // fixed delay is long enough after changing the input multiplexer.
+  const uint32_t conversionStartUs = micros();
+  bool conversionReady = false;
+  while (static_cast<uint32_t>(micros() - conversionStartUs) < 20000UL) {
+    Wire.beginTransmission(ADS1115_I2C_ADDRESS);
+    Wire.write(0x01);
+    if (Wire.endTransmission(false) != 0 ||
+        Wire.requestFrom(static_cast<int>(ADS1115_I2C_ADDRESS), 2, 1) != 2) {
+      ads1115Available = false;
+      return false;
+    }
+    const uint16_t status = static_cast<uint16_t>((Wire.read() << 8) | Wire.read());
+    if (status & 0x8000) {
+      conversionReady = true;
+      break;
+    }
+    delayMicroseconds(100);
+  }
+  if (!conversionReady) {
+    return false;
+  }
+
   Wire.beginTransmission(ADS1115_I2C_ADDRESS);
   Wire.write(0x00);
   if (Wire.endTransmission(false) != 0 || Wire.requestFrom(static_cast<int>(ADS1115_I2C_ADDRESS), 2, 1) != 2) {
@@ -1847,25 +2534,46 @@ void calibrateCurrentSensorZero() {
   }
 }
 
-float readCurrentSensorAmps() {
-  float sensorVoltage = readCurrentSensorVoltage();
+float currentAmpsFromSensorVoltage(float sensorVoltage) {
   if (isnan(sensorVoltage)) {
     return 0.0f;
   }
-  float currentAmps = -(sensorVoltage - currentSensorZeroVoltage) / ACS712_SENSITIVITY_VOLTS_PER_AMP;
+  // The installed sensor output falls with battery-feed current. Startup
+  // calibration captures the powered electronics, which already draw 0.21 A.
+  float loadChangeAmps = (currentSensorZeroVoltage - sensorVoltage) / ACS712_SENSITIVITY_VOLTS_PER_AMP;
 
-  if (fabsf(currentAmps) < CURRENT_SENSOR_NOISE_FLOOR_AMPS) {
-    currentAmps = 0.0;
+  if (fabsf(loadChangeAmps) < CURRENT_SENSOR_NOISE_FLOOR_AMPS) {
+    loadChangeAmps = 0.0f;
   }
 
-  return currentAmps;
+  return CURRENT_SENSOR_STARTUP_LOAD_AMPS + loadChangeAmps;
+}
+
+float readCurrentSensorAmps() {
+  return currentAmpsFromSensorVoltage(readCurrentSensorVoltage());
 }
 
 void serviceElrsTelemetry(uint32_t now) {
+  if (telemetryMode == TELEMETRY_MODE_WIFI) {
+    if (now - lastElrsTelemetryMs >= ELRS_TELEMETRY_INTERVAL_MS) {
+      lastElrsTelemetryMs = now;
+      elrs.sendHeartbeat(elrsArmed && controlSource == CONTROL_SOURCE_ELRS);
+    }
+    return;
+  }
   elrs.sendLinkAndChannels(now);
   if (now - lastElrsTelemetryMs >= ELRS_TELEMETRY_INTERVAL_MS) {
     lastElrsTelemetryMs = now;
     elrs.sendHeartbeat(elrsArmed && controlSource == CONTROL_SOURCE_ELRS);
+    const uint8_t state = static_cast<uint8_t>(controlMode) |
+      (static_cast<uint8_t>(controlSource) << 3) |
+      (elrsArmed ? 0x20 : 0) |
+      (scienceExperimentState == 1 ? 0x40 : 0) |
+      (manualLinkLossStop ? 0x80 : 0);
+    const int rearPwm = driveValues[0] < 0 ? -appliedMotorPwm[0] : appliedMotorPwm[0];
+    const int leftPwm = driveValues[1] < 0 ? -appliedMotorPwm[1] : appliedMotorPwm[1];
+    const int rightPwm = driveValues[2] < 0 ? -appliedMotorPwm[2] : appliedMotorPwm[2];
+    elrs.sendBuoyState(rearPwm, leftPwm, rightPwm, state);
   }
   if (now - lastElrsBatteryMs >= ELRS_BATTERY_INTERVAL_MS) {
     lastElrsBatteryMs = now;
@@ -1876,10 +2584,34 @@ void serviceElrsTelemetry(uint32_t now) {
     lastElrsGpsMs = now;
     if (gps.location.isValid() && gps.location.age() < 2000) {
       elrs.sendGps(gps.location.lat(), gps.location.lng(),
-                   gps.speed.isValid() ? gps.speed.mps() : 0.0f,
-                   gps.course.isValid() ? gps.course.deg() : 0.0f,
+                   gps.speed.isValid() ? gps.speed.mps() : NAN,
+                   gps.course.isValid() ? gps.course.deg() : NAN,
                    gps.altitude.isValid() ? gps.altitude.meters() : 0.0f,
-                   gps.satellites.isValid() ? static_cast<uint8_t>(constrain(gps.satellites.value(), 0UL, 255UL)) : 0);
+                   gps.satellites.isValid() ? static_cast<uint8_t>(constrain(gps.satellites.value(), 0UL, 255UL)) : 0,
+                   gps.hdop.isValid() ? static_cast<float>(gps.hdop.hdop()) : NAN);
+    }
+  }
+  if (now - lastElrsScienceMs >= ELRS_SCIENCE_INTERVAL_MS) {
+    lastElrsScienceMs = now;
+    // One small science value per second keeps the Backpack link light.
+    // Fields rotate so each measurement is refreshed every four seconds.
+    switch (elrsScienceField++ & 0x03) {
+      case 0:
+        if (ds18b20HasReading) elrs.sendScienceValue("WATER_TEMP", ds18b20TemperatureC);
+        break;
+      case 1:
+        if (latestRangeValid) elrs.sendScienceValue("DEPTH_M", latestRangeDistanceMm / 1000.0f);
+        break;
+      case 2: {
+        const float value = readAds1115AverageVoltage(ADS1115_TDS_CHANNEL, 1);
+        if (!isnan(value)) elrs.sendScienceValue("TDS_V", value);
+        break;
+      }
+      case 3: {
+        const float value = readAds1115AverageVoltage(ADS1115_TURBIDITY_CHANNEL, 1);
+        if (!isnan(value)) elrs.sendScienceValue("TURBIDITY", value / TURBIDITY_INPUT_DIVIDER_RATIO);
+        break;
+      }
     }
   }
 }
@@ -1890,7 +2622,7 @@ void emitSensorDiagnostics() {
   float currentVoltage = readCurrentSensorVoltage();
   float batteryAdcVoltage = readBatteryAdcVoltage();
   float batteryVoltage = isnan(batteryAdcVoltage) ? 0.0f : batteryAdcVoltage * (BATTERY_SENSOR_MAX_VOLTAGE / ADC_REFERENCE_VOLTAGE);
-  float currentAmps = -(currentVoltage - currentSensorZeroVoltage) / ACS712_SENSITIVITY_VOLTS_PER_AMP;
+  float currentAmps = currentAmpsFromSensorVoltage(currentVoltage);
   emitLine("DIAG ADS1115 CURRENT_V " + String(currentVoltage, 3) + " CURRENT_A " + String(currentAmps, 3));
   emitLine("DIAG ADS1115 BATTERY_ADC_V " + String(batteryAdcVoltage, 3) + " BATTERY_V " + String(batteryVoltage, 3));
 }
@@ -1922,8 +2654,7 @@ void recordScienceSnapshot() {
     ? NAN
     : turbidityAdcVoltage / TURBIDITY_INPUT_DIVIDER_RATIO;
   if (!isnan(currentVoltage)) {
-    latestCurrentAmps = -(currentVoltage - currentSensorZeroVoltage) / ACS712_SENSITIVITY_VOLTS_PER_AMP;
-    if (fabsf(latestCurrentAmps) < CURRENT_SENSOR_NOISE_FLOOR_AMPS) latestCurrentAmps = 0.0f;
+    latestCurrentAmps = currentAmpsFromSensorVoltage(currentVoltage);
   }
   if (!isnan(batteryAdcVoltage)) {
     latestBatteryVolts = batteryAdcVoltage * (BATTERY_SENSOR_MAX_VOLTAGE / ADC_REFERENCE_VOLTAGE);
@@ -2121,6 +2852,52 @@ bool setupMpu6050() {
   return true;
 }
 
+bool qmc5883WriteRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(QMC5883_I2C_ADDRESS);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool qmc5883ReadBytes(uint8_t startReg, uint8_t* buffer, size_t length) {
+  Wire.beginTransmission(QMC5883_I2C_ADDRESS);
+  Wire.write(startReg);
+  if (Wire.endTransmission(false) != 0) return false;
+  size_t bytesRead = Wire.requestFrom(static_cast<int>(QMC5883_I2C_ADDRESS), static_cast<int>(length), static_cast<int>(true));
+  if (bytesRead != length) return false;
+  for (size_t i = 0; i < length; ++i) {
+    if (Wire.available() <= 0) return false;
+    buffer[i] = static_cast<uint8_t>(Wire.read());
+  }
+  return true;
+}
+
+bool setupQmc5883() {
+  Wire.beginTransmission(QMC5883_I2C_ADDRESS);
+  if (Wire.endTransmission() != 0) return false;
+  if (!qmc5883WriteRegister(0x0A, 0x80)) return false;  // soft reset
+  delay(10);
+  if (!qmc5883WriteRegister(0x0B, 0x01)) return false;  // recommended set/reset period
+  // OSR=512, range=8 G, output rate=50 Hz, continuous measurement.
+  return qmc5883WriteRegister(0x09, 0xD5);
+}
+
+bool readQmc5883(MagnetometerReadings& readings) {
+  if (!magnetometerAvailable) return false;
+  uint8_t raw[6] = {};
+  uint8_t status = 0;
+  if (!qmc5883ReadBytes(0x06, &status, 1) ||
+      !qmc5883ReadBytes(0x00, raw, sizeof(raw))) {
+    magnetometerAvailable = false;
+    return false;
+  }
+  if ((status & 0x02) != 0 || (status & 0x01) == 0) return false;
+  readings.x = static_cast<int16_t>((static_cast<uint16_t>(raw[1]) << 8) | raw[0]);
+  readings.y = static_cast<int16_t>((static_cast<uint16_t>(raw[3]) << 8) | raw[2]);
+  readings.z = static_cast<int16_t>((static_cast<uint16_t>(raw[5]) << 8) | raw[4]);
+  return true;
+}
+
 bool setupAudioInput() {
   i2s_config_t config = {};
   config.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX);
@@ -2289,6 +3066,16 @@ void sendUdpStateTelemetry() {
     static_cast<uint8_t>(motorsEnabled() ? 1 : 0),
   };
   sendUdpPacket(PACKET_TYPE_STATE, payload);
+}
+
+void sendUdpElrsChannelsTelemetry() {
+  ElrsChannelsPacketPayload payload = {};
+  if (elrs.rcFresh(millis())) {
+    for (uint8_t channel = 0; channel < 16; ++channel) {
+      payload.channels[channel] = elrs.channel(channel);
+    }
+  }
+  sendUdpPacket(PACKET_TYPE_ELRS_CHANNELS, payload);
 }
 
 void sendUdpGpsTelemetry() {
@@ -2464,6 +3251,21 @@ void emitMotorCalibrationSnapshot(int motorIndex, bool forwardDirection) {
   );
 }
 
+uint32_t missionCrc32File(const char* path, bool& ok) {
+  ok = false;
+  File file = SD.open(path, FILE_READ);
+  if (!file) return 0;
+  uint32_t crc = 0xFFFFFFFFUL;
+  while (file.available()) {
+    crc ^= static_cast<uint8_t>(file.read());
+    for (uint8_t bit = 0; bit < 8; ++bit)
+      crc = (crc >> 1) ^ (0xEDB88320UL & (-(static_cast<int32_t>(crc & 1))));
+  }
+  file.close();
+  ok = true;
+  return crc ^ 0xFFFFFFFFUL;
+}
+
 void handleControlCommand(String command) {
   command.trim();
   command.toUpperCase();
@@ -2475,6 +3277,10 @@ void handleControlCommand(String command) {
   const bool wifiPropulsionCommand = command.startsWith("CTRL MOTION ") ||
     command.startsWith("CTRL VECTOR ") || command.startsWith("CTRL MOTOR ") ||
     command.startsWith("CTRL HOLD ") || command.startsWith("CTRL GOTO ");
+  if (missionModeRequested && wifiPropulsionCommand && command != "CTRL MOTOR STOP") {
+    emitLine("ERR MISSION MODE UNAVAILABLE; PROPULSION INHIBITED");
+    return;
+  }
   if (wifiPropulsionCommand && elrsArmed && command != "CTRL MOTOR STOP") {
     emitLine("ERR ELRS CONTROL ACTIVE");
     return;
@@ -2500,6 +3306,277 @@ void handleControlCommand(String command) {
   if (command == "REQ STATUS ALL") {
     emitLine("ACK REQ STATUS ALL");
     sendStatusSnapshot();
+    return;
+  }
+
+  if (command.startsWith("CTRL CONFIG MAGCAL ")) {
+    float offsetX = 0.0f, offsetY = 0.0f, scaleX = 1.0f, scaleY = 1.0f;
+    if (sscanf(command.c_str(), "CTRL CONFIG MAGCAL %f %f %f %f", &offsetX, &offsetY, &scaleX, &scaleY) != 4 ||
+        !validMagnetometerCalibration(offsetX, offsetY, scaleX, scaleY)) {
+      emitLine("ERR CONFIG MAGCAL VALUES");
+      return;
+    }
+    if (!saveMagnetometerCalibrationToSd(offsetX, offsetY, scaleX, scaleY)) {
+      emitLine(!sdCardMounted ? "ERR CONFIG SD UNAVAILABLE" : "ERR CONFIG MAGCAL SAVE");
+      return;
+    }
+    emitLine("ACK CONFIG MAGCAL STORED SD");
+    emitLine("TEL STATUS MAGCAL LOADED SD");
+    return;
+  }
+
+  if (command.startsWith("CTRL MISSION FILE BEGIN ")) {
+    unsigned long byteCount = 0, checksum = 0;
+    if (sscanf(command.c_str(), "CTRL MISSION FILE BEGIN %lu %lx", &byteCount, &checksum) != 2 ||
+        byteCount == 0 || byteCount > 20000 || !sdCardMounted) {
+      emitLine(!sdCardMounted ? "ERR MISSION SD UNAVAILABLE" : "ERR MISSION FILE BAD SIZE");
+      return;
+    }
+    if (runningMissionId[0]) { emitLine("ERR MISSION RUNNING"); return; }
+    if (!SD.exists("/missions") && !SD.mkdir("/missions")) { emitLine("ERR MISSION SD WRITE"); return; }
+    if (missionUploadFile) missionUploadFile.close();
+    SD.remove("/missions/upload.tmp");
+    missionUploadFile = SD.open("/missions/upload.tmp", FILE_WRITE);
+    if (!missionUploadFile) { emitLine("ERR MISSION SD WRITE"); return; }
+    missionUploadExpectedBytes = static_cast<uint32_t>(byteCount);
+    missionUploadExpectedCrc = static_cast<uint32_t>(checksum);
+    missionUploadReceivedBytes = 0;
+    missionUploadInProgress = true;
+    emitLine("ACK MISSION FILE BEGIN " + String(missionUploadExpectedBytes));
+    return;
+  }
+
+  if (command.startsWith("CTRL MISSION FILE DATA ")) {
+    unsigned long offset = 0;
+    char encoded[481] = "";
+    if (!missionUploadInProgress || !missionUploadFile ||
+        sscanf(command.c_str(), "CTRL MISSION FILE DATA %lu %480s", &offset, encoded) != 2 ||
+        offset != missionUploadReceivedBytes) { emitLine("ERR MISSION FILE OFFSET"); return; }
+    const size_t encodedLength = strlen(encoded);
+    if (encodedLength == 0 || encodedLength > 480 || (encodedLength & 1) ||
+        missionUploadReceivedBytes + encodedLength / 2 > missionUploadExpectedBytes) {
+      emitLine("ERR MISSION FILE DATA"); return;
+    }
+    for (size_t i = 0; i < encodedLength; i += 2) {
+      char pair[3] = {encoded[i], encoded[i + 1], 0};
+      char* end = nullptr;
+      unsigned long value = strtoul(pair, &end, 16);
+      if (!end || *end != '\0' || end == pair) { emitLine("ERR MISSION FILE DATA"); return; }
+      if (missionUploadFile.write(static_cast<uint8_t>(value)) != 1) {
+        emitLine("ERR MISSION SD WRITE"); return;
+      }
+    }
+    missionUploadReceivedBytes += static_cast<uint32_t>(encodedLength / 2);
+    emitLine("ACK MISSION FILE DATA " + String(missionUploadReceivedBytes));
+    return;
+  }
+
+  if (command == "CTRL MISSION FILE COMMIT") {
+    if (!missionUploadInProgress || !missionUploadFile) { emitLine("ERR MISSION FILE NOT STARTED"); return; }
+    missionUploadFile.flush();
+    missionUploadFile.close();
+    bool crcOk = false;
+    const uint32_t actualCrc = missionCrc32File("/missions/upload.tmp", crcOk);
+    MissionWaypoint verifiedPoints[MAX_MISSION_WAYPOINTS] = {};
+    uint8_t verifiedCount = 0;
+    char verifiedId[37] = "";
+    MissionMetadata verifiedMetadata;
+    if (missionUploadReceivedBytes != missionUploadExpectedBytes || !crcOk || actualCrc != missionUploadExpectedCrc ||
+        !readMissionFile("/missions/upload.tmp", verifiedPoints, verifiedCount, verifiedId, &verifiedMetadata)) {
+      missionUploadInProgress = false;
+      SD.remove("/missions/upload.tmp");
+      emitLine("ERR MISSION FILE VALIDATION");
+      return;
+    }
+    const String missionPath = currentMissionFilePath();
+    const String backupPath = currentMissionFilePath(".bak");
+    SD.remove(backupPath.c_str());
+    const bool hadPrevious = SD.exists(missionPath.c_str());
+    if (hadPrevious && !SD.rename(missionPath.c_str(), backupPath.c_str())) {
+      missionUploadInProgress = false; SD.remove("/missions/upload.tmp");
+      emitLine("ERR MISSION SD WRITE"); return;
+    }
+    if (!SD.rename("/missions/upload.tmp", missionPath.c_str()) || !persistMissionSelection(verifiedId) ||
+        !loadMissionFromSd(verifiedId)) {
+      SD.remove(missionPath.c_str());
+      if (hadPrevious) SD.rename(backupPath.c_str(), missionPath.c_str());
+      missionUploadInProgress = false;
+      emitLine("ERR MISSION SD SELECT"); return;
+    }
+    SD.remove(backupPath.c_str());
+    missionUploadInProgress = false;
+    cleanupObsoleteMissionFiles();
+    emitLine("ACK MISSION COMMIT " + String(missionWaypointCount));
+    emitLine("TEL STATUS MISSION " + String(missionWaypointCount) + " UPLOAD SD LOADED " +
+      String(missionId) + " RUNNING " + String(runningMissionId[0] ? runningMissionId : "NONE"));
+    return;
+  }
+
+  if (command.startsWith("CTRL MISSION BEGIN ")) {
+    char requestedId[37] = "";
+    unsigned int count = 0, boundaryCount = 0, hasHome = 0, hasEnd = 0;
+    if (sscanf(command.c_str(), "CTRL MISSION BEGIN %36s %u %u %u %u", requestedId, &count, &boundaryCount, &hasHome, &hasEnd) != 5 ||
+        !validMissionId(requestedId) ||
+        count == 0 || count > MAX_MISSION_WAYPOINTS || boundaryCount > MAX_MISSION_BOUNDARY_POINTS || hasHome > 1 || hasEnd > 1) {
+      missionUploadInProgress = false;
+      emitLine("ERR MISSION BAD COUNT");
+      return;
+    }
+    stagedMissionWaypointCount = static_cast<uint8_t>(count);
+    stagedMissionMetadata = MissionMetadata();
+    stagedMissionBoundaryCount = static_cast<uint8_t>(boundaryCount);
+    stagedMissionMetadata.boundaryCount = stagedMissionBoundaryCount;
+    stagedMissionHasHome = hasHome != 0; stagedMissionHasEnd = hasEnd != 0;
+    stagedMissionHomeReceived = false; stagedMissionEndReceived = false;
+    stagedMissionBoundaryMask = 0;
+    strlcpy(stagedMissionId, requestedId, sizeof(stagedMissionId));
+    stagedMissionWaypointMask = 0;
+    missionUploadInProgress = true;
+    emitLine("ACK MISSION BEGIN " + String(count));
+    return;
+  }
+
+  if (command.startsWith("CTRL MISSION HOME ") || command.startsWith("CTRL MISSION END ")) {
+    const bool isHome = command.startsWith("CTRL MISSION HOME ");
+    float latitude = 0, longitude = 0;
+    if (!missionUploadInProgress || sscanf(command.c_str(), isHome ? "CTRL MISSION HOME %f %f" : "CTRL MISSION END %f %f", &latitude, &longitude) != 2 ||
+        !isfinite(latitude) || !isfinite(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180 ||
+        (isHome && !stagedMissionHasHome) || (!isHome && !stagedMissionHasEnd)) { emitLine("ERR MISSION BAD LOCATION"); return; }
+    if (isHome) { stagedMissionMetadata.hasHome = true; stagedMissionMetadata.home = {latitude, longitude}; stagedMissionHomeReceived = true; emitLine("ACK MISSION HOME"); }
+    else { stagedMissionMetadata.hasEnd = true; stagedMissionMetadata.end = {latitude, longitude}; stagedMissionEndReceived = true; emitLine("ACK MISSION END"); }
+    return;
+  }
+
+  if (command.startsWith("CTRL MISSION BOUNDARY ")) {
+    unsigned int index = 0; float latitude = 0, longitude = 0;
+    if (!missionUploadInProgress || sscanf(command.c_str(), "CTRL MISSION BOUNDARY %u %f %f", &index, &latitude, &longitude) != 3 ||
+        index >= stagedMissionBoundaryCount || !isfinite(latitude) || !isfinite(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+      emitLine("ERR MISSION BAD BOUNDARY"); return;
+    }
+    stagedMissionMetadata.boundary[index] = {latitude, longitude};
+    stagedMissionBoundaryMask |= (static_cast<uint64_t>(1) << index);
+    emitLine("ACK MISSION BOUNDARY " + String(index)); return;
+  }
+
+  if (command.startsWith("CTRL MISSION POINT ")) {
+    unsigned int index = 0;
+    float latitude = 0.0f, longitude = 0.0f; unsigned int measurementMask = 0, collectData = 0, holdSeconds = 0, speedPercent = 0;
+    if (!missionUploadInProgress ||
+        sscanf(command.c_str(), "CTRL MISSION POINT %u %f %f %u %u %u %u", &index, &latitude, &longitude, &measurementMask, &collectData, &holdSeconds, &speedPercent) != 7 ||
+        index >= stagedMissionWaypointCount || !isfinite(latitude) || !isfinite(longitude) ||
+        latitude < -90.0f || latitude > 90.0f || longitude < -180.0f || longitude > 180.0f || measurementMask > 31 || collectData > 1 || holdSeconds > 3600 || speedPercent < 1 || speedPercent > 100) {
+      emitLine("ERR MISSION BAD POINT");
+      return;
+    }
+    stagedMissionWaypoints[index] = {latitude, longitude, static_cast<uint16_t>(measurementMask), collectData != 0, static_cast<uint16_t>(holdSeconds), static_cast<uint8_t>(speedPercent)};
+    stagedMissionWaypointMask |= (static_cast<uint64_t>(1) << index);
+    emitLine("ACK MISSION POINT " + String(index));
+    return;
+  }
+
+  if (command == "CTRL MISSION COMMIT") {
+    const uint64_t expectedMask = stagedMissionWaypointCount == 64
+      ? UINT64_MAX
+      : ((static_cast<uint64_t>(1) << stagedMissionWaypointCount) - 1);
+    const uint64_t expectedBoundaryMask = stagedMissionBoundaryCount == 64 ? UINT64_MAX : (stagedMissionBoundaryCount == 0 ? 0 : ((static_cast<uint64_t>(1) << stagedMissionBoundaryCount) - 1));
+    if (!missionUploadInProgress || stagedMissionWaypointCount == 0 ||
+        stagedMissionWaypointMask != expectedMask || stagedMissionBoundaryMask != expectedBoundaryMask ||
+        stagedMissionHomeReceived != stagedMissionHasHome || stagedMissionEndReceived != stagedMissionHasEnd) {
+      missionUploadInProgress = false;
+      emitLine("ERR MISSION INCOMPLETE");
+      return;
+    }
+    if (!saveMissionToSd(stagedMissionId, stagedMissionWaypoints, stagedMissionWaypointCount, &stagedMissionMetadata)) {
+      missionUploadInProgress = false;
+      emitLine("ERR MISSION SD WRITE");
+      return;
+    }
+    if (!persistMissionSelection(stagedMissionId)) {
+      missionUploadInProgress = false;
+      emitLine("ERR MISSION SD SELECT");
+      return;
+    }
+    SD.remove(currentMissionFilePath(".bak").c_str());
+    memcpy(missionWaypoints, stagedMissionWaypoints,
+      stagedMissionWaypointCount * sizeof(MissionWaypoint));
+    missionWaypointCount = stagedMissionWaypointCount;
+    missionMetadata = stagedMissionMetadata;
+    strlcpy(missionId, stagedMissionId, sizeof(missionId));
+    missionUploadInProgress = false;
+    cleanupObsoleteMissionFiles();
+    emitLine("ACK MISSION COMMIT " + String(missionWaypointCount));
+    emitLine("TEL STATUS MISSION " + String(missionWaypointCount) + " UPLOAD SD LOADED " +
+      String(missionId) + " RUNNING " + String(runningMissionId[0] ? runningMissionId : "NONE"));
+    return;
+  }
+
+  if (command == "CTRL MISSION LIST") {
+    emitMissionList();
+    return;
+  }
+
+  if (command.startsWith("CTRL MISSION DELETE ")) {
+    char requestedId[37] = "";
+    if (sscanf(command.c_str(), "CTRL MISSION DELETE %36s", requestedId) != 1 ||
+        !validMissionId(requestedId)) {
+      emitLine("ERR MISSION BAD ID");
+      return;
+    }
+    if (!sdCardMounted) {
+      emitLine("ERR MISSION SD UNAVAILABLE");
+      return;
+    }
+    if (runningMissionId[0] && strcmp(runningMissionId, requestedId) == 0) {
+      emitLine("ERR MISSION RUNNING");
+      return;
+    }
+    if (!deleteMissionFromSd(requestedId)) {
+      emitLine("ERR MISSION DELETE FAILED");
+      return;
+    }
+    emitLine("ACK MISSION DELETE " + String(requestedId));
+    sendStatusSnapshot();
+    return;
+  }
+
+  if (command.startsWith("CTRL MISSION READ")) {
+    char requestedId[37] = "";
+    const bool hasId = sscanf(command.c_str(), "CTRL MISSION READ %36s", requestedId) == 1;
+    MissionWaypoint points[MAX_MISSION_WAYPOINTS] = {};
+    uint8_t pointCount = 0;
+    char resultId[37] = "";
+    MissionMetadata metadata;
+    if (hasId) {
+      if (!validMissionId(requestedId)) {
+        emitLine("ERR MISSION BAD ID");
+        return;
+      }
+      const String path = currentMissionFilePath();
+      bool found = readMissionFile(path.c_str(), points, pointCount, resultId, &metadata) && strcmp(resultId, requestedId) == 0;
+      if (!found) {
+        const String backupPath = currentMissionFilePath(".bak");
+        found = readMissionFile(backupPath.c_str(), points, pointCount, resultId, &metadata) && strcmp(resultId, requestedId) == 0;
+      }
+      if (!found) {
+        emitLine("ERR MISSION NOT FOUND");
+        return;
+      }
+    } else {
+      pointCount = missionWaypointCount;
+      strlcpy(resultId, missionId, sizeof(resultId));
+      memcpy(points, missionWaypoints, pointCount * sizeof(MissionWaypoint));
+      metadata = missionMetadata;
+    }
+    emitLine("ACK MISSION READ " + String(resultId) + " " + String(pointCount) + " " + String(metadata.boundaryCount) + " " + String(metadata.hasHome ? 1 : 0) + " " + String(metadata.hasEnd ? 1 : 0));
+    if (metadata.hasHome) emitLine("TEL MISSION HOME " + String(metadata.home.latitude, 7) + " " + String(metadata.home.longitude, 7));
+    if (metadata.hasEnd) emitLine("TEL MISSION END " + String(metadata.end.latitude, 7) + " " + String(metadata.end.longitude, 7));
+    for (uint8_t i = 0; i < metadata.boundaryCount; ++i)
+      emitLine("TEL MISSION BOUNDARY " + String(i) + " " + String(metadata.boundary[i].latitude, 7) + " " + String(metadata.boundary[i].longitude, 7));
+    for (uint8_t i = 0; i < pointCount; ++i) {
+      emitLine("TEL MISSION POINT " + String(i) + " " +
+        String(points[i].latitude, 7) + " " + String(points[i].longitude, 7) + " " +
+        String(points[i].measurementMask) + " " + String(points[i].collectData ? 1 : 0) + " " + String(points[i].holdSeconds) + " " + String(points[i].speedPercent));
+    }
     return;
   }
 
@@ -2964,6 +4041,7 @@ void setupMotors() {
 void setup() {
   gpsSerial.begin(GPS_BAUDRATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  magnetometerAvailable = setupQmc5883();
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
   lastLedToggleMs = millis();
@@ -2972,6 +4050,9 @@ void setup() {
   elrs.begin();
   ads1115Available = setupAds1115();
   sdCardMounted = mountSdCard();
+  magnetometerCalibrationLoaded = loadNavigationConfigFromSd();
+  if (sdCardMounted && !loadSelectedMissionFromSd() &&
+      !migrateSelectedMissionCollectionFromSd()) migrateLegacyMissionFromSd();
   setupWifiControl();
   delay(250);
   calibrateCurrentSensorZero();
@@ -2988,6 +4069,8 @@ void setup() {
   emitLine("SD card: " + String(sdCardMounted ? "ready" : "unavailable"));
   emitLine("ADS1115: " + String(ads1115Available ? "ready" : "unavailable"));
   emitLine("MPU6050: " + String(mpu6050Available ? "ready" : "unavailable"));
+  emitLine("QMC5883 magnetometer: " + String(magnetometerAvailable ? "ready at 0x0D" : "unavailable"));
+  emitLine("Navigation config: " + String(magnetometerCalibrationLoaded ? "magnetometer calibration loaded from SD" : "default; no calibration file"));
   emitLine("INMP441 audio: " + String(audioInputAvailable ? "ready" : "unavailable"));
   emitLine("ELRS UART2: MAVLink 460800");
   updateSdCardTelemetry();
@@ -2999,14 +4082,20 @@ void loop() {
   if (!serviceMode) processAudioFrames();
   processTcpControl();
   processSdFileServer();
+  elrs.poll();
   updateMotorCommandWatchdog();
   if (serviceMode) {
     serviceElrsTelemetry(millis());
     updateStatusLed();
+    flushTcpTelemetry();
     delay(1);
     return;
   }
   processGpsSerial();
+  if (!magnetometerAvailable && millis() - lastMagnetometerRetryMs >= 5000) {
+    lastMagnetometerRetryMs = millis();
+    magnetometerAvailable = setupQmc5883();
+  }
   serviceElrsTelemetry(millis());
   updateStatusLed();
   updateMotorRamps();
@@ -3018,50 +4107,68 @@ void loop() {
   uint32_t waterTemperatureIntervalMs = audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : WATER_TEMP_STREAM_INTERVAL_MS;
   uint32_t powerIntervalMs = audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : POWER_STREAM_INTERVAL_MS;
   uint32_t diagnosticsIntervalMs = audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : 5000UL;
-  if (imuStreamEnabled && controlClientConnected() && (nowMs - lastImuStreamMs >= sensorStreamIntervalMs)) {
+  if (telemetryMode == TELEMETRY_MODE_WIFI && imuStreamEnabled && controlClientConnected() &&
+      (nowMs - lastImuStreamMs >= sensorStreamIntervalMs)) {
     lastImuStreamMs = nowMs;
     sendUdpImuTelemetry();
   }
   if (!sdTransferActive && nowMs - lastRangeStreamMs >= rangeIntervalMs) {
     lastRangeStreamMs = nowMs;
     latestRangeValid = readJsnSr04tDistanceMm(latestRangeDistanceMm);
-    if (controlClientConnected()) {
+    if (telemetryMode == TELEMETRY_MODE_WIFI && controlClientConnected()) {
       sendUdpRangeTelemetry();
     }
   }
-  if (controlClientConnected() && (nowMs - lastWaterTempStreamMs >= waterTemperatureIntervalMs)) {
+  if (telemetryMode == TELEMETRY_MODE_WIFI && controlClientConnected() &&
+      (nowMs - lastWaterTempStreamMs >= waterTemperatureIntervalMs)) {
     lastWaterTempStreamMs = nowMs;
     emitWaterTemperatureTelemetry();
   }
   const uint32_t waterChemistryIntervalMs = audioRecordingEnabled
     ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : WATER_CHEMISTRY_STREAM_INTERVAL_MS;
-  if (controlClientConnected() && (nowMs - lastWaterChemistryStreamMs >= waterChemistryIntervalMs)) {
+  if (telemetryMode == TELEMETRY_MODE_WIFI && controlClientConnected() &&
+      (nowMs - lastWaterChemistryStreamMs >= waterChemistryIntervalMs)) {
     lastWaterChemistryStreamMs = nowMs;
     emitWaterChemistryTelemetry();
   }
-  if (controlClientConnected() && (nowMs - lastPowerStreamMs >= powerIntervalMs)) {
+  if (telemetryMode == TELEMETRY_MODE_WIFI && controlClientConnected() &&
+      (nowMs - lastPowerStreamMs >= powerIntervalMs)) {
     lastPowerStreamMs = nowMs;
     sendUdpPowerTelemetry();
   }
-  if (controlClientConnected() && (nowMs - lastStateStreamMs >= STATE_STREAM_INTERVAL_MS)) {
+  if (telemetryMode == TELEMETRY_MODE_WIFI && controlClientConnected() &&
+      (nowMs - lastStateStreamMs >= STATE_STREAM_INTERVAL_MS)) {
     lastStateStreamMs = nowMs;
     sendUdpStateTelemetry();
   }
-  if (controlClientConnected() && (nowMs - lastMotorOutputStreamMs >= MOTOR_OUTPUT_STREAM_INTERVAL_MS)) {
+  if (telemetryMode == TELEMETRY_MODE_WIFI && controlClientConnected() &&
+      (nowMs - lastElrsChannelStreamMs >= ELRS_CHANNEL_STREAM_INTERVAL_MS)) {
+    lastElrsChannelStreamMs = nowMs;
+    sendUdpElrsChannelsTelemetry();
+  }
+  if (telemetryMode == TELEMETRY_MODE_WIFI && controlClientConnected() &&
+      (nowMs - lastMotorOutputStreamMs >= MOTOR_OUTPUT_STREAM_INTERVAL_MS)) {
     lastMotorOutputStreamMs = nowMs;
     sendMotorOutputTelemetry();
   }
-  if (controlClientConnected() && (nowMs - lastGpsStreamMs >= GPS_STREAM_INTERVAL_MS)) {
+  if (telemetryMode == TELEMETRY_MODE_WIFI && controlClientConnected() &&
+      (nowMs - lastGpsStreamMs >= GPS_STREAM_INTERVAL_MS)) {
     lastGpsStreamMs = nowMs;
     sendUdpGpsTelemetry();
+  }
+  if (telemetryMode == TELEMETRY_MODE_WIFI && controlClientConnected() &&
+      (nowMs - lastMagnetometerStreamMs >= MAGNETOMETER_STREAM_INTERVAL_MS)) {
+    lastMagnetometerStreamMs = nowMs;
+    emitMagnetometerTelemetry();
   }
   serviceSdRecorder(nowMs);
   processAudioFrames();
 
-  if (nowMs - lastSerialSensorTestMs >= diagnosticsIntervalMs) {
+  if (telemetryMode == TELEMETRY_MODE_WIFI && nowMs - lastSerialSensorTestMs >= diagnosticsIntervalMs) {
     lastSerialSensorTestMs = nowMs;
     emitSensorDiagnostics();
   }
+  flushTcpTelemetry();
 }
 
 
