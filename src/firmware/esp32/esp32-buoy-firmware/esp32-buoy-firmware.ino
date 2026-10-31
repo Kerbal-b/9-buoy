@@ -141,7 +141,9 @@ const size_t TCP_COMMAND_BUFFER_LIMIT = 600;
 const i2s_port_t AUDIO_I2S_PORT = I2S_NUM_0;
 const uint32_t AUDIO_DEFAULT_SAMPLE_RATE = 16000;
 const size_t AUDIO_FRAME_SAMPLES = 256;
-const int AUDIO_PCM_SHIFT = 11;
+// INMP441 samples are 24-bit values in 32-bit I2S slots; retain the upper
+// 16 bits when converting to signed 16-bit WAV samples.
+const int AUDIO_PCM_SHIFT = 16;
 // Leave digital headroom for the INMP441 pair. The previous 4x multiplier
 // clipped most samples in real SD recordings and made stereo position sound unstable.
 const float AUDIO_INPUT_GAIN = 1.0f;
