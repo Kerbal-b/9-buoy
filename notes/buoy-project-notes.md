@@ -6,6 +6,7 @@ This file is now the notes index and workflow reference.
 
 Use `notes/sessions/` for real dated meeting notes.
 Create one file per day using the format `YYYY-MM-DD.md`.
+For field tests, follow the [SD card workflow](./SD-CARD-FIELD-WORKFLOW.md) before the next run.
 
 ## Canonical Research Files
 
