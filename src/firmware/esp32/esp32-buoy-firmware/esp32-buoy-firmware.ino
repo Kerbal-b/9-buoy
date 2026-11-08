@@ -2,13 +2,16 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <ArduinoOTA.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <FS.h>
 #include <SD.h>
 #include <SPI.h>
+#include <Preferences.h>
 #include <math.h>
 #include <driver/i2s.h>
+#include <esp_system.h>
 #include <esp_timer.h>
 #include <lwip/sockets.h>
 #include <stdlib.h>
@@ -72,6 +75,7 @@ const uint32_t SD_SPI_FREQUENCY = 20000000UL;
 const size_t SD_AUDIO_WRITE_BLOCK_BYTES = 4096;
 const uint32_t SD_FLUSH_INTERVAL_MS = 1000;
 const uint32_t SD_CARD_TELEMETRY_INTERVAL_MS = 30000;
+const uint32_t SD_STANDALONE_TELEMETRY_INTERVAL_MS = 1000;
 const uint32_t SD_SCIENCE_INTERVAL_MS = 100;
 const uint32_t SD_TELEMETRY_INTERVAL_MS = 100;
 const uint32_t AUDIO_PRIORITY_SENSOR_INTERVAL_MS = 30000;
@@ -104,6 +108,11 @@ const float CURRENT_SENSOR_NOISE_FLOOR_AMPS = 0.15;
 const float CURRENT_SENSOR_STARTUP_LOAD_AMPS = 0.21f;  // Measured at battery feed with motors off
 
 const int MOTOR_OUTPUT_LIMIT = 255;
+// Below this command magnitude, the calibrated sustain PWM is already near its
+// minimum. Pulse the whole mix on a common clock so relative motor on-time is
+// proportional instead of flattening every small command to the same PWM.
+const int LOW_SPEED_MIX_THRESHOLD = 64;
+const uint32_t LOW_SPEED_MIX_PERIOD_MS = 800;
 const int VECTOR_SCALE = 100;
 const float MOTOR_OUTPUT_BOOST = 2.0f;
 const bool MOTOR_DIRECTION_INVERTED = true;
@@ -112,10 +121,26 @@ const int MOTOR_RAMP_UP_PER_SECOND = 120;
 const int MOTOR_RAMP_DOWN_PER_SECOND = 200;
 const uint32_t MOTOR_COMMAND_WATCHDOG_MS = 1000;
 const int ELRS_MOTOR_POWER_LIMIT_PERCENT = 100;
+const uint32_t MANUAL_ASSIST_UPDATE_INTERVAL_MS = 100;
+const float MANUAL_ASSIST_HEADING_DEADBAND_DEG = 4.0f;
+const float MANUAL_ASSIST_YAW_GAIN_PERCENT_PER_DEG = 0.55f;
+const int MANUAL_ASSIST_MAX_YAW_PERCENT = 25;
 const uint32_t ELRS_TELEMETRY_INTERVAL_MS = 1000;
 const uint32_t ELRS_BATTERY_INTERVAL_MS = 5000;
 const uint32_t ELRS_GPS_INTERVAL_MS = 5000;
 const uint32_t ELRS_SCIENCE_INTERVAL_MS = 1000;
+const uint32_t ELRS_NAVIGATION_INTERVAL_MS = 5000;
+const uint32_t ELRS_ATTITUDE_INTERVAL_MS = 1000;
+const uint32_t ELRS_MOTION_SAMPLE_INTERVAL_MS = 100;
+const uint32_t ELRS_MOTION_WINDOW_MS = 5000;
+const uint32_t ELRS_CALIBRATION_SAMPLE_INTERVAL_MS = 50;
+const uint32_t ELRS_CALIBRATION_PULSE_DURATION_DEFAULT_MS = 10000;
+const uint32_t ELRS_CALIBRATION_PULSE_DURATION_LONG_MS = 20000;
+// EdgeTX extended channel limits can send 881..2119 us on CH11-CH16.
+// Accept those endpoints for calibration metadata while still rejecting
+// missing/ignored (0) channels and values outside the RC override range.
+const uint16_t ELRS_CALIBRATION_CHANNEL_MIN_US = 881;
+const uint16_t ELRS_CALIBRATION_CHANNEL_MAX_US = 2119;
 
 const int PWM_FREQ_HZ = 20000;
 const int PWM_RES_BITS = 8;
@@ -137,6 +162,11 @@ const uint32_t MOTOR_OUTPUT_STREAM_INTERVAL_MS = 100;
 const uint32_t ELRS_CHANNEL_STREAM_INTERVAL_MS = 100;
 const uint32_t GPS_STREAM_INTERVAL_MS = 500;
 const uint32_t MAGNETOMETER_STREAM_INTERVAL_MS = 500;
+// The QMC5883 updates at 50 Hz while mission navigation updates every 200 ms.
+// Keep the last valid heading across brief not-ready samples, but stop if it
+// goes stale or the sensor reports an I2C failure.
+const uint32_t MISSION_HEADING_MAX_AGE_MS = 500;
+const double MISSION_START_RADIUS_M = 30.0;
 const size_t TCP_COMMAND_BUFFER_LIMIT = 600;
 const i2s_port_t AUDIO_I2S_PORT = I2S_NUM_0;
 const uint32_t AUDIO_DEFAULT_SAMPLE_RATE = 16000;
@@ -289,9 +319,9 @@ struct __attribute__((packed)) AudioIndexRecord {
 MotorChannel motors[] = {
   // Rear motor is the first tuning target. Adjust these values before
   // changing the front motors if the drivetrain is being balanced.
-  {REAR_IN1_PIN, REAR_IN2_PIN, REAR_IN1_PWM_CHANNEL, REAR_IN2_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, false, 0, 171, 171, 260, 260, 130, 130, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 125, 125},
-  {FRONT_LEFT_IN1_PIN, FRONT_LEFT_IN2_PIN, FRONT_LEFT_IN1_PWM_CHANNEL, FRONT_LEFT_IN2_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, false, 0, 171, 171, 260, 260, 130, 130, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 125, 125},
-  {FRONT_RIGHT_IN1_PIN, FRONT_RIGHT_IN2_PIN, FRONT_RIGHT_IN1_PWM_CHANNEL, FRONT_RIGHT_IN2_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, true, 0, 171, 171, 260, 260, 130, 130, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 125, 125},
+  {REAR_IN1_PIN, REAR_IN2_PIN, REAR_IN1_PWM_CHANNEL, REAR_IN2_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, false, 0, 110, 110, 0, 0, 110, 110, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 75, 75},
+  {FRONT_LEFT_IN1_PIN, FRONT_LEFT_IN2_PIN, FRONT_LEFT_IN1_PWM_CHANNEL, FRONT_LEFT_IN2_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, false, 0, 110, 110, 0, 0, 110, 110, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 75, 75},
+  {FRONT_RIGHT_IN1_PIN, FRONT_RIGHT_IN2_PIN, FRONT_RIGHT_IN1_PWM_CHANNEL, FRONT_RIGHT_IN2_PWM_CHANNEL, 1.00f, 1.00f, 0.00f, false, 0, 110, 110, 0, 0, 110, 110, 255, 255, 2.00f, 2.00f, 1.00f, 1.00f, 0, 0, 75, 75},
 };
 
 const int MOTOR_COUNT = sizeof(motors) / sizeof(motors[0]);
@@ -316,6 +346,26 @@ const float external_tangential_motor_axes[3][2] = {
   {-0.5f, 0.86602540378f},
 };
 const float external_tangential_yaw_gains[3] = {1.0f, -1.0f, 1.0f};
+// In the single-motor water trial, rear+ and front-left+ turned the hull the
+// same way, while front-right+ turned it the opposite way. Manual strafe must
+// counter that torque while retaining a net lateral force.
+const float tx12_manual_lateral_gains[3] = {-1.0f, 0.5f, -0.5f};
+// Right strafe was still producing a clockwise yaw bias in the water trace.
+// Move some reverse demand off the rear motor and into the front-left motor;
+// leave the opposite (left strafe) mix unchanged for this trial.
+const float tx12_manual_right_lateral_gains[3] = {-0.8f, 0.8f, -0.5f};
+// Empirical mixer points are commanded motor drive percentages at each
+// requested axis magnitude. Axis order: forward, reverse, right, left, CW, CCW.
+const uint8_t MIXER_CAL_POWER_STEPS = 10;  // 10..100 percent, in 10 percent steps.
+const uint8_t MIXER_CAL_AXIS_COUNT = 6;
+int8_t mixerCalValues[MIXER_CAL_POWER_STEPS][MIXER_CAL_AXIS_COUNT][MOTOR_COUNT] = {};
+bool mixerCalPointSet[MIXER_CAL_POWER_STEPS][MIXER_CAL_AXIS_COUNT] = {};
+bool mixerCalProfileLoaded = false;
+bool mixerCalLoadedFromBackup = false;
+uint32_t mixerCalProfileCrc = 0;
+// Water-trial starting estimate: a reverse-running propeller produces about
+// half the useful thrust of the same forward command.
+const float TX12_MANUAL_REVERSE_COMMAND_GAIN = 2.0f;
 
 // ---------------------------------------------------------------------------
 // Runtime State
@@ -332,13 +382,29 @@ enum TelemetryMode { TELEMETRY_MODE_WIFI, TELEMETRY_MODE_MAVLINK };
 TelemetryMode telemetryMode = TELEMETRY_MODE_WIFI;
 bool elrsArmReady = false;
 bool elrsArmed = false;
+bool elrsArmBlockedByWifiLogged = false;
+bool elrsArmInterlockBlockLogged = false;
 bool magnetometerAvailable = false;
 bool magnetometerCalibrationLoaded = false;
 float magnetometerOffsetX = 0.0f;
 float magnetometerOffsetY = 0.0f;
 float magnetometerScaleX = 1.0f;
 float magnetometerScaleY = 1.0f;
+bool missionHeadingCacheValid = false;
+float missionHeadingCacheDegrees = 0.0f;
+uint32_t missionHeadingCacheUpdatedMs = 0;
 bool missionModeRequested = false;
+bool manualAssistRequested = false;
+bool manualAssistTargetValid = false;
+bool manualAssistYawing = false;
+bool manualAssistHeadingAvailable = false;
+float manualAssistTargetHeadingDegrees = 0.0f;
+float manualAssistLastYawCorrection = 0.0f;
+uint32_t lastManualAssistUpdateMs = 0;
+bool elrsScienceSwitchPositionKnown = false;
+int8_t elrsScienceSwitchPosition = 0;
+bool elrsScienceManualModeKnown = false;
+bool elrsScienceManualMode = false;
 bool manualLinkLossStop = false;
 uint32_t elrsFailsafeCount = 0;
 String lastElrsFailsafeStatus = "NONE";
@@ -346,7 +412,18 @@ uint32_t lastElrsAppliedRcMs = 0;
 uint32_t lastElrsTelemetryMs = 0;
 uint32_t lastElrsBatteryMs = 0;
 uint32_t lastElrsGpsMs = 0;
+uint32_t lastWifiHomeStatusMs = 0;
+uint8_t lastElrsHomeKind = 255;
+double lastElrsHomeLatitude = NAN;
+double lastElrsHomeLongitude = NAN;
 uint32_t lastElrsScienceMs = 0;
+uint32_t lastElrsNavigationMs = 0;
+uint32_t lastElrsAttitudeMs = 0;
+uint32_t lastElrsMotionSampleMs = 0;
+uint32_t elrsMotionWindowStartMs = 0;
+float elrsDynamicAccelSquaredSum = 0.0f;
+float elrsAngularRateSquaredSum = 0.0f;
+uint16_t elrsMotionSampleCount = 0;
 uint8_t elrsScienceField = 0;
 
 double gpsLatitude = 0.0;
@@ -357,6 +434,7 @@ int targetDriveValues[] = {0, 0, 0};
 int appliedMotorPwm[] = {0, 0, 0};
 bool motorStartBoostPending[] = {false, false, false};
 uint32_t motorStartBoostUntilMs[] = {0, 0, 0};
+uint32_t lowSpeedMixEpochMs = 0;
 ControlMode controlMode = CONTROL_MODE_IDLE;
 bool holdPositionEnabled = false;
 bool targetLocationSet = false;
@@ -373,10 +451,16 @@ struct MissionMetadata {
   MissionCoordinate end = {};
   uint8_t boundaryCount = 0;
   MissionCoordinate boundary[MAX_MISSION_BOUNDARY_POINTS] = {};
+  uint8_t linkLossAction = 1; // 0=stop, 1=return home
+  uint8_t boundaryBreachAction = 1;
+  uint8_t lowBatteryAction = 1;
+  uint8_t batteryThresholdPercent = 20;
 };
 MissionWaypoint missionWaypoints[MAX_MISSION_WAYPOINTS] = {};
 MissionWaypoint stagedMissionWaypoints[MAX_MISSION_WAYPOINTS] = {};
 MissionMetadata missionMetadata;
+MissionCoordinate missionPlannedHomeBeforeRun = {};
+bool missionHomeCapturedForRun = false;
 MissionMetadata stagedMissionMetadata;
 uint8_t missionWaypointCount = 0;
 uint8_t stagedMissionWaypointCount = 0;
@@ -391,6 +475,53 @@ bool missionUploadInProgress = false;
 char missionId[37] = "";
 char stagedMissionId[37] = "";
 char runningMissionId[37] = "";
+bool missionExecutionActive = false;
+bool missionReturningHome = false;
+MissionCoordinate manualHome = {};
+bool manualHomeAvailable = false;
+struct PersistedManualHome {
+  uint32_t magic;
+  int32_t latitudeE7;
+  int32_t longitudeE7;
+};
+constexpr uint32_t MANUAL_HOME_STORAGE_MAGIC = 0x484F4D45UL;
+Preferences manualHomePreferences;
+bool manualHomePreferencesReady = false;
+bool manualHomeButtonReleasedAfterArm = false;
+uint32_t manualRthComboStartedMs = 0;
+bool manualRthComboTriggered = false;
+bool manualReturnHomeActive = false;
+uint32_t lastManualReturnUpdateMs = 0;
+uint32_t lastManualReturnTelemetryMs = 0;
+bool missionCheckpointActive = false;
+bool missionStartLocked = false;
+bool missionStartBlockedLogged = false;
+uint8_t missionStartBlockCode = 0;
+uint8_t missionCurrentWaypoint = 0;
+uint8_t missionCompletedWaypoints = 0;
+int16_t missionReturnWaypointIndex = -1;
+char missionLastRunId[37] = "";
+float missionDistanceToWaypointMeters = NAN;
+float missionDistanceFromHomeMeters = NAN;
+uint8_t missionPercentComplete = 0;
+uint32_t missionCheckpointStartedMs = 0;
+uint32_t lastMissionControlMs = 0;
+uint32_t lastMissionUpdateMs = 0;
+uint32_t lastMissionTelemetryMs = 0;
+String missionRunStatus = "IDLE";
+String missionStopReason = "";
+
+uint8_t missionTelemetryStatusCode() {
+  if (missionStartBlockCode != 0) return 8;
+  if (missionRunStatus == "STARTING") return 1;
+  if (missionRunStatus == "MOVING") return 2;
+  if (missionRunStatus == "COLLECTING") return 3;
+  if (missionRunStatus == "RETURNING_HOME") return 4;
+  if (missionRunStatus == "STOPPED") return 5;
+  if (missionRunStatus == "COMPLETE") return 6;
+  if (missionRunStatus == "RETURNED_HOME") return 7;
+  return 0;
+}
 
 float currentSensorZeroVoltage = ADC_REFERENCE_VOLTAGE / 2.0;
 bool mpu6050Available = false;
@@ -404,6 +535,8 @@ volatile uint32_t audioSampleRateHz = AUDIO_DEFAULT_SAMPLE_RATE;
 bool ads1115Available = false;
 WiFiServer tcpServer(WIFI_TCP_PORT);
 WiFiClient tcpClient;
+bool otaServiceReady = false;
+bool otaUpdateInProgress = false;
 // Queue TCP telemetry so a weak Wi-Fi connection cannot stall ELRS control.
 constexpr size_t TCP_TELEMETRY_BUFFER_SIZE = 4096;
 char tcpTelemetryBuffer[TCP_TELEMETRY_BUFFER_SIZE];
@@ -429,6 +562,10 @@ uint32_t lastWaterChemistryStreamMs = 0;
 uint32_t lastPowerStreamMs = 0;
 uint32_t lastStateStreamMs = 0;
 uint32_t lastMotorOutputStreamMs = 0;
+int latestMixerInputLateral = 0;
+int latestMixerInputThrust = 0;
+int latestMixerInputYaw = 0;
+bool latestMixerInputTx12 = false;
 uint32_t lastElrsChannelStreamMs = 0;
 uint32_t lastGpsStreamMs = 0;
 uint32_t lastMagnetometerStreamMs = 0;
@@ -451,6 +588,31 @@ File sdAudioFile;
 File sdAudioIndexFile;
 File sdScienceFile;
 File sdTelemetryFile;
+File sdCalibrationFile;
+bool elrsCalibrationActive = false;
+uint8_t elrsCalibrationStatusCode = 0; // 0=idle, 1=active, 2=stopped, 3=complete
+int lastElrsStatusHeading = -1;
+uint32_t lastElrsStatusHeadingMs = 0;
+uint32_t lastElrsCompactStatusMs = 0;
+bool elrsCalibrationArmedOnce = false;
+bool elrsCalibrationArmBlockLogged = false;
+bool elrsCalibrationTestActive = false;
+bool elrsCalibrationFinalTest = false;
+uint8_t elrsCalibrationMode = 0; // 0=mixer response, 1=compass motor load
+uint8_t elrsCalibrationTestIndex = 0;
+uint8_t elrsCalibrationPowerPercent = 0;
+uint32_t elrsCalibrationPulseDurationMs = ELRS_CALIBRATION_PULSE_DURATION_DEFAULT_MS;
+uint8_t elrsCalibrationCurrentPowerPercent = 0;
+uint8_t elrsCalibrationExpectedIndex = 0;
+uint8_t elrsCalibrationExpectedPower = 30;
+uint8_t elrsCalibrationLastCommand = 0;
+uint32_t elrsCalibrationStartedMs = 0;
+uint32_t elrsCalibrationTestStartedMs = 0;
+uint32_t elrsCalibrationTestEndsMs = 0;
+uint32_t elrsCalibrationSampleMs = 0;
+uint32_t elrsCalibrationFlushMs = 0;
+uint32_t elrsCalibrationSampleCount = 0;
+String elrsCalibrationPath;
 bool sdAuxFilesPaused = false;
 File sdTransferFile;
 String sdTransferRequest;
@@ -484,6 +646,10 @@ uint32_t lastSdFlushMs = 0;
 uint32_t lastSdScienceMs = 0;
 uint32_t lastSdTelemetryMs = 0;
 uint32_t lastSdCardTelemetryMs = 0;
+uint32_t lastStandaloneTelemetryMs = 0;
+uint32_t lastStandalonePowerSampleMs = 0;
+uint32_t lastStandaloneScienceSampleMs = 0;
+uint32_t sdLogBootId = 0;
 uint64_t sdCardSizeBytes = 0;
 uint64_t sdTotalBytes = 0;
 uint64_t sdUsedBytes = 0;
@@ -491,6 +657,10 @@ uint16_t latestRangeDistanceMm = 0;
 bool latestRangeValid = false;
 float latestBatteryVolts = 0.0f;
 float latestCurrentAmps = 0.0f;
+ImuReadings standaloneImuReadings = {};
+bool standaloneImuValid = false;
+float standaloneTdsVoltage = NAN;
+float standaloneTurbidityVoltage = NAN;
 
 bool readMpu6050(ImuReadings& readings);
 bool setupMpu6050();
@@ -509,6 +679,15 @@ bool setupAudioInput();
 bool startAudioCaptureTask();
 void processAudioFrames();
 void handleControlCommand(String command);
+void stopMissionExecution(const String& reason, bool completed = false);
+bool missionSegmentInsideBoundary(double fromLatitude, double fromLongitude, double toLatitude, double toLongitude);
+void updateMissionExecution(uint32_t now);
+void updateManualReturnHome(uint32_t now);
+bool activeTelemetryHome(MissionCoordinate& home, uint8_t& homeKind);
+bool loadManualHomeFromPreferences();
+bool saveManualHomeToPreferences(const MissionCoordinate& home);
+void beginMissionReturnHome(const String& reason);
+String currentScienceTimestamp();
 void processTcpControl();
 void processSdFileServer();
 void setupWifiControl();
@@ -526,8 +705,21 @@ bool loadSelectedMissionFromSd();
 void emitMissionList();
 bool startSdRecorder(const String& startUtc);
 bool saveSdRecorder(const String& saveUtc);
+void processElrsScienceSwitch(bool manualMode);
+int applyManualHeadingAssist(int stickYaw, int scaledYaw, int scaledLateral,
+                             int scaledThrust, float powerScale, uint32_t now);
 void serviceSdRecorder(uint32_t nowMs);
+bool recordStandaloneTelemetrySnapshot();
 void recordLogLine(const String& line);
+void stopElrsCalibration(const char* reason, bool completed);
+bool startElrsCalibrationLog(uint8_t mode, uint8_t maxPower, uint32_t pulseDurationMs);
+void processElrsCalibrationCommand(uint32_t now);
+void serviceElrsCalibration(uint32_t now);
+void writeElrsCalibrationSample(uint32_t now);
+float readCurrentSensorVoltage();
+float readBatterySystemVoltage();
+float currentAmpsFromSensorVoltage(float sensorVoltage);
+uint32_t missionCrc32File(const char* path, bool& ok);
 
 bool controlClientConnected() {
   return tcpClient && tcpClient.connected();
@@ -713,7 +905,134 @@ bool saveMagnetometerCalibrationToSd(float offsetX, float offsetY, float scaleX,
   magnetometerScaleX = scaleX;
   magnetometerScaleY = scaleY;
   magnetometerCalibrationLoaded = true;
+  missionHeadingCacheValid = false;
   return true;
+}
+
+bool readMixerCalibrationFile(const char* path, int8_t values[MIXER_CAL_POWER_STEPS][MIXER_CAL_AXIS_COUNT][MOTOR_COUNT],
+                              bool points[MIXER_CAL_POWER_STEPS][MIXER_CAL_AXIS_COUNT]) {
+  if (!sdCardMounted) return false;
+  File file = SD.open(path, FILE_READ);
+  if (!file) return false;
+  memset(values, 0, sizeof(int8_t) * MIXER_CAL_POWER_STEPS * MIXER_CAL_AXIS_COUNT * MOTOR_COUNT);
+  memset(points, 0, sizeof(bool) * MIXER_CAL_POWER_STEPS * MIXER_CAL_AXIS_COUNT);
+  String header = file.readStringUntil('\n');
+  header.trim();
+  bool valid = header == "BUOY_MIXER_PROFILE_V1";
+  while (valid && file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    int power = 0, axis = 0, rear = 0, left = 0, right = 0;
+    if (sscanf(line.c_str(), "POINT,%d,%d,%d,%d,%d", &power, &axis, &rear, &left, &right) != 5 ||
+        power < 10 || power > 100 || power % 10 != 0 || axis < 0 || axis >= MIXER_CAL_AXIS_COUNT ||
+        rear < -100 || rear > 100 || left < -100 || left > 100 || right < -100 || right > 100) {
+      valid = false;
+      break;
+    }
+    const int step = power / 10 - 1;
+    values[step][axis][0] = static_cast<int8_t>(rear);
+    values[step][axis][1] = static_cast<int8_t>(left);
+    values[step][axis][2] = static_cast<int8_t>(right);
+    points[step][axis] = true;
+  }
+  file.close();
+  return valid;
+}
+
+uint8_t mixerCalibrationPointCount(const bool points[MIXER_CAL_POWER_STEPS][MIXER_CAL_AXIS_COUNT]) {
+  uint8_t count = 0;
+  for (uint8_t step = 0; step < MIXER_CAL_POWER_STEPS; ++step)
+    for (uint8_t axis = 0; axis < MIXER_CAL_AXIS_COUNT; ++axis)
+      if (points[step][axis]) ++count;
+  return count;
+}
+
+bool mixerCalibrationComplete() {
+  return mixerCalibrationPointCount(mixerCalPointSet) == MIXER_CAL_POWER_STEPS * MIXER_CAL_AXIS_COUNT;
+}
+
+bool loadMixerCalibrationFromSd() {
+  if (!sdCardMounted) return false;
+  mixerCalLoadedFromBackup = false;
+  bool valid = readMixerCalibrationFile("/config/propulsion.cfg", mixerCalValues, mixerCalPointSet);
+  if (!valid) {
+    valid = readMixerCalibrationFile("/config/propulsion.bak", mixerCalValues, mixerCalPointSet);
+    mixerCalLoadedFromBackup = valid;
+  }
+  if (valid) {
+    mixerCalProfileLoaded = mixerCalibrationPointCount(mixerCalPointSet) > 0;
+    return mixerCalProfileLoaded;
+  }
+  memset(mixerCalPointSet, 0, sizeof(mixerCalPointSet));
+  mixerCalProfileLoaded = false;
+  return false;
+}
+
+bool saveMixerCalibrationToSd() {
+  if (!sdCardMounted || mixerCalibrationPointCount(mixerCalPointSet) == 0) return false;
+  if (!SD.exists("/config") && !SD.mkdir("/config")) return false;
+  const char* temporaryPath = "/config/propulsion.tmp";
+  const char* configPath = "/config/propulsion.cfg";
+  const char* backupPath = "/config/propulsion.bak";
+  SD.remove(temporaryPath);
+  File file = SD.open(temporaryPath, FILE_WRITE);
+  if (!file) return false;
+  bool ok = file.println("BUOY_MIXER_PROFILE_V1") > 0;
+  for (uint8_t step = 0; ok && step < MIXER_CAL_POWER_STEPS; ++step) {
+    for (uint8_t axis = 0; ok && axis < MIXER_CAL_AXIS_COUNT; ++axis) {
+      if (!mixerCalPointSet[step][axis]) continue;
+      ok = file.printf("POINT,%u,%u,%d,%d,%d\n", (step + 1) * 10, axis,
+        mixerCalValues[step][axis][0], mixerCalValues[step][axis][1], mixerCalValues[step][axis][2]) > 0;
+    }
+  }
+  file.flush();
+  file.close();
+  int8_t verifyValues[MIXER_CAL_POWER_STEPS][MIXER_CAL_AXIS_COUNT][MOTOR_COUNT];
+  bool verifyPoints[MIXER_CAL_POWER_STEPS][MIXER_CAL_AXIS_COUNT];
+  if (!ok || !readMixerCalibrationFile(temporaryPath, verifyValues, verifyPoints) ||
+      mixerCalibrationPointCount(verifyPoints) != mixerCalibrationPointCount(mixerCalPointSet)) {
+    SD.remove(temporaryPath);
+    return false;
+  }
+  for (uint8_t step = 0; step < MIXER_CAL_POWER_STEPS; ++step) {
+    for (uint8_t axis = 0; axis < MIXER_CAL_AXIS_COUNT; ++axis) {
+      if (verifyPoints[step][axis] != mixerCalPointSet[step][axis]) { SD.remove(temporaryPath); return false; }
+      if (!verifyPoints[step][axis]) continue;
+      for (uint8_t motor = 0; motor < MOTOR_COUNT; ++motor) {
+        if (verifyValues[step][axis][motor] != mixerCalValues[step][axis][motor]) { SD.remove(temporaryPath); return false; }
+      }
+    }
+  }
+  SD.remove(backupPath);
+  const bool hadPrevious = SD.exists(configPath);
+  if (hadPrevious && !SD.rename(configPath, backupPath)) { SD.remove(temporaryPath); return false; }
+  if (!SD.rename(temporaryPath, configPath)) {
+    if (hadPrevious) SD.rename(backupPath, configPath);
+    SD.remove(temporaryPath);
+    return false;
+  }
+  SD.remove(backupPath);
+  mixerCalProfileLoaded = true;
+  mixerCalLoadedFromBackup = false;
+  return true;
+}
+
+void addMixerCalibrationAxis(float input, uint8_t positiveAxis, uint8_t negativeAxis,
+                             float output[MOTOR_COUNT]) {
+  const uint8_t axis = input >= 0.0f ? positiveAxis : negativeAxis;
+  const float magnitude = fabsf(input) * 100.0f;
+  if (magnitude <= 0.001f) return;
+  const float lowerPosition = magnitude / 10.0f - 1.0f;
+  const int lowerStep = max(0, min(static_cast<int>(MIXER_CAL_POWER_STEPS) - 1, static_cast<int>(floorf(lowerPosition))));
+  const int upperStep = min(static_cast<int>(MIXER_CAL_POWER_STEPS) - 1, lowerStep + 1);
+  const float fraction = lowerPosition < 0.0f ? 0.0f : lowerPosition - lowerStep;
+  const float lowPowerScale = magnitude < 10.0f ? magnitude / 10.0f : 1.0f;
+  for (int motor = 0; motor < MOTOR_COUNT; ++motor) {
+    const float low = mixerCalValues[lowerStep][axis][motor];
+    const float high = mixerCalValues[upperStep][axis][motor];
+    output[motor] += (low + (high - low) * fraction) * lowPowerScale;
+  }
 }
 
 bool validMissionId(const char* id) {
@@ -772,17 +1091,29 @@ bool readMissionFile(const char* path, MissionWaypoint* points, uint8_t& count, 
   unsigned int parsedCount = 0;
   unsigned int boundaryCount = 0, hasHome = 0, hasEnd = 0;
   MissionMetadata parsedMetadata;
-  const bool version3 = header.startsWith("BUOY_MISSION_V3,");
+  const bool version4 = header.startsWith("BUOY_MISSION_V4,");
+  const bool version3 = version4 || header.startsWith("BUOY_MISSION_V3,");
   const bool version2 = version3 || header.startsWith("BUOY_MISSION_V2,");
-  const int headerFields = version2
+  unsigned int linkLossAction = 1, boundaryBreachAction = 1, lowBatteryAction = 1, batteryThresholdPercent = 20;
+  const int headerFields = version4
+    ? sscanf(header.c_str(), "BUOY_MISSION_V4,%36[^,],%u,%u,%u,%u,%u,%u,%u,%u", parsedId, &parsedCount, &boundaryCount, &hasHome, &hasEnd, &linkLossAction, &boundaryBreachAction, &lowBatteryAction, &batteryThresholdPercent)
+    : version2
     ? sscanf(header.c_str(), version3 ? "BUOY_MISSION_V3,%36[^,],%u,%u,%u,%u" : "BUOY_MISSION_V2,%36[^,],%u,%u,%u,%u", parsedId, &parsedCount, &boundaryCount, &hasHome, &hasEnd)
     : sscanf(header.c_str(), "BUOY_MISSION_V1,%36[^,],%u", parsedId, &parsedCount);
-  if (headerFields != (version2 ? 5 : 2) ||
+  if (headerFields != (version4 ? 9 : (version2 ? 5 : 2)) ||
       !validMissionId(parsedId) || parsedCount == 0 || parsedCount > MAX_MISSION_WAYPOINTS) {
     file.close();
     return false;
   }
-  if (boundaryCount > MAX_MISSION_BOUNDARY_POINTS || hasHome > 1 || hasEnd > 1) { file.close(); return false; }
+  if (boundaryCount > MAX_MISSION_BOUNDARY_POINTS || hasHome > 1 || hasEnd > 1 ||
+      linkLossAction > 1 || boundaryBreachAction > 1 || lowBatteryAction > 1 ||
+      batteryThresholdPercent < 5 || batteryThresholdPercent > 80) { file.close(); return false; }
+  if (version4) {
+    parsedMetadata.linkLossAction = static_cast<uint8_t>(linkLossAction);
+    parsedMetadata.boundaryBreachAction = static_cast<uint8_t>(boundaryBreachAction);
+    parsedMetadata.lowBatteryAction = static_cast<uint8_t>(lowBatteryAction);
+    parsedMetadata.batteryThresholdPercent = static_cast<uint8_t>(batteryThresholdPercent);
+  }
   if (version2) {
     parsedMetadata.hasHome = hasHome != 0;
     parsedMetadata.hasEnd = hasEnd != 0;
@@ -841,7 +1172,7 @@ bool saveMissionToSd(const char* id, const MissionWaypoint* points, uint8_t coun
   SD.remove(temporaryPath);
   File file = SD.open(temporaryPath, FILE_WRITE);
   if (!file) return false;
-  bool writeOk = file.println(String("BUOY_MISSION_V3,") + id + "," + String(count) + "," + String(metadata->boundaryCount) + "," + String(metadata->hasHome ? 1 : 0) + "," + String(metadata->hasEnd ? 1 : 0)) > 0;
+  bool writeOk = file.println(String("BUOY_MISSION_V4,") + id + "," + String(count) + "," + String(metadata->boundaryCount) + "," + String(metadata->hasHome ? 1 : 0) + "," + String(metadata->hasEnd ? 1 : 0) + "," + String(metadata->linkLossAction) + "," + String(metadata->boundaryBreachAction) + "," + String(metadata->lowBatteryAction) + "," + String(metadata->batteryThresholdPercent)) > 0;
   if (writeOk && metadata->hasHome) writeOk = file.println(String("HOME,") + String(metadata->home.latitude, 7) + "," + String(metadata->home.longitude, 7)) > 0;
   if (writeOk && metadata->hasEnd) writeOk = file.println(String("END,") + String(metadata->end.latitude, 7) + "," + String(metadata->end.longitude, 7)) > 0;
   for (uint8_t i = 0; writeOk && i < metadata->boundaryCount; ++i)
@@ -865,6 +1196,8 @@ bool saveMissionToSd(const char* id, const MissionWaypoint* points, uint8_t coun
     return false;
   }
   if (verifiedMetadata.hasHome != metadata->hasHome || verifiedMetadata.hasEnd != metadata->hasEnd || verifiedMetadata.boundaryCount != metadata->boundaryCount ||
+      verifiedMetadata.linkLossAction != metadata->linkLossAction || verifiedMetadata.boundaryBreachAction != metadata->boundaryBreachAction ||
+      verifiedMetadata.lowBatteryAction != metadata->lowBatteryAction || verifiedMetadata.batteryThresholdPercent != metadata->batteryThresholdPercent ||
       (metadata->hasHome && (fabsf(verifiedMetadata.home.latitude - metadata->home.latitude) > 0.000001f || fabsf(verifiedMetadata.home.longitude - metadata->home.longitude) > 0.000001f)) ||
       (metadata->hasEnd && (fabsf(verifiedMetadata.end.latitude - metadata->end.latitude) > 0.000001f || fabsf(verifiedMetadata.end.longitude - metadata->end.longitude) > 0.000001f))) { SD.remove(temporaryPath); return false; }
   for (uint8_t i = 0; i < metadata->boundaryCount; ++i) {
@@ -1094,18 +1427,57 @@ bool startSdRecorder(const String& startUtc) {
   scienceExperimentState = 1;
   audioRecordingEnabled = false;
   updateWavHeader();
-  sdScienceFile.println(F("timestamp_us,imu_valid,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,imu_temp_c,water_temp_c,range_valid,range_mm,ads_current_v,ads_battery_v,tds_v,turbidity_probe_v"));
-  sdTelemetryFile.println(F("timestamp_us,gps_valid,gps_date_ddmmyy,gps_time_hhmmsscc,latitude,longitude,control_mode,hold,motors_enabled,rear_drive,left_drive,right_drive,battery_v,current_a,audio_frames_dropped,sd_available,sd_mount_failures,sd_write_failures,sd_card_mib,sd_total_mib,sd_used_mib,sd_free_mib,sd_audio_bytes,sd_audio_buffer_bytes,sd_audio_queue_depth"));
+  sdScienceFile.println(F("timestamp_us,mission_waypoint,mission_collecting,measurement_mask,imu_valid,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,imu_temp_c,water_temp_c,range_valid,range_mm,ads_current_v,ads_battery_v,tds_v,turbidity_probe_v"));
+  sdTelemetryFile.println(F("timestamp_us,gps_valid,gps_date_ddmmyy,gps_time_hhmmsscc,latitude,longitude,control_mode,mission_waypoint,mission_collecting,measurement_mask,hold,motors_enabled,rear_drive,left_drive,right_drive,battery_v,current_a,audio_frames_dropped,sd_available,sd_mount_failures,sd_write_failures,sd_card_mib,sd_total_mib,sd_used_mib,sd_free_mib,sd_audio_bytes,sd_audio_buffer_bytes,sd_audio_queue_depth"));
   File manifest = SD.open((sdSessionDirectory + "/manifest.txt").c_str(), FILE_WRITE);
   if (manifest) {
+    const bool missionStartedSession = missionExecutionActive && runningMissionId[0] != '\0';
     manifest.println("firmware_version=" + firmwareVersionString());
     manifest.println("firmware_major=" + String(kFirmwareVersionMajor));
     manifest.println("firmware_minor=" + String(kFirmwareVersionMinor));
     manifest.println("firmware_patch=" + String(kFirmwareVersionPatch));
     manifest.println("firmware_build_date=" + String(kFirmwareBuildDate));
-    manifest.println("start_utc=" + startUtc);
+    manifest.println(String("session_origin=") + (missionStartedSession ? "mission_auto" : "manual"));
+    manifest.println(String("mission_id=") + (missionStartedSession ? String(runningMissionId) : String("NONE")));
+    if (missionStartedSession) {
+      manifest.println(String("mission_run_id=") + sdSessionDirectory.substring(1));
+      manifest.println(String("mission_started_utc=") + (startUtc.startsWith("00000000T") ? String("UNKNOWN") : startUtc));
+      manifest.println(String("mission_home=") + String(missionMetadata.home.latitude, 7) + "," + String(missionMetadata.home.longitude, 7));
+      manifest.println(String("mission_has_end=") + String(missionMetadata.hasEnd ? 1 : 0));
+      if (missionMetadata.hasEnd) {
+        manifest.println(String("mission_end=") + String(missionMetadata.end.latitude, 7) + "," + String(missionMetadata.end.longitude, 7));
+      }
+      manifest.println(String("mission_boundary_count=") + String(missionMetadata.boundaryCount));
+      for (uint8_t i = 0; i < missionMetadata.boundaryCount; ++i) {
+        const MissionCoordinate& point = missionMetadata.boundary[i];
+        manifest.println(String("mission_boundary_") + String(i + 1) + "=" + String(point.latitude, 7) + "," + String(point.longitude, 7));
+      }
+      manifest.println(String("mission_waypoint_count=") + String(missionWaypointCount));
+      manifest.println(F("mission_measurement_mask bits: water_temperature=1, depth=2, conductivity=4, turbidity=8, air_temperature=16"));
+      for (uint8_t i = 0; i < missionWaypointCount; ++i) {
+        const MissionWaypoint& point = missionWaypoints[i];
+        manifest.println(String("mission_waypoint_") + String(i + 1) + "=" +
+          String(point.latitude, 7) + "," + String(point.longitude, 7) + "," +
+          String(point.measurementMask) + "," + String(point.collectData ? 1 : 0) + "," +
+          String(point.holdSeconds) + "," + String(point.speedPercent));
+      }
+      manifest.println(F("audio_policy=recorded only during stationary mission collection holds; excluded during transit"));
+    } else {
+      manifest.println(F("mission_run_id=NONE"));
+      manifest.println(F("mission_started_utc=NONE"));
+    }
+    if (startUtc.startsWith("00000000T")) {
+      manifest.println(F("start_utc=UNKNOWN"));
+      manifest.println("start_elapsed_ms=" + String(millis()));
+    } else {
+      manifest.println("start_utc=" + startUtc);
+    }
     manifest.println(F("status=recording"));
-    manifest.println(F("timestamp_us is the 64-bit monotonic ESP timer; correlate it with GPS fields in telemetry.csv."));
+    manifest.println(F("timestamp_us is the 64-bit monotonic ESP timer; science.csv and telemetry.csv include current mission waypoint, collection state, and measurement mask."));
+    if (missionStartedSession) {
+      manifest.println(String("mission_collection_sample_interval_ms=") + String(SD_SCIENCE_INTERVAL_MS));
+      manifest.println(F("mission session opens once at mission start and stays open through transit, collection holds, and return home; it closes at mission stop or completion."));
+    }
     manifest.println(F("audio.wav: stereo signed 16-bit PCM; sample rate is stored in the WAV header."));
     manifest.println(F("audio.idx: repeated packed little-endian records: uint64 timestamp_us, uint32 first_sample_frame, uint16 frame_count, uint16 reserved."));
     manifest.println(F("science.csv: calibrated physical units where available; TDS and turbidity remain voltages pending wet calibration."));
@@ -1136,7 +1508,12 @@ bool saveSdRecorder(const String& saveUtc) {
   if (writeError) { ++sdWriteFailures; return false; }
   File manifest = SD.open((sdSessionDirectory + "/manifest.txt").c_str(), FILE_APPEND);
   if (!manifest) { ++sdWriteFailures; return false; }
-  manifest.println("saved_utc=" + saveUtc);
+  if (saveUtc.startsWith("00000000T")) {
+    manifest.println(F("saved_utc=UNKNOWN"));
+    manifest.println("saved_elapsed_ms=" + String(millis()));
+  } else {
+    manifest.println("saved_utc=" + saveUtc);
+  }
   manifest.println(F("status=complete"));
   manifest.close();
   return true;
@@ -1162,8 +1539,65 @@ void stopRecordingForManualLinkLoss() {
   saveSdRecorder(stoppedAt);
 }
 
+String standaloneLogDateTag() {
+  char tag[16];
+  if (gps.date.isValid()) {
+    snprintf(tag, sizeof(tag), "%04u%02u%02u", gps.date.year(), gps.date.month(), gps.date.day());
+  } else {
+    snprintf(tag, sizeof(tag), "boot-%08lx", static_cast<unsigned long>(sdLogBootId));
+  }
+  return String(tag);
+}
+
+String standaloneLogPath(const char* stem, const char* extension) {
+  char bootId[9];
+  snprintf(bootId, sizeof(bootId), "%08lx", static_cast<unsigned long>(sdLogBootId));
+  return String("/logs/") + stem + "-" + standaloneLogDateTag() + "-" + bootId + extension;
+}
+
+bool ensureStandaloneLogDirectory() {
+  if (!sdCardMounted) return false;
+  if (SD.exists("/logs")) return true;
+  if (SD.mkdir("/logs")) return true;
+  ++sdWriteFailures;
+  return false;
+}
+
+void printCsvQuoted(File& file, const String& value) {
+  file.print('"');
+  for (size_t i = 0; i < value.length(); ++i) {
+    const char c = value.charAt(i);
+    if (c == '"') file.print('"');
+    if (c == '\r' || c == '\n') file.print(' ');
+    else file.print(c);
+  }
+  file.print('"');
+}
+
 void recordLogLine(const String& line) {
-  (void)line;
+  if (!ensureStandaloneLogDirectory()) return;
+  const String path = standaloneLogPath("system", ".csv");
+  File file = SD.open(path.c_str(), FILE_APPEND);
+  if (!file) {
+    ++sdWriteFailures;
+    return;
+  }
+  if (file.size() == 0) {
+    file.println(F("gps_date_ddmmyy,gps_time_hhmmsscc,uptime_ms,boot_id,event"));
+  }
+  if (gps.date.isValid()) file.print(gps.date.value());
+  file.print(',');
+  if (gps.time.isValid()) file.print(gps.time.value());
+  file.print(',');
+  file.print(millis());
+  file.print(',');
+  file.print(sdLogBootId, HEX);
+  file.print(',');
+  printCsvQuoted(file, line);
+  file.println();
+  file.flush();
+  if (file.getWriteError()) ++sdWriteFailures;
+  file.close();
 }
 
 void emitLine(const String& line) {
@@ -1173,6 +1607,15 @@ void emitLine(const String& line) {
   memcpy(tcpTelemetryBuffer + tcpTelemetryBuffered, line.c_str(), length);
   tcpTelemetryBuffered += length;
   tcpTelemetryBuffer[tcpTelemetryBuffered++] = '\n';
+}
+
+void reportMissionStartBlock(uint8_t code, const char* reason) {
+  if (missionStartBlockCode == code) return;
+  missionStartBlockCode = code;
+  missionStartBlockedLogged = true;
+  emitLine(String("TEL EVENT MISSION_START BLOCKED ") + String(code) + " " + reason);
+  elrs.sendScienceValue("MIS_STATE", 8);
+  elrs.sendScienceValue("MIS_BLOCK", code);
 }
 
 void flushTcpTelemetry() {
@@ -1311,6 +1754,9 @@ void sendMotorOutputTelemetry() {
     line += " " + String(driveValues[i]) + " " + String(appliedMotorPwm[i]);
   }
   emitLine(line);
+  emitLine(String("TEL MIX INPUT ") + String(latestMixerInputLateral) + " " +
+    String(latestMixerInputThrust) + " " + String(latestMixerInputYaw) + " " +
+    String(latestMixerInputTx12 ? 1 : 0));
 }
 
 void sendStatusSnapshot() {
@@ -1321,6 +1767,17 @@ void sendStatusSnapshot() {
     (controlSource == CONTROL_SOURCE_ELRS ? "TX12" :
      controlSource == CONTROL_SOURCE_WIFI ? "WIFI" : "NONE"));
   emitLine(String("TEL STATUS ELRS_ARM ") + (elrsArmed ? "ARMED" : "DISARMED"));
+  emitLine(manualHomeAvailable
+    ? String("TEL STATUS MANUAL_HOME SET ") + String(manualHome.latitude, 7) + " " + String(manualHome.longitude, 7)
+    : String("TEL STATUS MANUAL_HOME UNSET"));
+  MissionCoordinate activeHome = {};
+  uint8_t activeHomeKind = 0;
+  if (activeTelemetryHome(activeHome, activeHomeKind)) {
+    emitLine(String("TEL STATUS ACTIVE_HOME ") + (activeHomeKind == 1 ? "MANUAL " : "MISSION ") +
+      String(activeHome.latitude, 7) + " " + String(activeHome.longitude, 7));
+  } else {
+    emitLine("TEL STATUS ACTIVE_HOME NONE");
+  }
   emitLine(String("TEL STATUS RECOVERY ") + (manualLinkLossStop ? "MANUAL_STOP" : "READY"));
   emitLine(String("TEL STATUS MAGNETOMETER ") + (magnetometerAvailable ? "READY" : "UNAVAILABLE"));
   emitLine(String("TEL STATUS MAGCAL ") + (magnetometerCalibrationLoaded ? "LOADED SD" : "DEFAULT"));
@@ -1346,6 +1803,9 @@ void sendStatusSnapshot() {
     " LAST_REJECT " + rcReject +
     " TARGET " + String(elrs.lastRcTargetSystem()) + " " + String(elrs.lastRcTargetComponent()) +
     " BAD_CH " + String(elrs.lastRcInvalidChannel()) + " VALUE " + String(elrs.lastRcInvalidValue()));
+  emitLine(String("TEL STATUS SCIENCE ") +
+    (scienceExperimentState == 1 ? "RECORDING " : (scienceExperimentState == 2 ? "STOPPED " : "IDLE ")) +
+    (sdSessionDirectory.length() ? sdSessionDirectory : "NONE"));
   // In Backpack mode the Wi-Fi heartbeat reports only control and safety.
   // Power, position, motor state and channels travel over MAVLink instead.
   if (telemetryMode == TELEMETRY_MODE_MAVLINK) return;
@@ -1355,7 +1815,7 @@ void sendStatusSnapshot() {
     " RSSI_DBM " + String(elrs.rssiDbm()) +
     " SNR_DB " + String(elrs.snrDb()));
   String channelLine = "TEL STATUS ELRS_CHANNELS";
-  for (uint8_t channel = 0; channel < 10; ++channel) {
+  for (uint8_t channel = 0; channel < 16; ++channel) {
     channelLine += " " + String(elrs.channel(channel));
   }
   emitLine(channelLine);
@@ -1385,7 +1845,11 @@ void sendStatusSnapshot() {
   }
   emitLine(modeLine);
   emitLine(String("TEL STATUS MISSION_CONTROL ") +
-    (missionModeRequested ? "MISSION_REQUEST_BLOCKED" : "MANUAL"));
+    (missionModeRequested ? (missionExecutionActive ? missionRunStatus :
+      (missionStartLocked ? String("MISSION_LOCKED") :
+       (missionStartBlockCode ? String("MISSION_BLOCKED_") + String(missionStartBlockCode) : String("MISSION_READY")))) :
+     manualAssistRequested ? (manualAssistHeadingAvailable
+       ? String("MANUAL_ASSIST") : String("MANUAL_ASSIST_NO_HEADING")) : String("MANUAL")));
   emitLine(String("TEL STATUS MISSION ") + String(missionWaypointCount) +
     " UPLOAD " + (missionUploadInProgress ? "RECEIVING" : "READY") +
     " LOADED " + String(missionId[0] ? missionId : "NONE") +
@@ -1409,12 +1873,13 @@ void sendStatusSnapshot() {
 
   emitLine(holdPositionEnabled ? "TEL STATUS HOLD ON" : "TEL STATUS HOLD OFF");
   emitLine(buildSdStatusLine());
-  emitLine(String("TEL STATUS SCIENCE ") +
-    (scienceExperimentState == 1 ? "RECORDING " : (scienceExperimentState == 2 ? "STOPPED " : "IDLE ")) +
-    (sdSessionDirectory.length() ? sdSessionDirectory : "NONE"));
   emitLine(String("TEL STATUS STREAM AUDIO ") + (audioStreamEnabled ? "ON" : "OFF"));
   emitLine(String("TEL STATUS STREAM IMU ") + (imuStreamEnabled ? "ON" : "OFF"));
   emitLine(String("TEL STATUS SERVICE ") + (serviceMode ? "ON" : "OFF"));
+  emitLine(String("TEL STATUS CALIBRATION ") + (elrsCalibrationActive ? "ACTIVE" : "IDLE") +
+    " ARMED " + String(elrsCalibrationArmedOnce ? 1 : 0) +
+    " TEST " + String(elrsCalibrationTestActive ? 1 : 0) +
+    " EXPECTED " + String(elrsCalibrationExpectedIndex) + " " + String(elrsCalibrationExpectedPower));
 
   float batteryVolts = readBatterySystemVoltage();
   float currentAmps = readCurrentSensorAmps();
@@ -1470,13 +1935,15 @@ void emitWaterTemperatureTelemetry() {
 }
 
 void updateDs18b20Sensor(uint32_t nowMs) {
+  const bool missionCollectionSampling = missionExecutionActive && missionCheckpointActive;
   if (!ds18b20Available) {
-    uint32_t retryIntervalMs = audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : 5000UL;
+    uint32_t retryIntervalMs = audioRecordingEnabled && !missionCollectionSampling ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : 5000UL;
     if (nowMs - lastDs18b20RequestMs >= retryIntervalMs) ds18b20Available = setupDs18b20();
     return;
   }
 
-  uint32_t intervalMs = audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : WATER_TEMP_STREAM_INTERVAL_MS;
+  uint32_t intervalMs = missionCollectionSampling ? SD_SCIENCE_INTERVAL_MS
+    : (audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : WATER_TEMP_STREAM_INTERVAL_MS);
   if ((nowMs - lastDs18b20RequestMs) < intervalMs) {
     return;
   }
@@ -1633,6 +2100,20 @@ uint64_t sdDirectoryByteSize(const String& path) {
   return total;
 }
 
+void readSessionManifestMetadata(const String& sessionPath, String& origin, String& missionId, String& missionRunId) {
+  File manifest = SD.open((sessionPath + "/manifest.txt").c_str(), FILE_READ);
+  if (!manifest) return;
+  while (manifest.available()) {
+    String line = manifest.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("session_origin=")) origin = line.substring(14);
+    else if (line.startsWith("mission_id=")) missionId = line.substring(11);
+    else if (line.startsWith("mission_run_id=")) missionRunId = line.substring(15);
+    if (origin.length() && missionId.length() && missionRunId.length()) break;
+  }
+  manifest.close();
+}
+
 void sendSdDirectoryListing(File& directory, const String& directoryPath) {
   while (sdFileClient.connected()) {
     File entry = directory.openNextFile();
@@ -1649,6 +2130,16 @@ void sendSdDirectoryListing(File& directory, const String& directoryPath) {
       uint64_t directoryBytes = directoryPath == "/" && scienceExperimentState == 0 && entryPath.startsWith("/session")
         ? sdDirectoryByteSize(entryPath) : 0;
       sdFileClient.print(static_cast<unsigned long long>(directoryBytes));
+      if (directoryPath == "/" && entryPath.startsWith("/session")) {
+        String origin, missionId, missionRunId;
+        readSessionManifestMetadata(entryPath, origin, missionId, missionRunId);
+        sdFileClient.print("|");
+        sdFileClient.print(origin.length() ? origin : "unknown");
+        sdFileClient.print("|");
+        sdFileClient.print(missionId.length() ? missionId : "NONE");
+        sdFileClient.print("|");
+        sdFileClient.print(missionRunId.length() ? missionRunId : "NONE");
+      }
       sdFileClient.print("\n");
     } else {
       sdFileClient.print("FILE|");
@@ -1940,8 +2431,10 @@ void markControlHeartbeat() {
 }
 
 void stopMotorsForSafety(const __FlashStringHelper* reason) {
+  if (elrsCalibrationActive) stopElrsCalibration("SAFETY_STOP", false);
   bool wasActive = motorCommandActive();
   stopAllMotors();
+  manualReturnHomeActive = false;
   controlMode = CONTROL_MODE_IDLE;
   controlSource = CONTROL_SOURCE_NONE;
   elrsArmed = false;
@@ -1961,7 +2454,15 @@ void stopElrsForFailsafe(uint32_t now) {
                        zeroLinkQuality ? "ZERO_LQ" : "ARM_STATE_LOST";
   const String rcAge = elrs.lastRcMs() == 0 ? String("UNKNOWN") : String(now - elrs.lastRcMs());
   const String linkAge = elrs.lastLinkMs() == 0 ? String("UNKNOWN") : String(now - elrs.lastLinkMs());
-  stopMotorsForSafety(F("ELRS FAILSAFE"));
+  if (missionExecutionActive && missionMetadata.linkLossAction == 1 && missionMetadata.hasHome) {
+    beginMissionReturnHome("ELRS LINK LOST");
+    controlSource = CONTROL_SOURCE_NONE;
+    elrsArmed = false;
+    elrsArmReady = false;
+  } else {
+    if (missionExecutionActive) stopMissionExecution("ELRS LINK LOST", false);
+    stopMotorsForSafety(F("ELRS FAILSAFE"));
+  }
   manualLinkLossStop = true;
   ++elrsFailsafeCount;
   lastElrsFailsafeStatus = String("COUNT ") + String(elrsFailsafeCount) +
@@ -1973,11 +2474,15 @@ void stopElrsForFailsafe(uint32_t now) {
     " RADIO " + String(elrs.validRadioStatus()) +
     " CRCERR " + String(elrs.crcErrors()) +
     " UPTIME_MS " + String(now);
+  recordLogLine(String("ELRS FAILSAFE ") + lastElrsFailsafeStatus);
   emitLine(String("TEL EVENT ELRS_FAILSAFE ") + lastElrsFailsafeStatus);
-  stopRecordingForManualLinkLoss();
+  if (!missionExecutionActive) {
+    stopRecordingForManualLinkLoss();
+  }
 }
 
 void updateMotorCommandWatchdog() {
+  if (missionExecutionActive) return;
   if (controlSource == CONTROL_SOURCE_ELRS) {
     const uint32_t now = millis();
     if (!elrsArmed || !elrs.rcFresh(now) || (elrs.linkFresh(now) && elrs.linkQuality() == 0)) {
@@ -2078,13 +2583,30 @@ void processTcpControl() {
 // Motor Control
 // ---------------------------------------------------------------------------
 
-void computeMotorThrusts(float lateral, float thrust, float yaw, int* thrusts) {
+void computeMotorThrusts(float lateral, float thrust, float yaw, int* thrusts,
+                         bool tx12ManualMix) {
+  if (tx12ManualMix && mixerCalProfileLoaded && mixerCalibrationComplete()) {
+    float calibrated[MOTOR_COUNT] = {0.0f, 0.0f, 0.0f};
+    addMixerCalibrationAxis(thrust, 0, 1, calibrated);
+    addMixerCalibrationAxis(lateral, 2, 3, calibrated);
+    addMixerCalibrationAxis(yaw, 4, 5, calibrated);
+    float maxMagnitude = 0.0f;
+    for (int i = 0; i < MOTOR_COUNT; ++i) maxMagnitude = max(maxMagnitude, fabsf(calibrated[i]));
+    const float scale = maxMagnitude > 100.0f ? 100.0f / maxMagnitude : 1.0f;
+    for (int i = 0; i < MOTOR_COUNT; ++i)
+      thrusts[i] = static_cast<int>(roundf(constrain(calibrated[i] * scale, -100.0f, 100.0f) * MOTOR_OUTPUT_LIMIT / 100.0f));
+    return;
+  }
+
   float mixedThrusts[3];
   float maxMagnitude = 0.0f;
   for (int i = 0; i < MOTOR_COUNT; i++) {
     const MotorChannel& motor = motors[i];
     const float axisX = USE_EXTERNAL_TANGENTIAL_MOTOR_LAYOUT
-      ? external_tangential_motor_axes[i][0]
+      ? (tx12ManualMix
+          ? (lateral > 0.0f ? tx12_manual_right_lateral_gains[i]
+                            : tx12_manual_lateral_gains[i])
+          : external_tangential_motor_axes[i][0])
       : legacy_motor_axes[i][0];
     const float axisY = USE_EXTERNAL_TANGENTIAL_MOTOR_LAYOUT
       ? external_tangential_motor_axes[i][1]
@@ -2096,13 +2618,26 @@ void computeMotorThrusts(float lateral, float thrust, float yaw, int* thrusts) {
       (lateral * axisX * motor.mixTurnGain) +
       (thrust * axisY * motor.mixThrustGain)
     ) * MOTOR_OUTPUT_BOOST;
-    motorThrust += yaw * yawGain;
+    if (tx12ManualMix && USE_EXTERNAL_TANGENTIAL_MOTOR_LAYOUT) {
+      // The trial showed front-right+ turns toward negative yaw (left), and
+      // front-left+ turns toward positive yaw (right).
+      if (i == 2 && yaw < 0.0f) motorThrust -= yaw;
+      if (i == 1 && yaw > 0.0f) motorThrust += yaw;
+    } else {
+      motorThrust += yaw * yawGain;
+    }
     motorThrust += motor.mixBias;
+    if (tx12ManualMix && USE_EXTERNAL_TANGENTIAL_MOTOR_LAYOUT && motorThrust < 0.0f) {
+      motorThrust *= TX12_MANUAL_REVERSE_COMMAND_GAIN;
+    }
     mixedThrusts[i] = motorThrust;
     maxMagnitude = max(maxMagnitude, abs(motorThrust));
   }
 
-  float outputScale = (yaw != 0.0f && maxMagnitude > 1.0f) ? (1.0f / maxMagnitude) : 1.0f;
+  // Scale the complete TX12 vector together so clipping cannot change its
+  // motor proportions, including when the weak reverse motor sets the limit.
+  float outputScale = ((tx12ManualMix || yaw != 0.0f) && maxMagnitude > 1.0f)
+    ? (1.0f / maxMagnitude) : 1.0f;
   for (int i = 0; i < MOTOR_COUNT; i++) {
     float motorThrust = clampf(mixedThrusts[i] * outputScale, -1.0f, 1.0f);
     thrusts[i] = round(motorThrust * MOTOR_OUTPUT_LIMIT);
@@ -2114,6 +2649,13 @@ int computeMotorPwm(int motorIndex, const MotorChannel& motor, int driveValue) {
   int magnitude = abs(clampedDriveValue);
   if (magnitude <= motor.commandDeadband) {
     return 0;
+  }
+
+  if (magnitude < LOW_SPEED_MIX_THRESHOLD) {
+    const uint32_t onTimeMs = static_cast<uint32_t>(magnitude) *
+      LOW_SPEED_MIX_PERIOD_MS / LOW_SPEED_MIX_THRESHOLD;
+    const uint32_t phaseMs = (millis() - lowSpeedMixEpochMs) % LOW_SPEED_MIX_PERIOD_MS;
+    if (phaseMs >= onTimeMs) return 0;
   }
 
   bool forward = clampedDriveValue > 0;
@@ -2225,6 +2767,16 @@ void setMotorDrive(int motorIndex, int driveValue) {
   }
 
   int constrainedDrive = constrain(driveValue, -MOTOR_OUTPUT_LIMIT, MOTOR_OUTPUT_LIMIT);
+  if (constrainedDrive != 0) {
+    bool allTargetsStopped = true;
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+      if (targetDriveValues[i] != 0) {
+        allTargetsStopped = false;
+        break;
+      }
+    }
+    if (allTargetsStopped) lowSpeedMixEpochMs = millis();
+  }
   targetDriveValues[motorIndex] = constrainedDrive;
   if (constrainedDrive == 0) {
     motorStartBoostPending[motorIndex] = false;
@@ -2238,7 +2790,11 @@ void setMotorDrive(int motorIndex, int driveValue) {
   }
 }
 
-void applyMotionCommand(int lateral, int thrust, int yaw) {
+void applyMotionCommand(int lateral, int thrust, int yaw, bool tx12ManualMix) {
+  latestMixerInputLateral = lateral;
+  latestMixerInputThrust = thrust;
+  latestMixerInputYaw = yaw;
+  latestMixerInputTx12 = tx12ManualMix;
   float lateralf = lateral / static_cast<float>(VECTOR_SCALE);
   float thrustf = thrust / static_cast<float>(VECTOR_SCALE);
   float yawf = yaw / static_cast<float>(VECTOR_SCALE);
@@ -2249,11 +2805,15 @@ void applyMotionCommand(int lateral, int thrust, int yaw) {
   }
 
   int thrusts[3];
-  computeMotorThrusts(lateralf, thrustf, yawf, thrusts);
+  computeMotorThrusts(lateralf, thrustf, yawf, thrusts, tx12ManualMix);
 
   for (int i = 0; i < MOTOR_COUNT; i++) {
     setMotorDrive(i, thrusts[i]);
   }
+}
+
+void applyMotionCommand(int lateral, int thrust, int yaw) {
+  applyMotionCommand(lateral, thrust, yaw, false);
 }
 
 void applyVectorCommand(int turn, int thrust) {
@@ -2264,6 +2824,510 @@ int elrsStickPercent(uint16_t microseconds) {
   int offset = constrain(static_cast<int>(microseconds) - 1500, -500, 500);
   if (abs(offset) <= 40) return 0;
   return constrain(static_cast<int>(roundf(offset / 5.0f)), -100, 100);
+}
+
+String currentScienceTimestamp() {
+  char timestamp[24];
+  if (gps.date.isValid() && gps.time.isValid()) {
+    snprintf(timestamp, sizeof(timestamp), "%04u%02u%02uT%02u%02u%02uZ",
+      gps.date.year(), gps.date.month(), gps.date.day(),
+      gps.time.hour(), gps.time.minute(), gps.time.second());
+  } else {
+    // Keep the session folder's timestamp shape while marking UTC as unknown.
+    const uint32_t elapsedSeconds = millis() / 1000UL;
+    snprintf(timestamp, sizeof(timestamp), "00000000T%02lu%02lu%02luZ",
+      static_cast<unsigned long>((elapsedSeconds / 3600UL) % 24UL),
+      static_cast<unsigned long>((elapsedSeconds / 60UL) % 60UL),
+      static_cast<unsigned long>(elapsedSeconds % 60UL));
+  }
+  return String(timestamp);
+}
+
+void processElrsScienceSwitch(bool manualMode) {
+  const uint16_t channel = elrs.channel(7);  // SC / CH8
+  if (channel < 900 || channel > 2100) return;
+
+  // Low closes the session, middle records science without audio, and high
+  // records science with audio. Only react to a switch edge.
+  const int8_t position = channel < 1300 ? -1 : (channel >= 1700 ? 1 : 0);
+  const bool positionWasKnown = elrsScienceSwitchPositionKnown;
+  if (!positionWasKnown) {
+    elrsScienceSwitchPosition = position;
+    elrsScienceSwitchPositionKnown = true;
+  }
+  const bool changed = positionWasKnown && position != elrsScienceSwitchPosition;
+  elrsScienceSwitchPosition = position;
+  const bool enteringManual = manualMode && (!elrsScienceManualModeKnown || !elrsScienceManualMode);
+  elrsScienceManualModeKnown = true;
+  elrsScienceManualMode = manualMode;
+  if (!manualMode || serviceMode || sdTransferActive) return;
+
+  if (position < 0) {
+    if (!changed) return;
+    const String timestamp = currentScienceTimestamp();
+    if (scienceExperimentState == 1) {
+      handleControlCommand("CTRL SCIENCE STOP " + timestamp);
+    }
+    if (scienceExperimentState == 2) {
+      handleControlCommand("CTRL SCIENCE SAVE " + timestamp);
+    }
+  } else if (position == 0) {
+    if (scienceExperimentState == 0 && (changed || enteringManual || !positionWasKnown)) {
+      handleControlCommand("CTRL SCIENCE START " + currentScienceTimestamp());
+    }
+    if (scienceExperimentState == 1 && audioRecordingEnabled) {
+      handleControlCommand("CTRL AUDIO RECORD STOP");
+    }
+  } else if (position > 0) {
+    if (scienceExperimentState == 0 && (changed || enteringManual || !positionWasKnown)) {
+      handleControlCommand("CTRL SCIENCE START " + currentScienceTimestamp());
+    }
+    if (scienceExperimentState == 1) handleControlCommand("CTRL AUDIO RECORD START");
+  }
+}
+
+const char* elrsCalibrationAxisName(uint8_t index) {
+  static const char* names[MIXER_CAL_AXIS_COUNT] = {
+    "forward", "reverse", "strafe_right", "strafe_left", "yaw_cw", "yaw_ccw"
+  };
+  return index < MIXER_CAL_AXIS_COUNT ? names[index] : "invalid";
+}
+
+bool startElrsCalibrationLog(uint8_t mode, uint8_t maxPower, uint32_t pulseDurationMs) {
+  if (!sdCardMounted || mode > 1 || maxPower < 30 || maxPower > 100 || maxPower % 10 ||
+      (pulseDurationMs != ELRS_CALIBRATION_PULSE_DURATION_DEFAULT_MS &&
+       pulseDurationMs != ELRS_CALIBRATION_PULSE_DURATION_LONG_MS)) return false;
+  elrsCalibrationPulseDurationMs = pulseDurationMs;
+  if (!SD.exists("/calibration") && !SD.mkdir("/calibration")) return false;
+  const String stamp = currentScienceTimestamp();
+  char path[64];
+  uint8_t collision = 0;
+  do {
+    snprintf(path, sizeof(path), "/calibration/%s_%s_%lu_%u.csv", mode == 0 ? "mixer" : "magmotor",
+      stamp.c_str(), static_cast<unsigned long>(millis()), collision++);
+  } while (SD.exists(path) && collision < 20);
+  if (SD.exists(path)) return false;
+  elrsCalibrationPath = path;
+  sdCalibrationFile = SD.open(elrsCalibrationPath.c_str(), FILE_WRITE);
+  if (!sdCalibrationFile) return false;
+
+  sdCalibrationFile.println(F("#format=BUOY_ELRS_CALIBRATION_V1"));
+  sdCalibrationFile.println(String("#started_utc=") + stamp);
+  sdCalibrationFile.println(String("#firmware_version=") + firmwareVersionString());
+  sdCalibrationFile.println(String("#test_mode=") + (mode == 0 ? "mixer_response" : "magnetometer_motor_load"));
+  sdCalibrationFile.println(String("#max_test_power_percent=") + String(maxPower));
+  sdCalibrationFile.println(F("#control_mode=manual"));
+  sdCalibrationFile.println(String("#test_duration_ms=") + String(elrsCalibrationPulseDurationMs));
+  sdCalibrationFile.println(String("#sample_interval_ms=") + String(ELRS_CALIBRATION_SAMPLE_INTERVAL_MS));
+  sdCalibrationFile.println(F("#calibration_priority_mode=1"));
+  sdCalibrationFile.println(String("#motor_count=") + String(MOTOR_COUNT));
+  sdCalibrationFile.println(String("#mixer_profile_loaded=") + String(mixerCalProfileLoaded ? 1 : 0));
+  sdCalibrationFile.println(String("#mixer_profile_complete=") + String(mixerCalibrationComplete() ? 1 : 0));
+  sdCalibrationFile.println(String("#mixer_profile_source=") + (mixerCalLoadedFromBackup ? "backup" : "primary_or_none"));
+  bool profileCrcValid = false;
+  const char* activeProfilePath = mixerCalLoadedFromBackup ? "/config/propulsion.bak" : "/config/propulsion.cfg";
+  const uint32_t activeProfileCrc = mixerCalProfileLoaded ? missionCrc32File(activeProfilePath, profileCrcValid) : 0;
+  sdCalibrationFile.println(String("#mixer_profile_crc32=") + (profileCrcValid ? String(activeProfileCrc, HEX) : String("NONE")));
+  sdCalibrationFile.println(String("#elrs_motor_power_limit_percent=") + String(ELRS_MOTOR_POWER_LIMIT_PERCENT));
+  sdCalibrationFile.println(String("#motor_output_limit=") + String(MOTOR_OUTPUT_LIMIT));
+  sdCalibrationFile.println(String("#motor_pwm_frequency_hz=") + String(PWM_FREQ_HZ));
+  sdCalibrationFile.println(String("#motor_pwm_resolution_bits=") + String(PWM_RES_BITS));
+  sdCalibrationFile.println(String("#motor_output_boost=") + String(MOTOR_OUTPUT_BOOST, 4));
+  sdCalibrationFile.println(String("#motor_ramp_interval_ms=") + String(MOTOR_RAMP_INTERVAL_MS));
+  sdCalibrationFile.println(String("#low_speed_mix_threshold=") + String(LOW_SPEED_MIX_THRESHOLD));
+  sdCalibrationFile.println(String("#low_speed_mix_period_ms=") + String(LOW_SPEED_MIX_PERIOD_MS));
+  sdCalibrationFile.println(String("#manual_reverse_command_gain=") + String(TX12_MANUAL_REVERSE_COMMAND_GAIN, 4));
+  sdCalibrationFile.println(String("#tx12_manual_left_lateral_gains=") + String(tx12_manual_lateral_gains[0], 5) + "," +
+    String(tx12_manual_lateral_gains[1], 5) + "," + String(tx12_manual_lateral_gains[2], 5));
+  sdCalibrationFile.println(String("#tx12_manual_right_lateral_gains=") + String(tx12_manual_right_lateral_gains[0], 5) + "," +
+    String(tx12_manual_right_lateral_gains[1], 5) + "," + String(tx12_manual_right_lateral_gains[2], 5));
+  sdCalibrationFile.println(String("#magnetometer_available=") + String(magnetometerAvailable ? 1 : 0));
+  sdCalibrationFile.println(String("#magnetometer_calibration_loaded=") + String(magnetometerCalibrationLoaded ? 1 : 0));
+  sdCalibrationFile.println(String("#magnetometer_offset_x=") + String(magnetometerOffsetX, 6));
+  sdCalibrationFile.println(String("#magnetometer_offset_y=") + String(magnetometerOffsetY, 6));
+  sdCalibrationFile.println(String("#magnetometer_scale_x=") + String(magnetometerScaleX, 6));
+  sdCalibrationFile.println(String("#magnetometer_scale_y=") + String(magnetometerScaleY, 6));
+  sdCalibrationFile.println(F("#radio_channels=CH1_lateral,CH2_thrust,CH3_power,CH4_yaw,CH5_arm,CH6_telemetry,CH7_mode,CH8_session,CH9_home,CH10_rth,CH11_cal_enable,CH12_cal_command,CH13_cal_mode,CH14_test_index,CH15_test_power,CH16_cal_duration"));
+  for (int i = 0; i < MOTOR_COUNT; ++i) {
+    const MotorChannel& m = motors[i];
+    sdCalibrationFile.printf("#motor_%d=%s,direction_inverted:%d,deadband:%d,boost_pwm_fwd:%d,boost_pwm_rev:%d,boost_ms_fwd:%d,boost_ms_rev:%d,min_pwm_fwd:%d,min_pwm_rev:%d,max_pwm_fwd:%d,max_pwm_rev:%d,curve_fwd:%.5f,curve_rev:%.5f,scale_fwd:%.5f,scale_rev:%.5f,offset_fwd:%d,offset_rev:%d,ramp_up:%d,ramp_down:%d,mix_turn:%.5f,mix_thrust:%.5f,mix_bias:%.5f\n",
+      i, i == 0 ? "rear" : (i == 1 ? "front_left" : "front_right"), m.directionInverted ? 1 : 0,
+      m.commandDeadband, m.startBoostPwmForward, m.startBoostPwmReverse, m.startBoostMsForward,
+      m.startBoostMsReverse, m.minStartPwmForward, m.minStartPwmReverse, m.maxPwmForward,
+      m.maxPwmReverse, m.pwmCurveForward, m.pwmCurveReverse, m.pwmScaleForward, m.pwmScaleReverse,
+      m.pwmOffsetForward, m.pwmOffsetReverse, m.rampUpPerSecond, m.rampDownPerSecond,
+      m.mixTurnGain, m.mixThrustGain, m.mixBias);
+  }
+  sdCalibrationFile.println(F("#profile_point_columns=power_percent,axis,rear_percent,front_left_percent,front_right_percent,set"));
+  for (uint8_t step = 0; step < MIXER_CAL_POWER_STEPS; ++step) {
+    for (uint8_t axis = 0; axis < MIXER_CAL_AXIS_COUNT; ++axis) {
+      sdCalibrationFile.printf("#profile_point=%u,%s,%d,%d,%d,%d\n", (step + 1) * 10,
+        elrsCalibrationAxisName(axis), mixerCalValues[step][axis][0], mixerCalValues[step][axis][1],
+        mixerCalValues[step][axis][2], mixerCalPointSet[step][axis] ? 1 : 0);
+    }
+  }
+  sdCalibrationFile.println(F("#data follows; all motor commands are signed drive values in [-255,255], PWM columns are applied output PWM"));
+  sdCalibrationFile.println(F("record_type,elapsed_ms,test_index,test_name,requested_power_pct,test_active,commanded_lateral,commanded_thrust,commanded_yaw,drive_rear,drive_front_left,drive_front_right,target_rear,target_front_left,target_front_right,pwm_rear,pwm_front_left,pwm_front_right,current_a,battery_v,current_valid,battery_valid,accel_x_g,accel_y_g,accel_z_g,gyro_x_dps,gyro_y_dps,gyro_z_dps,mag_x_raw,mag_y_raw,mag_z_raw,mag_heading_deg,gps_valid,latitude,longitude,speed_mps,course_deg,satellites,hdop,ch1,ch2,ch3,ch4,ch5,ch7,ch11,ch12,ch13,ch14,ch15\n"));
+  sdCalibrationFile.flush();
+  if (sdCalibrationFile.getWriteError()) {
+    sdCalibrationFile.close();
+    return false;
+  }
+  elrsCalibrationMode = mode;
+  elrsCalibrationPowerPercent = maxPower;
+  elrsCalibrationExpectedIndex = 0;
+  elrsCalibrationExpectedPower = 30;
+  elrsCalibrationActive = true;
+  elrsCalibrationStatusCode = 1;
+  elrsCalibrationArmedOnce = false;
+  elrsCalibrationArmBlockLogged = false;
+  elrsCalibrationTestActive = false;
+  elrsCalibrationFinalTest = false;
+  elrsCalibrationSampleCount = 0;
+  elrsCalibrationStartedMs = millis();
+  elrsCalibrationCurrentPowerPercent = 0;
+  elrsCalibrationSampleMs = millis();
+  elrsCalibrationFlushMs = millis();
+  elrs.sendScienceValue("CAL_STAT", 1);
+  emitLine(String("TEL EVENT CALIBRATION STARTED ") + elrsCalibrationPath);
+  recordLogLine(String("ELRS CALIBRATION STARTED ") + elrsCalibrationPath);
+  return true;
+}
+
+void stopElrsCalibration(const char* reason, bool completed) {
+  if (!elrsCalibrationActive) return;
+  stopAllMotors();
+  if (sdCalibrationFile) {
+    sdCalibrationFile.printf("#end_elapsed_ms=%lu\n#stop_reason=%s\n#completed=%u\n#sample_count=%lu\n",
+      static_cast<unsigned long>(millis() - elrsCalibrationStartedMs), reason ? reason : "UNKNOWN",
+      completed ? 1 : 0, static_cast<unsigned long>(elrsCalibrationSampleCount));
+    sdCalibrationFile.flush();
+    sdCalibrationFile.close();
+  }
+  elrsCalibrationTestActive = false;
+  elrsCalibrationFinalTest = false;
+  elrsCalibrationActive = false;
+  elrsCalibrationStatusCode = completed ? 3 : 2;
+  elrsCalibrationLastCommand = 0;
+  elrsArmed = false;
+  elrsArmReady = false;
+  controlSource = CONTROL_SOURCE_NONE;
+  controlMode = CONTROL_MODE_IDLE;
+  elrs.sendScienceValue("CAL_STAT", completed ? 3 : 2);
+  emitLine(String("TEL EVENT CALIBRATION ") + (completed ? "COMPLETE " : "STOPPED ") + (reason ? reason : "UNKNOWN"));
+  recordLogLine(String("ELRS CALIBRATION ") + (completed ? "COMPLETE " : "STOPPED ") + (reason ? reason : "UNKNOWN"));
+}
+
+void processElrsCalibrationCommand(uint32_t now) {
+  const uint16_t marker = elrs.channel(10);
+  const uint16_t command = elrs.channel(11);
+  const bool enabled = marker >= 1700;
+  const bool commandValid = command >= 900 && command <= 2100;
+  uint8_t decodedCommand = 0;
+  if (commandValid) {
+    if (command >= 1100 && command <= 1300) decodedCommand = 1; // START
+    else if (command >= 1400 && command <= 1600) decodedCommand = 2; // NEXT
+    else if (command >= 1700) decodedCommand = 3; // STOP
+  }
+  const bool commandEdge = decodedCommand != 0 && decodedCommand != elrsCalibrationLastCommand;
+  if (decodedCommand == 0) elrsCalibrationLastCommand = 0;
+
+  const uint16_t modeChannel = elrs.channel(12);
+  const uint16_t indexChannel = elrs.channel(13);
+  const uint16_t requestedPowerChannel = elrs.channel(14);
+  const uint16_t durationChannel = elrs.channel(15);
+  if (!elrsCalibrationActive) {
+    if (enabled && decodedCommand == 1 && commandEdge) {
+      const bool manual = elrs.channel(6) >= 900 && elrs.channel(6) < 1300;
+      const bool disarmed = elrs.channel(4) < 1300 && !elrsArmed;
+      const bool centered = abs(elrsStickPercent(elrs.channel(0))) <= 2 &&
+        abs(elrsStickPercent(elrs.channel(1))) <= 2 && abs(elrsStickPercent(elrs.channel(3))) <= 2;
+      const bool powerMinimum = elrs.channel(2) >= 900 && elrs.channel(2) <= 1100;
+      const bool commandFieldsValid = modeChannel >= ELRS_CALIBRATION_CHANNEL_MIN_US &&
+        modeChannel <= ELRS_CALIBRATION_CHANNEL_MAX_US &&
+        indexChannel >= ELRS_CALIBRATION_CHANNEL_MIN_US && indexChannel <= ELRS_CALIBRATION_CHANNEL_MAX_US &&
+        requestedPowerChannel >= ELRS_CALIBRATION_CHANNEL_MIN_US &&
+        requestedPowerChannel <= ELRS_CALIBRATION_CHANNEL_MAX_US &&
+        durationChannel >= ELRS_CALIBRATION_CHANNEL_MIN_US &&
+        durationChannel <= ELRS_CALIBRATION_CHANNEL_MAX_US;
+      if (!manual || !disarmed || !centered || !powerMinimum || !sdCardMounted ||
+          serviceMode || sdTransferActive || scienceExperimentState != 0 ||
+          controlSource == CONTROL_SOURCE_WIFI || !commandFieldsValid) {
+        elrs.sendScienceValue("CAL_STAT", 4);
+        char details[320];
+        snprintf(details, sizeof(details),
+          "INTERLOCK MANUAL=%u DISARMED=%u CENTERED=%u POWER_MIN=%u SD_READY=%u SERVICE=%u SD_TRANSFER=%u SCIENCE_IDLE=%u WIFI_CONTROL=%u FIELDS_VALID=%u RC_FRESH=%u GPS_FIX=%u PRIMARY=%u,%u,%u,%u,%u,%u CH11=%u CH12=%u CH13=%u CH14=%u CH15=%u CH16=%u",
+          manual ? 1U : 0U, disarmed ? 1U : 0U, centered ? 1U : 0U, powerMinimum ? 1U : 0U,
+          sdCardMounted ? 1U : 0U, serviceMode ? 1U : 0U, sdTransferActive ? 1U : 0U,
+          scienceExperimentState == 0 ? 1U : 0U, controlSource == CONTROL_SOURCE_WIFI ? 1U : 0U,
+          commandFieldsValid ? 1U : 0U, elrs.rcFresh(now) ? 1U : 0U, gps.location.isValid() ? 1U : 0U,
+          elrs.channel(0), elrs.channel(1), elrs.channel(2), elrs.channel(3), elrs.channel(4), elrs.channel(6),
+          marker, command, modeChannel, indexChannel, requestedPowerChannel, durationChannel);
+        const String diagnostic = String("CALIBRATION START BLOCKED ") + details;
+        emitLine(String("TEL EVENT ") + diagnostic);
+        recordLogLine(diagnostic);
+      } else {
+        const uint8_t mode = modeChannel >= 1700 ? 1 : 0;
+        // Preserve a minimum that can produce measurable propulsion in water.
+        int maxPower = constrain((static_cast<int>(requestedPowerChannel) - 1000) / 10, 0, 100);
+        maxPower = constrain(((maxPower + 5) / 10) * 10, 30, 100);
+        const uint32_t pulseDurationMs = durationChannel >= 1700
+          ? ELRS_CALIBRATION_PULSE_DURATION_LONG_MS : ELRS_CALIBRATION_PULSE_DURATION_DEFAULT_MS;
+        if (!startElrsCalibrationLog(mode, static_cast<uint8_t>(maxPower), pulseDurationMs)) {
+          elrs.sendScienceValue("CAL_STAT", 5);
+          emitLine("TEL EVENT CALIBRATION BLOCKED SD_WRITE");
+        } else {
+          // START was accepted only with CH5 low. Preserve that verified
+          // disarmed state if SE is raised before another RC frame arrives.
+          elrsArmReady = true;
+          char accepted[192];
+          snprintf(accepted, sizeof(accepted),
+            "CALIBRATION START ACCEPTED MODE=%u MAX_POWER=%u PULSE_MS=%lu CH13=%u CH14=%u CH15=%u CH16=%u",
+            mode, static_cast<unsigned>(maxPower), static_cast<unsigned long>(pulseDurationMs),
+            modeChannel, indexChannel, requestedPowerChannel, durationChannel);
+          emitLine(String("TEL EVENT ") + accepted);
+          recordLogLine(accepted);
+        }
+      }
+    }
+    elrsCalibrationLastCommand = decodedCommand;
+    return;
+  }
+
+  if (!enabled) {
+    stopElrsCalibration("TX12_COMMAND_ENABLE_LOST", false);
+    return;
+  }
+  const uint32_t requestedDurationMs = durationChannel >= 1700
+    ? ELRS_CALIBRATION_PULSE_DURATION_LONG_MS : ELRS_CALIBRATION_PULSE_DURATION_DEFAULT_MS;
+  if (durationChannel < ELRS_CALIBRATION_CHANNEL_MIN_US ||
+      durationChannel > ELRS_CALIBRATION_CHANNEL_MAX_US ||
+      requestedDurationMs != elrsCalibrationPulseDurationMs) {
+    stopElrsCalibration("DURATION_SWITCH_CHANGED", false);
+    elrsArmed = false;
+    controlSource = CONTROL_SOURCE_NONE;
+    controlMode = CONTROL_MODE_IDLE;
+    return;
+  }
+  if (decodedCommand == 3 && commandEdge) {
+    stopElrsCalibration("TX12_STOP", false);
+    return;
+  }
+  const uint16_t armChannel = elrs.channel(4);
+  if (armChannel < 1300) {
+    if (elrsCalibrationTestActive || elrsCalibrationArmedOnce) {
+      stopElrsCalibration("DISARMED", false);
+      elrsArmed = false;
+      controlSource = CONTROL_SOURCE_NONE;
+      controlMode = CONTROL_MODE_IDLE;
+      return;
+    }
+    elrsArmReady = true;
+    elrsArmed = false;
+    controlSource = CONTROL_SOURCE_NONE;
+    elrsCalibrationLastCommand = decodedCommand;
+    return;
+  }
+  const bool manual = elrs.channel(6) >= 900 && elrs.channel(6) < 1300;
+  const bool centered = abs(elrsStickPercent(elrs.channel(0))) <= 2 &&
+    abs(elrsStickPercent(elrs.channel(1))) <= 2 && abs(elrsStickPercent(elrs.channel(3))) <= 2;
+  // The low-SE arm latch is consumed on the first armed frame. Once this
+  // calibration run has armed, keep accepting subsequent frames until SE is
+  // lowered or another safety interlock fails.
+  const bool calibrationArmAuthorized = elrsArmReady || elrsCalibrationArmedOnce;
+  if (!manual || armChannel < 1700 || !calibrationArmAuthorized || !centered || elrs.channel(2) > 1100 ||
+      serviceMode || sdTransferActive || missionExecutionActive || controlSource == CONTROL_SOURCE_WIFI) {
+    if (!elrsCalibrationArmBlockLogged) {
+      char blocked[190];
+      snprintf(blocked, sizeof(blocked),
+        "CALIBRATION ARM BLOCKED MANUAL=%u CH5=%u READY=%u ARMED_ONCE=%u CENTERED=%u CH3=%u SERVICE=%u SD_TRANSFER=%u MISSION=%u WIFI_CONTROL=%u",
+        manual ? 1U : 0U, armChannel, elrsArmReady ? 1U : 0U,
+        elrsCalibrationArmedOnce ? 1U : 0U, centered ? 1U : 0U, elrs.channel(2),
+        serviceMode ? 1U : 0U, sdTransferActive ? 1U : 0U,
+        missionExecutionActive ? 1U : 0U, controlSource == CONTROL_SOURCE_WIFI ? 1U : 0U);
+      emitLine(String("TEL EVENT ") + blocked);
+      recordLogLine(blocked);
+      elrsCalibrationArmBlockLogged = true;
+    }
+    if (elrsArmed || elrsCalibrationTestActive) stopElrsCalibration("SAFETY_INTERLOCK", false);
+    else elrs.sendScienceValue("CAL_STAT", 4);
+    elrsArmed = false;
+    controlSource = CONTROL_SOURCE_NONE;
+    controlMode = CONTROL_MODE_IDLE;
+    return;
+  }
+  if (!elrsCalibrationArmedOnce) {
+    emitLine("TEL EVENT CALIBRATION ARMED");
+    recordLogLine("ELRS CALIBRATION ARMED");
+  }
+  elrsArmed = true;
+  elrsArmReady = false;
+  elrsCalibrationArmedOnce = true;
+  controlSource = CONTROL_SOURCE_ELRS;
+  controlMode = CONTROL_MODE_MANUAL;
+  if (commandEdge && decodedCommand == 2 && !elrsCalibrationTestActive) {
+    const bool modeMatches = elrsCalibrationMode == 1
+      ? modeChannel >= 1900 && modeChannel <= ELRS_CALIBRATION_CHANNEL_MAX_US
+      : modeChannel >= ELRS_CALIBRATION_CHANNEL_MIN_US && modeChannel <= 1100;
+    if (!modeMatches || indexChannel < ELRS_CALIBRATION_CHANNEL_MIN_US ||
+        indexChannel > ELRS_CALIBRATION_CHANNEL_MAX_US ||
+        requestedPowerChannel < ELRS_CALIBRATION_CHANNEL_MIN_US ||
+        requestedPowerChannel > ELRS_CALIBRATION_CHANNEL_MAX_US) {
+      char rejected[160];
+      snprintf(rejected, sizeof(rejected),
+        "CALIBRATION STEP REJECTED MODE=%u CH13=%u CH14=%u CH15=%u EXPECTED_INDEX=%u EXPECTED_POWER=%u",
+        static_cast<unsigned>(elrsCalibrationMode), modeChannel, indexChannel,
+        requestedPowerChannel, static_cast<unsigned>(elrsCalibrationExpectedIndex),
+        static_cast<unsigned>(elrsCalibrationExpectedPower));
+      emitLine(String("TEL EVENT ") + rejected);
+      recordLogLine(rejected);
+      stopElrsCalibration("INVALID_STEP_ARGUMENTS", false);
+      elrsArmed = false;
+      controlSource = CONTROL_SOURCE_NONE;
+      controlMode = CONTROL_MODE_IDLE;
+      return;
+    }
+    int testIndex = constrain((static_cast<int>(indexChannel) - 1000 + 100) / 200, 0, 5);
+    int power = constrain((static_cast<int>(requestedPowerChannel) - 1000) / 10, 0, 100);
+    power = constrain(((power + 5) / 10) * 10, 30, elrsCalibrationPowerPercent);
+    if (testIndex != elrsCalibrationExpectedIndex || power != elrsCalibrationExpectedPower) {
+      char mismatch[160];
+      snprintf(mismatch, sizeof(mismatch),
+        "CALIBRATION STEP MISMATCH INDEX=%u POWER=%u EXPECTED_INDEX=%u EXPECTED_POWER=%u CH12=%u CH14=%u CH15=%u",
+        static_cast<unsigned>(testIndex), static_cast<unsigned>(power),
+        static_cast<unsigned>(elrsCalibrationExpectedIndex),
+        static_cast<unsigned>(elrsCalibrationExpectedPower), command, indexChannel,
+        requestedPowerChannel);
+      emitLine(String("TEL EVENT ") + mismatch);
+      recordLogLine(mismatch);
+      stopElrsCalibration("TEST_SEQUENCE_MISMATCH", false);
+      elrsArmed = false;
+      controlSource = CONTROL_SOURCE_NONE;
+      controlMode = CONTROL_MODE_IDLE;
+      return;
+    }
+    if (elrsCalibrationMode == 0) {
+      const int demand = power;
+      int lateral = 0, thrust = 0, yaw = 0;
+      if (testIndex == 0) thrust = demand;
+      else if (testIndex == 1) thrust = -demand;
+      else if (testIndex == 2) lateral = demand;
+      else if (testIndex == 3) lateral = -demand;
+      else if (testIndex == 4) yaw = demand;
+      else yaw = -demand;
+      applyMotionCommand(lateral, thrust, yaw, true);
+      latestMixerInputLateral = lateral;
+      latestMixerInputThrust = thrust;
+      latestMixerInputYaw = yaw;
+      latestMixerInputTx12 = true;
+    } else {
+      const int motorIndex = testIndex / 2;
+      const bool forward = (testIndex % 2) == 0;
+      const int drive = static_cast<int>(roundf(power * MOTOR_OUTPUT_LIMIT *
+        (ELRS_MOTOR_POWER_LIMIT_PERCENT / 100.0f) / 100.0f));
+      for (int i = 0; i < MOTOR_COUNT; ++i) setMotorDrive(i, i == motorIndex ? (forward ? drive : -drive) : 0);
+      latestMixerInputLateral = 0;
+      latestMixerInputThrust = 0;
+      latestMixerInputYaw = 0;
+      latestMixerInputTx12 = false;
+    }
+    elrsCalibrationTestIndex = static_cast<uint8_t>(testIndex);
+    elrsCalibrationCurrentPowerPercent = static_cast<uint8_t>(power);
+    elrsCalibrationTestActive = true;
+    elrsCalibrationFinalTest = (power == elrsCalibrationPowerPercent && testIndex == 5);
+    if (testIndex == 5) {
+      if (power < elrsCalibrationPowerPercent) {
+        elrsCalibrationExpectedIndex = 0;
+        elrsCalibrationExpectedPower = static_cast<uint8_t>(power + 10);
+      }
+    } else {
+      elrsCalibrationExpectedIndex = static_cast<uint8_t>(testIndex + 1);
+      elrsCalibrationExpectedPower = static_cast<uint8_t>(power);
+    }
+    elrsCalibrationTestStartedMs = now;
+    elrsCalibrationTestEndsMs = now + elrsCalibrationPulseDurationMs;
+    elrs.sendScienceValue("CAL_STEP", testIndex + 1);
+    elrs.sendScienceValue("CAL_PWR", power);
+    emitLine(String("TEL EVENT CALIBRATION STEP ") + String(testIndex) + " " + String(power));
+  }
+  elrsCalibrationLastCommand = decodedCommand;
+}
+
+void serviceElrsCalibration(uint32_t now) {
+  if (!elrsCalibrationActive) return;
+  if (serviceMode || sdTransferActive || missionExecutionActive || scienceExperimentState != 0 ||
+      controlSource == CONTROL_SOURCE_WIFI) {
+    stopElrsCalibration("EXTERNAL_CONTROL_OR_SD_ACTIVITY", false);
+    return;
+  }
+  if (!elrs.rcFresh(now) || (elrs.linkFresh(now) && elrs.linkQuality() == 0)) {
+    stopElrsCalibration("ELRS_FAILSAFE", false);
+    return;
+  }
+  if (elrsCalibrationTestActive && static_cast<int32_t>(now - elrsCalibrationTestEndsMs) >= 0) {
+    stopAllMotors();
+    elrsCalibrationTestActive = false;
+    if (elrsCalibrationFinalTest) {
+      stopElrsCalibration("ALL_STEPS_COMPLETE", true);
+      return;
+    }
+    elrs.sendScienceValue("CAL_STAT", 1);
+  }
+  if (now - elrsCalibrationSampleMs >= ELRS_CALIBRATION_SAMPLE_INTERVAL_MS) {
+    elrsCalibrationSampleMs = now;
+    writeElrsCalibrationSample(now);
+  }
+  if (now - elrsCalibrationFlushMs >= 1000) {
+    elrsCalibrationFlushMs = now;
+    sdCalibrationFile.flush();
+    if (sdCalibrationFile.getWriteError()) stopElrsCalibration("SD_WRITE_ERROR", false);
+  }
+}
+
+void writeElrsCalibrationSample(uint32_t now) {
+  if (!sdCalibrationFile) return;
+  ImuReadings imu = {};
+  MagnetometerReadings mag = {};
+  const bool imuValid = readMpu6050(imu);
+  const bool magValid = readQmc5883(mag);
+  const float currentSensorVoltage = readCurrentSensorVoltage();
+  const bool currentValid = isfinite(currentSensorVoltage);
+  const float sampleCurrent = currentValid ? currentAmpsFromSensorVoltage(currentSensorVoltage) : NAN;
+  if (currentValid) latestCurrentAmps = sampleCurrent;
+  const float sampleBattery = readBatterySystemVoltage();
+  const bool batteryValid = isfinite(sampleBattery) && sampleBattery > 0.0f;
+  if (batteryValid) latestBatteryVolts = sampleBattery;
+  float heading = NAN;
+  if (magValid) readMissionHeadingDegrees(heading);
+  const bool gpsValid = gps.location.isValid() && gps.location.age() < 2000;
+  const int lateral = latestMixerInputLateral;
+  const int thrust = latestMixerInputThrust;
+  const int yaw = latestMixerInputYaw;
+  const char* testName = elrsCalibrationMode == 0 ? elrsCalibrationAxisName(elrsCalibrationTestIndex) :
+    (elrsCalibrationTestIndex == 0 ? "rear_forward" : elrsCalibrationTestIndex == 1 ? "rear_reverse" :
+     elrsCalibrationTestIndex == 2 ? "front_left_forward" : elrsCalibrationTestIndex == 3 ? "front_left_reverse" :
+     elrsCalibrationTestIndex == 4 ? "front_right_forward" : "front_right_reverse");
+  sdCalibrationFile.printf("SAMPLE,%lu,%u,%s,%u,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%u,%u,",
+    static_cast<unsigned long>(now - elrsCalibrationStartedMs), static_cast<unsigned int>(elrsCalibrationTestIndex),
+    testName, static_cast<unsigned int>(elrsCalibrationCurrentPowerPercent),
+    elrsCalibrationTestActive ? 1U : 0U,
+    lateral, thrust, yaw, driveValues[0], driveValues[1], driveValues[2], targetDriveValues[0], targetDriveValues[1],
+    targetDriveValues[2], appliedMotorPwm[0], appliedMotorPwm[1], appliedMotorPwm[2], sampleCurrent,
+    batteryValid ? sampleBattery : NAN, currentValid ? 1U : 0U, batteryValid ? 1U : 0U);
+  if (imuValid) sdCalibrationFile.printf("%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,", imu.accelXG, imu.accelYG, imu.accelZG, imu.gyroXDps, imu.gyroYDps, imu.gyroZDps);
+  else sdCalibrationFile.print(F("nan,nan,nan,nan,nan,nan,"));
+  sdCalibrationFile.printf("%d,%d,%d,%.3f,%u,%.7f,%.7f,%.3f,%.3f,%u,%.2f,",
+    magValid ? mag.x : 0, magValid ? mag.y : 0, magValid ? mag.z : 0, heading,
+    gpsValid ? 1U : 0U, gpsValid ? gps.location.lat() : 0.0, gpsValid ? gps.location.lng() : 0.0,
+    gps.speed.isValid() ? gps.speed.mps() : 0.0, gps.course.isValid() ? gps.course.deg() : 0.0,
+    gps.satellites.isValid() ? static_cast<unsigned int>(gps.satellites.value()) : 0U,
+    gps.hdop.isValid() ? gps.hdop.hdop() : 0.0);
+  for (uint8_t channel = 0; channel < 5; ++channel) {
+    sdCalibrationFile.printf("%u,", elrs.channel(channel));
+  }
+  sdCalibrationFile.printf("%u,%u,%u,%u,%u,%u\n", elrs.channel(6), elrs.channel(10), elrs.channel(11),
+    elrs.channel(12), elrs.channel(13), elrs.channel(14));
+  ++elrsCalibrationSampleCount;
 }
 
 void processElrsControl() {
@@ -2282,32 +3346,203 @@ void processElrsControl() {
     }
   }
   if (!elrs.rcFresh(now) || (elrs.linkFresh(now) && elrs.linkQuality() == 0)) {
-    if (controlSource == CONTROL_SOURCE_ELRS) {
+    elrsScienceSwitchPositionKnown = false;
+    elrsScienceManualModeKnown = false;
+    if (controlSource == CONTROL_SOURCE_ELRS && !(missionExecutionActive && missionReturningHome)) {
       stopElrsForFailsafe(now);
     }
     return;
   }
 
-  // CH7 is the TX12 SB mode selector. Mission execution is unavailable until
-  // the buoy has a tested waypoint guidance controller, so fail closed here.
+  // CH7 is the TX12 SB mode selector.
   const uint16_t missionModeChannel = elrs.channel(6);
+  const bool manualModeSelected = missionModeChannel >= 900 && missionModeChannel < 1700;
+  const bool requestedManualAssist = missionModeChannel >= 1300 && missionModeChannel < 1700;
+  if (requestedManualAssist != manualAssistRequested) {
+    manualAssistRequested = requestedManualAssist;
+    manualAssistTargetValid = false;
+    manualAssistYawing = false;
+    manualAssistHeadingAvailable = false;
+    manualAssistLastYawCorrection = 0.0f;
+    lastManualAssistUpdateMs = 0;
+    emitLine(String("TEL EVENT MANUAL_ASSIST ") + (manualAssistRequested ? "ON" : "OFF"));
+  }
+  processElrsCalibrationCommand(now);
+  if (elrsCalibrationActive) return;
+  processElrsScienceSwitch(manualModeSelected);
   if (missionModeChannel >= 1700) {
     if (!missionModeRequested) {
-      stopMotorsForSafety(F("MISSION MODE UNAVAILABLE"));
-      emitLine("TEL EVENT MISSION_MODE REQUESTED_UNAVAILABLE");
+      if (elrsArmed && controlSource == CONTROL_SOURCE_ELRS) {
+        stopMotorsForSafety(F("MISSION MODE SWITCH"));
+      }
+      emitLine("TEL EVENT MISSION_MODE REQUESTED");
     }
     missionModeRequested = true;
-    elrsArmed = false;
-    elrsArmReady = false;
+    if (missionStartLocked) {
+      reportMissionStartBlock(9, "SELECT_MANUAL_THEN_MISSION");
+      return;
+    }
+    const uint16_t armChannel = elrs.channel(4);  // CH5: low disarm, high arm
+    if (armChannel < 1300) {
+      if (missionExecutionActive) stopMissionExecution("RADIO DISARM", false);
+      elrsArmReady = true;
+      if (elrsArmed) stopMotorsForSafety(F("MISSION DISARMED"));
+      elrsArmed = false;
+      return;
+    }
+    if (armChannel < 1700 || serviceMode || sdTransferActive) {
+      if (armChannel >= 1300) reportMissionStartBlock(14, "ARM_SWITCH_NOT_FULLY_HIGH");
+      else if (serviceMode || sdTransferActive) reportMissionStartBlock(15, "BUOY_SERVICE_OR_SD_TRANSFER_ACTIVE");
+      if (missionExecutionActive) stopMissionExecution("RADIO ARM SWITCH", false);
+      if (elrsArmed) stopMotorsForSafety(F("MISSION DISARMED"));
+      elrsArmed = false;
+      return;
+    }
+    const int lateral = elrsStickPercent(elrs.channel(0));
+    const int thrust = elrsStickPercent(elrs.channel(1));
+    const int yaw = elrsStickPercent(elrs.channel(3));
+    const uint16_t powerChannel = elrs.channel(2);
+    if (!elrsArmed) {
+      if (controlSource == CONTROL_SOURCE_WIFI) {
+        reportMissionStartBlock(3, "WIFI_CONTROL_SOURCE_ACTIVE");
+        if (!elrsArmBlockedByWifiLogged) recordLogLine("MISSION ARM BLOCKED: WIFI CONTROL SOURCE ACTIVE");
+        elrsArmBlockedByWifiLogged = true;
+        return;
+      }
+      if (!elrsArmReady || powerChannel > 1100 || lateral || thrust || yaw) {
+        if (!elrsArmInterlockBlockLogged) {
+          recordLogLine("MISSION ARM BLOCKED: CYCLE ARM LOW; POWER MINIMUM; STICKS CENTERED");
+          elrsArmInterlockBlockLogged = true;
+        }
+        reportMissionStartBlock(!elrsArmReady ? 1 : 2,
+          !elrsArmReady ? "CYCLE_ARM_LOW" : "POWER_MINIMUM_STICKS_CENTERED");
+        return;
+      }
+      if (!missionId[0] || missionWaypointCount == 0 || !missionMetadata.hasHome || missionMetadata.boundaryCount < 3) {
+        reportMissionStartBlock(10, "V4_MISSION_WITH_HOME_BOUNDARY_REQUIRED");
+        missionStartBlockedLogged = true;
+        return;
+      }
+      bool routeValid = missionCoordinateInsideBoundary(missionMetadata.home.latitude, missionMetadata.home.longitude);
+      for (uint8_t i = 0; routeValid && i < missionWaypointCount; ++i) {
+        routeValid = missionWaypoints[i].speedPercent >= 1 && missionWaypoints[i].speedPercent <= 100 &&
+          missionCoordinateInsideBoundary(missionWaypoints[i].latitude, missionWaypoints[i].longitude);
+      }
+      if (!routeValid) {
+        reportMissionStartBlock(13, "MISSION_ROUTE_POINT_OR_SPEED_INVALID");
+        missionStartBlockedLogged = true;
+        return;
+      }
+      if (!sdCardMounted) {
+        reportMissionStartBlock(11, "SD_CARD_UNAVAILABLE");
+        missionStartBlockedLogged = true;
+        return;
+      }
+      if (scienceExperimentState != 0) {
+        reportMissionStartBlock(12, "SAVE_OR_STOP_EXISTING_SESSION_FIRST");
+        missionStartBlockedLogged = true;
+        return;
+      }
+      if (!gps.location.isValid() || gps.location.age() > 1500 || !gps.satellites.isValid() ||
+          gps.satellites.value() < 5 || !gps.hdop.isValid() || gps.hdop.hdop() > 3.0) {
+        reportMissionStartBlock(5, "GPS_QUALITY_NEEDS_5_SATS_HDOP_3_OR_BETTER");
+        missionStartBlockedLogged = true;
+        return;
+      }
+      if (!missionCoordinateInsideBoundary(gps.location.lat(), gps.location.lng())) {
+        reportMissionStartBlock(6, "GPS_OUTSIDE_MISSION_BOUNDARY");
+        missionStartBlockedLogged = true;
+        return;
+      }
+      if (TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(),
+          missionMetadata.home.latitude, missionMetadata.home.longitude) > MISSION_START_RADIUS_M) {
+        reportMissionStartBlock(7, "MOVE_WITHIN_30M_OF_MISSION_HOME");
+        missionStartBlockedLogged = true;
+        return;
+      }
+      // Holding SA while switching to Mission deliberately captures this
+      // start position as Home for the run. The original mission file remains
+      // unchanged; the session manifest and event log record the run Home.
+      const bool captureMissionHome = elrs.channel(8) >= 1500;
+      const auto plannedMissionHome = missionMetadata.home;
+      if (captureMissionHome && missionWaypointCount > 0 &&
+          !missionSegmentInsideBoundary(gps.location.lat(), gps.location.lng(),
+            missionWaypoints[0].latitude, missionWaypoints[0].longitude)) {
+        reportMissionStartBlock(6, "CAPTURED_HOME_ROUTE_OUTSIDE_BOUNDARY");
+        missionStartBlockedLogged = true;
+        return;
+      }
+      float startingHeading = 0.0f;
+      if (!magnetometerCalibrationLoaded || !magnetometerAvailable || !readMissionHeadingDegrees(startingHeading)) {
+        reportMissionStartBlock(8, "MAGNETOMETER_CALIBRATION_UNAVAILABLE");
+        missionStartBlockedLogged = true;
+        return;
+      }
+      elrsArmBlockedByWifiLogged = false;
+      elrsArmInterlockBlockLogged = false;
+      elrsArmReady = false;
+      manualLinkLossStop = false;
+      missionExecutionActive = true;
+      missionReturningHome = false;
+      missionCheckpointActive = false;
+      missionCurrentWaypoint = 0;
+      missionCompletedWaypoints = 0;
+      missionRunStatus = "STARTING";
+      missionStartBlockCode = 0;
+      missionStopReason = "";
+      missionStartBlockedLogged = false;
+      if (captureMissionHome) {
+        missionPlannedHomeBeforeRun = plannedMissionHome;
+        missionHomeCapturedForRun = true;
+        missionMetadata.home.latitude = gps.location.lat();
+        missionMetadata.home.longitude = gps.location.lng();
+        recordLogLine(String("MISSION HOME CAPTURED ") +
+          String(missionMetadata.home.latitude, 7) + "," + String(missionMetadata.home.longitude, 7) +
+          " PLANNED=" + String(plannedMissionHome.latitude, 7) + "," + String(plannedMissionHome.longitude, 7));
+        emitLine(String("TEL EVENT MISSION_HOME_CAPTURED ") +
+          String(missionMetadata.home.latitude, 7) + " " + String(missionMetadata.home.longitude, 7));
+      }
+      strlcpy(runningMissionId, missionId, sizeof(runningMissionId));
+      strlcpy(missionLastRunId, missionId, sizeof(missionLastRunId));
+      handleControlCommand("CTRL SCIENCE START " + currentScienceTimestamp());
+      if (scienceExperimentState != 1) {
+        missionExecutionActive = false;
+        missionMetadata.home = plannedMissionHome;
+        missionHomeCapturedForRun = false;
+        missionRunStatus = "IDLE";
+        runningMissionId[0] = '\0';
+        elrsArmReady = false;
+        reportMissionStartBlock(16, "MISSION_SESSION_CREATE_FAILED");
+        recordLogLine("MISSION START BLOCKED: SESSION CREATE FAILED");
+        return;
+      }
+      elrsArmed = true;
+      controlSource = CONTROL_SOURCE_ELRS;
+      controlMode = CONTROL_MODE_GOTO;
+      elrs.sendScienceValue("MIS_BLOCK", 0);
+      elrs.sendScienceValue("MIS_STATE", missionTelemetryStatusCode());
+      lastMissionControlMs = 0;
+      lastMissionUpdateMs = 0;
+      recordLogLine(String("MISSION START ") + runningMissionId);
+      emitLine(String("TEL EVENT MISSION_START ") + runningMissionId);
+    }
     return;
   }
   if (missionModeRequested) {
+    if (missionExecutionActive) stopMissionExecution("MISSION MODE SWITCH", false);
+    missionStartLocked = false;
+    missionStartBlockedLogged = false;
+    missionStartBlockCode = 0;
+    elrs.sendScienceValue("MIS_BLOCK", 0);
     missionModeRequested = false;
     emitLine("TEL EVENT MISSION_MODE MANUAL");
   }
 
   const uint16_t armChannel = elrs.channel(4);  // CH5: low disarm, high arm
   if (armChannel < 1300) {
+    elrsArmBlockedByWifiLogged = false;
+    elrsArmInterlockBlockLogged = false;
+    if (elrsArmed || controlSource == CONTROL_SOURCE_ELRS) recordLogLine("ELRS ARM SWITCH LOW; DISARMED");
     if (controlSource == CONTROL_SOURCE_ELRS) stopMotorsForSafety(F("ELRS DISARMED"));
     elrsArmed = false;
     elrsArmReady = true;
@@ -2328,25 +3563,105 @@ void processElrsControl() {
     // controls before its next high transition can take motor authority.
     if (controlSource == CONTROL_SOURCE_WIFI) {
       elrsArmReady = false;
+      if (!elrsArmBlockedByWifiLogged) {
+        recordLogLine("ELRS ARM BLOCKED: WIFI CONTROL SOURCE ACTIVE");
+        elrsArmBlockedByWifiLogged = true;
+      }
       return;
     }
-    if (!elrsArmReady || powerChannel > 1100 || lateral || thrust || yaw) return;
+    if (!elrsArmReady || powerChannel > 1100 || lateral || thrust || yaw) {
+      if (!elrsArmInterlockBlockLogged) {
+        recordLogLine("ELRS ARM BLOCKED: CYCLE ARM LOW; POWER MINIMUM; STICKS CENTERED");
+        elrsArmInterlockBlockLogged = true;
+      }
+      return;
+    }
+    const bool captureHomeOnArm = elrs.channel(8) >= 1700;  // SA / CH9 held while arming.
+    if (captureHomeOnArm && (!gps.location.isValid() || gps.location.age() > 1500 ||
+        !gps.satellites.isValid() || gps.satellites.value() < 5 ||
+        !gps.hdop.isValid() || gps.hdop.hdop() > 3.0)) {
+      if (!elrsArmInterlockBlockLogged) {
+        emitLine("TEL EVENT MANUAL_ARM_BLOCKED HOME_GPS_QUALITY");
+        recordLogLine("MANUAL ARM BLOCKED: HOME CAPTURE NEEDS GPS FIX");
+        elrsArmInterlockBlockLogged = true;
+      }
+      return;
+    }
     elrsArmed = true;
+    elrsArmBlockedByWifiLogged = false;
+    elrsArmInterlockBlockLogged = false;
     elrsArmReady = false;
     manualLinkLossStop = false;
     controlSource = CONTROL_SOURCE_ELRS;
     controlMode = CONTROL_MODE_MANUAL;
     holdPositionEnabled = false;
+    manualReturnHomeActive = false;
+    // Require both momentary buttons to be released after arming before the
+    // deliberate two-button Return Home command can be accepted.
+    manualHomeButtonReleasedAfterArm = false;
+    manualRthComboStartedMs = 0;
+    manualRthComboTriggered = false;
+    if (captureHomeOnArm) {
+      manualHome.latitude = gps.location.lat();
+      manualHome.longitude = gps.location.lng();
+      manualHomeAvailable = true;
+      const bool homePersisted = saveManualHomeToPreferences(manualHome);
+      emitLine(String("TEL STATUS MANUAL_HOME SET ") + String(manualHome.latitude, 7) + " " + String(manualHome.longitude, 7));
+      emitLine(String("TEL STATUS MANUAL_HOME_STORAGE ") + (homePersisted ? "SAVED NVS" : "SAVE FAILED"));
+      emitLine("TEL EVENT MANUAL_HOME_CAPTURED");
+      if (!homePersisted) emitLine("TEL EVENT MANUAL_HOME_NOT_PERSISTED");
+      recordLogLine(String("MANUAL HOME CAPTURED ") + String(manualHome.latitude, 7) + "," + String(manualHome.longitude, 7));
+      if (!homePersisted) recordLogLine("MANUAL HOME PERSISTENCE FAILED");
+    }
     lastElrsAppliedRcMs = 0;
     recordLogLine("ELRS CONTROL ARMED");
   }
+  const uint16_t homeButtonChannel = elrs.channel(8);  // SA / CH9: hold while arming to capture manual Home.
+  const uint16_t rthConfirmChannel = elrs.channel(9);  // SD / CH10: hold with SA to confirm Return Home.
+  const bool homeButtonPressed = homeButtonChannel >= 1500;
+  const bool rthConfirmPressed = rthConfirmChannel >= 1500;
+  const bool rthComboPressed = homeButtonPressed && rthConfirmPressed;
+  if (!homeButtonPressed && !rthConfirmPressed) {
+    manualHomeButtonReleasedAfterArm = true;
+    manualRthComboStartedMs = 0;
+    manualRthComboTriggered = false;
+  } else if (!rthComboPressed) {
+    manualRthComboStartedMs = 0;
+  } else if (manualHomeButtonReleasedAfterArm && manualHomeAvailable && !manualReturnHomeActive && !manualRthComboTriggered) {
+    const uint32_t now = millis();
+    if (manualRthComboStartedMs == 0) manualRthComboStartedMs = now;
+    if (now - manualRthComboStartedMs >= 1000) {
+      manualRthComboTriggered = true;
+      manualHomeButtonReleasedAfterArm = false;
+      if (!gps.location.isValid() || gps.location.age() > 1500 || !gps.satellites.isValid() ||
+          gps.satellites.value() < 5 || !gps.hdop.isValid() || gps.hdop.hdop() > 3.0) {
+        emitLine("TEL EVENT MANUAL_RTH_BLOCKED GPS_QUALITY");
+        recordLogLine("MANUAL RETURN HOME BLOCKED: GPS QUALITY");
+      } else {
+        float currentHeading = 0.0f;
+        if (!magnetometerCalibrationLoaded || !magnetometerAvailable || !readMissionHeadingDegrees(currentHeading)) {
+          emitLine("TEL EVENT MANUAL_RTH_BLOCKED HEADING_UNAVAILABLE");
+          recordLogLine("MANUAL RETURN HOME BLOCKED: HEADING UNAVAILABLE");
+        } else {
+          manualReturnHomeActive = true;
+          lastManualReturnUpdateMs = 0;
+          controlMode = CONTROL_MODE_GOTO;
+          emitLine("TEL EVENT MANUAL_RETURN_HOME STARTED");
+          recordLogLine("MANUAL RETURN HOME STARTED");
+        }
+      }
+    }
+  }
+  if (manualReturnHomeActive) return;
   if (controlSource != CONTROL_SOURCE_ELRS || elrs.lastRcMs() == lastElrsAppliedRcMs) return;
   lastElrsAppliedRcMs = elrs.lastRcMs();
   const int powerPercent = constrain((static_cast<int>(powerChannel) - 1000) / 10, 0, 100);
   const float scale = (powerPercent * ELRS_MOTOR_POWER_LIMIT_PERCENT) / 10000.0f;
   applyMotionCommand(static_cast<int>(roundf(lateral * scale)),
                      static_cast<int>(roundf(thrust * scale)),
-                     static_cast<int>(roundf(yaw * scale)));
+                     applyManualHeadingAssist(yaw, static_cast<int>(roundf(yaw * scale)),
+                       static_cast<int>(roundf(lateral * scale)),
+                       static_cast<int>(roundf(thrust * scale)), scale, now), true);
   controlMode = CONTROL_MODE_MANUAL;
 }
 
@@ -2358,6 +3673,463 @@ void stopAllMotors() {
     motorStartBoostUntilMs[i] = 0;
     setMotorDrive(i, 0);
     applyMotorOutput(motors[i], 0);
+  }
+}
+
+bool missionCoordinateInsideBoundary(double latitude, double longitude) {
+  if (missionMetadata.boundaryCount < 3) return false;
+  bool inside = false;
+  for (uint8_t i = 0, j = missionMetadata.boundaryCount - 1; i < missionMetadata.boundaryCount; j = i++) {
+    const double yi = missionMetadata.boundary[i].latitude;
+    const double xi = missionMetadata.boundary[i].longitude;
+    const double yj = missionMetadata.boundary[j].latitude;
+    const double xj = missionMetadata.boundary[j].longitude;
+    const double cross = (longitude - xi) * (yj - yi) - (latitude - yi) * (xj - xi);
+    if (fabs(cross) < 1e-9 && longitude >= min(xi, xj) - 1e-9 && longitude <= max(xi, xj) + 1e-9 &&
+        latitude >= min(yi, yj) - 1e-9 && latitude <= max(yi, yj) + 1e-9) return true;
+    const bool crosses = ((yi > latitude) != (yj > latitude)) &&
+      (longitude < (xj - xi) * (latitude - yi) / (yj - yi) + xi);
+    if (crosses) inside = !inside;
+  }
+  return inside;
+}
+
+bool missionDirectReturnPathIsSafe(double latitude, double longitude) {
+  if (!gps.location.isValid() || !missionMetadata.hasHome || missionMetadata.boundaryCount < 3) return false;
+  const double distance = TinyGPSPlus::distanceBetween(latitude, longitude,
+    missionMetadata.home.latitude, missionMetadata.home.longitude);
+  if (!isfinite(distance) || distance > 10000.0) return false;
+  const uint16_t steps = static_cast<uint16_t>(max(1.0, ceil(distance / 5.0)));
+  bool enteredBoundary = missionCoordinateInsideBoundary(latitude, longitude);
+  for (uint16_t i = 1; i <= steps; ++i) {
+    const double fraction = static_cast<double>(i) / steps;
+    const double testLat = latitude + (missionMetadata.home.latitude - latitude) * fraction;
+    const double testLon = longitude + (missionMetadata.home.longitude - longitude) * fraction;
+    const bool inside = missionCoordinateInsideBoundary(testLat, testLon);
+    if (inside) enteredBoundary = true;
+    else if (enteredBoundary && i < steps) return false;
+  }
+  return true;
+}
+
+bool missionSegmentInsideBoundary(double fromLatitude, double fromLongitude, double toLatitude, double toLongitude) {
+  const double distance = TinyGPSPlus::distanceBetween(fromLatitude, fromLongitude, toLatitude, toLongitude);
+  if (!isfinite(distance) || distance > 10000.0) return false;
+  const uint16_t steps = static_cast<uint16_t>(max(1.0, ceil(distance / 5.0)));
+  for (uint16_t i = 0; i <= steps; ++i) {
+    const double fraction = static_cast<double>(i) / steps;
+    if (!missionCoordinateInsideBoundary(fromLatitude + (toLatitude - fromLatitude) * fraction,
+        fromLongitude + (toLongitude - fromLongitude) * fraction)) return false;
+  }
+  return true;
+}
+
+bool readHeadingDegrees(float& headingDegrees, bool requireCalibration) {
+  if (!magnetometerAvailable || (requireCalibration && !magnetometerCalibrationLoaded)) return false;
+  MagnetometerReadings mag = {};
+  ImuReadings imu = {};
+  if (!readQmc5883(mag) || !readMpu6050(imu)) return false;
+  const float mx = (static_cast<float>(mag.x) - magnetometerOffsetX) * magnetometerScaleX;
+  const float my = (static_cast<float>(mag.y) - magnetometerOffsetY) * magnetometerScaleY;
+  const float mz = static_cast<float>(mag.z);
+  const float roll = atan2f(imu.accelYG, imu.accelZG);
+  const float pitch = atan2f(-imu.accelXG,
+    sqrtf(imu.accelYG * imu.accelYG + imu.accelZG * imu.accelZG));
+  const float horizontalX = mx * cosf(pitch) + mz * sinf(pitch);
+  const float horizontalY = mx * sinf(roll) * sinf(pitch) + my * cosf(roll)
+    - mz * sinf(roll) * cosf(pitch);
+  headingDegrees = atan2f(horizontalY, horizontalX) * 180.0f / PI;
+  if (headingDegrees < 0.0f) headingDegrees += 360.0f;
+  return isfinite(headingDegrees);
+}
+
+bool readMissionHeadingDegrees(float& headingDegrees) {
+  if (!magnetometerCalibrationLoaded || !magnetometerAvailable) {
+    missionHeadingCacheValid = false;
+    return false;
+  }
+  if (readHeadingDegrees(headingDegrees, true)) {
+    missionHeadingCacheDegrees = headingDegrees;
+    missionHeadingCacheUpdatedMs = millis();
+    missionHeadingCacheValid = true;
+    return true;
+  }
+  // A not-ready sample is normal between the magnetometer's 50 Hz updates.
+  // Reuse only a recent heading; readQmc5883 clears magnetometerAvailable on
+  // an I2C failure, which takes the fail-closed path above.
+  if (!magnetometerAvailable || !missionHeadingCacheValid ||
+      millis() - missionHeadingCacheUpdatedMs > MISSION_HEADING_MAX_AGE_MS) {
+    missionHeadingCacheValid = false;
+    return false;
+  }
+  headingDegrees = missionHeadingCacheDegrees;
+  return true;
+}
+
+bool readManualAssistHeadingDegrees(float& headingDegrees) {
+  return readHeadingDegrees(headingDegrees, false);
+}
+
+int applyManualHeadingAssist(int stickYaw, int scaledYaw, int scaledLateral,
+                             int scaledThrust, float powerScale, uint32_t now) {
+  if (!manualAssistRequested) {
+    manualAssistTargetValid = false;
+    manualAssistYawing = false;
+    manualAssistLastYawCorrection = 0.0f;
+    manualAssistHeadingAvailable = false;
+    return scaledYaw;
+  }
+
+  if (abs(stickYaw) > 5) {
+    manualAssistYawing = true;
+    manualAssistTargetValid = false;
+    manualAssistLastYawCorrection = 0.0f;
+    if (lastManualAssistUpdateMs == 0 || now - lastManualAssistUpdateMs >= MANUAL_ASSIST_UPDATE_INTERVAL_MS) {
+      float heading = 0.0f;
+      if (readManualAssistHeadingDegrees(heading)) {
+        manualAssistTargetHeadingDegrees = heading;
+        manualAssistHeadingAvailable = true;
+      } else {
+        manualAssistHeadingAvailable = false;
+      }
+      lastManualAssistUpdateMs = now;
+    }
+    return scaledYaw;
+  }
+
+  float heading = 0.0f;
+  if (manualAssistYawing || ((scaledLateral == 0 && scaledThrust == 0) || powerScale <= 0.0f)) {
+    manualAssistYawing = false;
+    manualAssistLastYawCorrection = 0.0f;
+    if (lastManualAssistUpdateMs == 0 || now - lastManualAssistUpdateMs >= MANUAL_ASSIST_UPDATE_INTERVAL_MS) {
+      if (readManualAssistHeadingDegrees(heading)) {
+        manualAssistTargetHeadingDegrees = heading;
+        manualAssistTargetValid = true;
+        manualAssistHeadingAvailable = true;
+      } else {
+        manualAssistTargetValid = false;
+        manualAssistHeadingAvailable = false;
+      }
+      lastManualAssistUpdateMs = now;
+    }
+    return 0;
+  }
+
+  if (now - lastManualAssistUpdateMs < MANUAL_ASSIST_UPDATE_INTERVAL_MS) {
+    return constrain(static_cast<int>(roundf(manualAssistLastYawCorrection * powerScale)),
+                     -MANUAL_ASSIST_MAX_YAW_PERCENT, MANUAL_ASSIST_MAX_YAW_PERCENT);
+  }
+  lastManualAssistUpdateMs = now;
+  if (!readManualAssistHeadingDegrees(heading)) {
+    manualAssistTargetValid = false;
+    manualAssistLastYawCorrection = 0.0f;
+    manualAssistHeadingAvailable = false;
+    return 0;
+  }
+  manualAssistHeadingAvailable = true;
+  if (!manualAssistTargetValid) {
+    manualAssistTargetHeadingDegrees = heading;
+    manualAssistTargetValid = true;
+    manualAssistLastYawCorrection = 0.0f;
+    return 0;
+  }
+
+  float headingError = manualAssistTargetHeadingDegrees - heading;
+  while (headingError > 180.0f) headingError -= 360.0f;
+  while (headingError < -180.0f) headingError += 360.0f;
+  if (fabsf(headingError) <= MANUAL_ASSIST_HEADING_DEADBAND_DEG) {
+    manualAssistLastYawCorrection = 0.0f;
+  } else {
+    manualAssistLastYawCorrection = constrain(
+      headingError * MANUAL_ASSIST_YAW_GAIN_PERCENT_PER_DEG,
+      -MANUAL_ASSIST_MAX_YAW_PERCENT, MANUAL_ASSIST_MAX_YAW_PERCENT);
+  }
+  return constrain(static_cast<int>(roundf(manualAssistLastYawCorrection * powerScale)),
+                   -MANUAL_ASSIST_MAX_YAW_PERCENT, MANUAL_ASSIST_MAX_YAW_PERCENT);
+}
+
+void updateManualReturnHome(uint32_t now) {
+  if (!manualReturnHomeActive) return;
+  if (lastManualReturnUpdateMs != 0 && now - lastManualReturnUpdateMs < 200) return;
+  lastManualReturnUpdateMs = now;
+  if (!elrsArmed || controlSource != CONTROL_SOURCE_ELRS || !elrs.rcFresh(now) || missionModeRequested || serviceMode || sdTransferActive) {
+    stopMotorsForSafety(F("MANUAL RETURN HOME INTERLOCK"));
+    emitLine("TEL EVENT MANUAL_RETURN_HOME STOPPED CONTROL_INTERLOCK");
+    return;
+  }
+  if (!manualHomeAvailable || !gps.location.isValid() || gps.location.age() > 1500 ||
+      !gps.satellites.isValid() || gps.satellites.value() < 5 ||
+      !gps.hdop.isValid() || gps.hdop.hdop() > 3.0) {
+    stopMotorsForSafety(F("MANUAL RETURN HOME GPS"));
+    emitLine("TEL EVENT MANUAL_RETURN_HOME STOPPED GPS_QUALITY");
+    return;
+  }
+  float heading = 0.0f;
+  if (!readMissionHeadingDegrees(heading)) {
+    stopMotorsForSafety(F("MANUAL RETURN HOME HEADING"));
+    emitLine("TEL EVENT MANUAL_RETURN_HOME STOPPED HEADING_UNAVAILABLE");
+    return;
+  }
+  const double latitude = gps.location.lat();
+  const double longitude = gps.location.lng();
+  const double distanceMeters = TinyGPSPlus::distanceBetween(latitude, longitude,
+    manualHome.latitude, manualHome.longitude);
+  if (!isfinite(distanceMeters)) {
+    stopMotorsForSafety(F("MANUAL RETURN HOME NAVIGATION"));
+    emitLine("TEL EVENT MANUAL_RETURN_HOME STOPPED NAVIGATION_INVALID");
+    return;
+  }
+  if (distanceMeters <= 5.0) {
+    stopMotorsForSafety(F("MANUAL HOME REACHED"));
+    emitLine(String("TEL STATUS MANUAL_HOME SET ") + String(manualHome.latitude, 7) + " " + String(manualHome.longitude, 7));
+    emitLine("TEL EVENT MANUAL_RETURN_HOME REACHED");
+    recordLogLine("MANUAL RETURN HOME REACHED");
+    return;
+  }
+  const double bearing = TinyGPSPlus::courseTo(latitude, longitude,
+    manualHome.latitude, manualHome.longitude);
+  float headingError = static_cast<float>(bearing) - heading;
+  while (headingError > 180.0f) headingError -= 360.0f;
+  while (headingError < -180.0f) headingError += 360.0f;
+  const int yaw = constrain(static_cast<int>(roundf(headingError * 0.55f)), -35, 35);
+  const int thrust = fabsf(headingError) > 50.0f ? 0 : 25;
+  applyMotionCommand(0, thrust, yaw);
+  controlMode = CONTROL_MODE_GOTO;
+  if (now - lastManualReturnTelemetryMs >= 1000) {
+    lastManualReturnTelemetryMs = now;
+    emitLine(String("TEL STATUS MANUAL_HOME RETURNING ") + String(distanceMeters, 1) + "M");
+  }
+}
+
+void beginMissionReturnHome(const String& reason) {
+  if (!missionExecutionActive || !missionMetadata.hasHome) return;
+  const double latitude = gps.location.lat();
+  const double longitude = gps.location.lng();
+  missionReturnWaypointIndex = -1;
+  if (!missionDirectReturnPathIsSafe(latitude, longitude)) {
+    if (!missionCoordinateInsideBoundary(latitude, longitude) || missionCurrentWaypoint == 0) {
+      stopMissionExecution("RETURN_HOME_PATH_UNSAFE", false);
+      return;
+    }
+    const MissionWaypoint& prior = missionWaypoints[missionCurrentWaypoint - 1];
+    if (!missionSegmentInsideBoundary(latitude, longitude, prior.latitude, prior.longitude)) {
+      stopMissionExecution("RETURN_HOME_PATH_UNSAFE", false);
+      return;
+    }
+    missionReturnWaypointIndex = static_cast<int16_t>(missionCurrentWaypoint - 1);
+  }
+  stopAllMotors();
+  missionReturningHome = true;
+  missionCheckpointActive = false;
+  missionRunStatus = "RETURNING_HOME";
+  elrs.sendScienceValue("MIS_STATE", missionTelemetryStatusCode());
+  missionStopReason = reason;
+  if (audioRecordingEnabled) handleControlCommand("CTRL AUDIO RECORD STOP");
+  recordLogLine(String("MISSION RETURN HOME reason=") + reason);
+  emitLine(String("TEL EVENT MISSION_RETURN_HOME ") + reason);
+}
+
+void stopMissionExecution(const String& reason, bool completed) {
+  const bool wasRunning = missionExecutionActive;
+  const uint8_t finalIndex = missionCurrentWaypoint;
+  const uint8_t finalCompleted = missionCompletedWaypoints;
+  const uint8_t percent = missionWaypointCount ? (finalCompleted * 100U / missionWaypointCount) : 0;
+  String reasonToken = reason;
+  reasonToken.replace(" ", "_");
+  stopAllMotors();
+  if (scienceExperimentState == 1) {
+    if (audioRecordingEnabled) handleControlCommand("CTRL AUDIO RECORD STOP");
+    handleControlCommand("CTRL SCIENCE STOP " + currentScienceTimestamp());
+  }
+  if (scienceExperimentState == 2) handleControlCommand("CTRL SCIENCE SAVE " + currentScienceTimestamp());
+  missionExecutionActive = false;
+  missionReturningHome = false;
+  missionReturnWaypointIndex = -1;
+  missionCheckpointActive = false;
+  missionStartLocked = true;
+  elrsArmed = false;
+  elrsArmReady = false;
+  controlSource = CONTROL_SOURCE_NONE;
+  controlMode = CONTROL_MODE_IDLE;
+  holdPositionEnabled = false;
+  targetLocationSet = false;
+  const bool routeComplete = completed && reason == "ROUTE_COMPLETE";
+  const bool returnedHome = completed && reason == "HOME_REACHED";
+  missionRunStatus = routeComplete ? "COMPLETE" : (returnedHome ? "RETURNED_HOME" : "STOPPED");
+  elrs.sendScienceValue("MIS_STATE", missionTelemetryStatusCode());
+  missionStopReason = reason;
+  runningMissionId[0] = '\0';
+  if (wasRunning) {
+    const char* finalLabel = routeComplete ? "COMPLETE" : (returnedHome ? "RETURNED_HOME" : "STOPPED");
+    const char* eventLabel = routeComplete ? "TEL EVENT MISSION_COMPLETE " :
+      (returnedHome ? "TEL EVENT MISSION_RETURNED_HOME " : "TEL EVENT MISSION_STOP ");
+    recordLogLine(String(routeComplete || returnedHome ? "MISSION COMPLETE " : "MISSION STOP ") + missionLastRunId + " reason=" + reason);
+    emitLine(String(eventLabel) + reason);
+    emitLine(String("TEL MISSION PROGRESS ") + missionLastRunId + " " + finalLabel + " " +
+      String(finalIndex) + " " + String(missionWaypointCount) + " " + String(finalCompleted) + " -1 -1 " + String(percent) + " " + reasonToken);
+    emitLine(String("TEL STATUS MISSION ") + String(missionWaypointCount) + " UPLOAD READY LOADED " +
+      String(missionId[0] ? missionId : "NONE") + " RUNNING NONE");
+  }
+  if (missionHomeCapturedForRun) {
+    missionMetadata.home = missionPlannedHomeBeforeRun;
+    missionHomeCapturedForRun = false;
+  }
+}
+
+void updateMissionExecution(uint32_t now) {
+  if (!missionExecutionActive) return;
+  if (lastMissionUpdateMs != 0 && now - lastMissionUpdateMs < 200) return;
+  lastMissionUpdateMs = now;
+  if (serviceMode || sdTransferActive) {
+    stopMissionExecution("SERVICE_MODE", false);
+    return;
+  }
+  if (scienceExperimentState != 1) {
+    stopMissionExecution("MISSION_SESSION_UNAVAILABLE", false);
+    return;
+  }
+  if (!missionReturningHome && (!elrs.rcFresh(now) || !missionModeRequested || !elrsArmed)) {
+    stopMissionExecution("RADIO_CONTROL_LOST", false);
+    return;
+  }
+  if (!gps.location.isValid() || gps.location.age() > 1500 || !gps.satellites.isValid() ||
+      gps.satellites.value() < 5 || !gps.hdop.isValid() || gps.hdop.hdop() > 3.0) {
+    stopMissionExecution("GPS_QUALITY_LOST", false);
+    return;
+  }
+
+  float heading = 0.0f;
+  if (!readMissionHeadingDegrees(heading)) {
+    stopMissionExecution("HEADING_UNAVAILABLE", false);
+    return;
+  }
+
+  const double latitude = gps.location.lat();
+  const double longitude = gps.location.lng();
+  if (!missionCoordinateInsideBoundary(latitude, longitude) && !missionReturningHome) {
+    if (missionMetadata.boundaryBreachAction == 1 && missionMetadata.hasHome) beginMissionReturnHome("BOUNDARY_BREACH");
+    else { stopMissionExecution("BOUNDARY_BREACH", false); return; }
+    if (!missionExecutionActive) return;
+  }
+  const float batteryVolts = latestBatteryVolts;
+  if (batteryVolts > 0.1f && estimateBatteryPercent(batteryVolts) <= missionMetadata.batteryThresholdPercent &&
+      !missionReturningHome) {
+    if (missionMetadata.lowBatteryAction == 1 && missionMetadata.hasHome) beginMissionReturnHome("LOW_BATTERY");
+    else { stopMissionExecution("LOW_BATTERY", false); return; }
+    if (!missionExecutionActive) return;
+  }
+
+  MissionCoordinate target = {};
+  uint8_t activeIndex = missionCurrentWaypoint;
+  if (missionReturningHome) {
+    if (missionReturnWaypointIndex >= 0) {
+      const MissionWaypoint& waypoint = missionWaypoints[missionReturnWaypointIndex];
+      target = {waypoint.latitude, waypoint.longitude};
+      activeIndex = static_cast<uint8_t>(missionReturnWaypointIndex);
+    } else {
+      target = missionMetadata.home;
+    }
+  } else if (missionCurrentWaypoint < missionWaypointCount) {
+    const MissionWaypoint& waypoint = missionWaypoints[missionCurrentWaypoint];
+    target = {waypoint.latitude, waypoint.longitude};
+  } else {
+    stopMissionExecution("ROUTE_COMPLETE", true);
+    return;
+  }
+
+  const double distanceMeters = TinyGPSPlus::distanceBetween(latitude, longitude, target.latitude, target.longitude);
+  double distanceHomeMeters = TinyGPSPlus::distanceBetween(latitude, longitude,
+    missionMetadata.home.latitude, missionMetadata.home.longitude);
+  if (!isfinite(distanceMeters) || !isfinite(distanceHomeMeters)) {
+    stopMissionExecution("NAVIGATION_INVALID", false);
+    return;
+  }
+  missionDistanceToWaypointMeters = static_cast<float>(distanceMeters);
+  missionDistanceFromHomeMeters = static_cast<float>(distanceHomeMeters);
+  missionPercentComplete = missionWaypointCount ? (missionCompletedWaypoints * 100U / missionWaypointCount) : 0;
+  String reasonToken = missionStopReason.length() ? missionStopReason : "NONE";
+  reasonToken.replace(" ", "_");
+
+  if (distanceMeters <= 5.0) {
+    stopAllMotors();
+    if (missionReturningHome) {
+      if (missionReturnWaypointIndex >= 0) {
+        --missionReturnWaypointIndex;
+        if (missionReturnWaypointIndex >= 0) {
+          const MissionWaypoint& next = missionWaypoints[missionReturnWaypointIndex];
+          if (!missionSegmentInsideBoundary(latitude, longitude, next.latitude, next.longitude)) {
+            stopMissionExecution("RETURN_HOME_PATH_UNSAFE", false);
+            return;
+          }
+          return;
+        }
+      }
+      if (!missionDirectReturnPathIsSafe(latitude, longitude)) {
+        stopMissionExecution("RETURN_HOME_PATH_UNSAFE", false);
+        return;
+      }
+      stopMissionExecution("HOME_REACHED", true);
+      return;
+    }
+    const MissionWaypoint& waypoint = missionWaypoints[missionCurrentWaypoint];
+    const bool shouldCollect = waypoint.collectData && waypoint.holdSeconds > 0;
+    if (shouldCollect && !missionCheckpointActive) {
+      missionCheckpointActive = true;
+      missionCheckpointStartedMs = now;
+      missionRunStatus = "COLLECTING";
+      elrs.sendScienceValue("MIS_STATE", missionTelemetryStatusCode());
+      if (scienceExperimentState == 1 && audioInputAvailable) handleControlCommand("CTRL AUDIO RECORD START");
+    }
+    if (missionCheckpointActive && now - missionCheckpointStartedMs < static_cast<uint32_t>(waypoint.holdSeconds) * 1000UL) {
+      // Hold position by commanding zero; this hull has no station-keeping actuator.
+      if (now - lastMissionTelemetryMs >= 1000) {
+        lastMissionTelemetryMs = now;
+        const uint8_t percent = missionWaypointCount ? (missionCompletedWaypoints * 100U / missionWaypointCount) : 0;
+        emitLine(String("TEL MISSION PROGRESS ") + missionLastRunId + " COLLECTING " + String(activeIndex) + " " +
+          String(missionWaypointCount) + " " + String(missionCompletedWaypoints) + " 0 " + String(distanceHomeMeters, 1) + " " + String(percent) + " CHECKPOINT");
+      }
+      return;
+    }
+    if (missionCheckpointActive) {
+      if (audioRecordingEnabled) handleControlCommand("CTRL AUDIO RECORD STOP");
+      missionCheckpointActive = false;
+    }
+    ++missionCompletedWaypoints;
+    ++missionCurrentWaypoint;
+    missionRunStatus = "MOVING";
+    if (missionCurrentWaypoint >= missionWaypointCount) {
+      stopMissionExecution("ROUTE_COMPLETE", true);
+      return;
+    }
+  }
+
+  const double bearing = TinyGPSPlus::courseTo(latitude, longitude, target.latitude, target.longitude);
+  float headingError = static_cast<float>(bearing) - heading;
+  while (headingError > 180.0f) headingError -= 360.0f;
+  while (headingError < -180.0f) headingError += 360.0f;
+  const int yaw = constrain(static_cast<int>(roundf(headingError * 0.55f)), -35, 35);
+  const uint8_t speedPercent = missionReturningHome ? 25 : missionWaypoints[missionCurrentWaypoint].speedPercent;
+  const int thrust = fabsf(headingError) > 50.0f ? 0 : speedPercent;
+  if (now - lastMissionControlMs >= 200) {
+    lastMissionControlMs = now;
+    applyMotionCommand(0, thrust, yaw);
+  }
+  targetLatitude = target.latitude;
+  targetLongitude = target.longitude;
+  targetLocationSet = true;
+  controlMode = CONTROL_MODE_GOTO;
+  const String nextMissionStatus = missionReturningHome ? "RETURNING_HOME" : "MOVING";
+  if (missionRunStatus != nextMissionStatus) {
+    missionRunStatus = nextMissionStatus;
+    elrs.sendScienceValue("MIS_STATE", missionTelemetryStatusCode());
+  }
+
+  if (now - lastMissionTelemetryMs >= 1000) {
+    lastMissionTelemetryMs = now;
+    const uint8_t percent = missionWaypointCount ? (missionCompletedWaypoints * 100U / missionWaypointCount) : 0;
+    emitLine(String("TEL MISSION PROGRESS ") + missionLastRunId + " " + missionRunStatus + " " + String(activeIndex) + " " +
+      String(missionWaypointCount) + " " + String(missionCompletedWaypoints) + " " + String(distanceMeters, 1) + " " +
+      String(distanceHomeMeters, 1) + " " + String(percent) + " " + reasonToken);
   }
 }
 
@@ -2383,8 +4155,9 @@ void updateMotorRamps() {
       // latched indefinitely even though the configured boost time elapsed.
       if (motorStartBoostUntilMs[i] != 0 && nowMs >= motorStartBoostUntilMs[i]) {
         motorStartBoostUntilMs[i] = 0;
-        applyMotorOutput(motors[i], currentDrive);
       }
+      if (computeMotorPwm(i, motors[i], currentDrive) != appliedMotorPwm[i])
+        applyMotorOutput(motors[i], currentDrive);
       continue;
     }
 
@@ -2555,15 +4328,239 @@ float readCurrentSensorAmps() {
   return currentAmpsFromSensorVoltage(readCurrentSensorVoltage());
 }
 
-void serviceElrsTelemetry(uint32_t now) {
-  if (telemetryMode == TELEMETRY_MODE_WIFI) {
-    if (now - lastElrsTelemetryMs >= ELRS_TELEMETRY_INTERVAL_MS) {
-      lastElrsTelemetryMs = now;
-      elrs.sendHeartbeat(elrsArmed && controlSource == CONTROL_SOURCE_ELRS);
+void sampleElrsWaterMotion(uint32_t now) {
+  if (lastElrsMotionSampleMs != 0 && now - lastElrsMotionSampleMs < ELRS_MOTION_SAMPLE_INTERVAL_MS) return;
+  lastElrsMotionSampleMs = now;
+  if (elrsMotionWindowStartMs == 0) elrsMotionWindowStartMs = now;
+
+  ImuReadings imu = {};
+  if (readMpu6050(imu)) {
+    const float accelMagnitude = sqrtf(imu.accelXG * imu.accelXG +
+      imu.accelYG * imu.accelYG + imu.accelZG * imu.accelZG);
+    const float dynamicAccel = accelMagnitude - 1.0f;
+    const float angularRate = sqrtf(imu.gyroXDps * imu.gyroXDps +
+      imu.gyroYDps * imu.gyroYDps + imu.gyroZDps * imu.gyroZDps);
+    elrsDynamicAccelSquaredSum += dynamicAccel * dynamicAccel;
+    elrsAngularRateSquaredSum += angularRate * angularRate;
+    ++elrsMotionSampleCount;
+  }
+
+  if (now - elrsMotionWindowStartMs < ELRS_MOTION_WINDOW_MS) return;
+  if (elrsMotionSampleCount >= 20) {
+    const float sampleCount = static_cast<float>(elrsMotionSampleCount);
+    elrs.sendScienceValue("SEA_ACC", sqrtf(elrsDynamicAccelSquaredSum / sampleCount));
+    elrs.sendScienceValue("SEA_GYR", sqrtf(elrsAngularRateSquaredSum / sampleCount));
+  }
+  elrsMotionWindowStartMs = now;
+  elrsDynamicAccelSquaredSum = 0.0f;
+  elrsAngularRateSquaredSum = 0.0f;
+  elrsMotionSampleCount = 0;
+}
+
+void sendElrsNavigationTelemetry(uint32_t now) {
+  if (now - lastElrsNavigationMs < ELRS_NAVIGATION_INTERVAL_MS) return;
+  lastElrsNavigationMs = now;
+  if (!magnetometerCalibrationLoaded || !magnetometerAvailable) return;
+
+  MagnetometerReadings mag = {};
+  ImuReadings imu = {};
+  if (!readQmc5883(mag)) return;
+
+  const float mx = (static_cast<float>(mag.x) - magnetometerOffsetX) * magnetometerScaleX;
+  const float my = (static_cast<float>(mag.y) - magnetometerOffsetY) * magnetometerScaleY;
+  const float mz = static_cast<float>(mag.z);
+  float magneticHeading = atan2f(my, mx) * 180.0f / PI;
+  if (magneticHeading < 0.0f) magneticHeading += 360.0f;
+  elrs.sendScienceValue("MAG_HEAD", magneticHeading);
+
+  // Accelerometer-based tilt compensation is a low-rate snapshot. Dynamic
+  // motion can affect this estimate; it is not an attitude stream.
+  if (!readMpu6050(imu)) return;
+  const float roll = atan2f(imu.accelYG, imu.accelZG);
+  const float pitch = atan2f(-imu.accelXG,
+    sqrtf(imu.accelYG * imu.accelYG + imu.accelZG * imu.accelZG));
+  const float horizontalX = mx * cosf(pitch) + mz * sinf(pitch);
+  const float horizontalY = mx * sinf(roll) * sinf(pitch) + my * cosf(roll)
+    - mz * sinf(roll) * cosf(pitch);
+  float tiltHeading = atan2f(horizontalY, horizontalX) * 180.0f / PI;
+  if (tiltHeading < 0.0f) tiltHeading += 360.0f;
+  elrs.sendScienceValue("TILT_HEAD", tiltHeading);
+}
+
+void sendElrsAttitudeTelemetry(uint32_t now) {
+  if (now - lastElrsAttitudeMs < ELRS_ATTITUDE_INTERVAL_MS) return;
+  lastElrsAttitudeMs = now;
+  if (!magnetometerCalibrationLoaded || !magnetometerAvailable) return;
+
+  MagnetometerReadings mag = {};
+  ImuReadings imu = {};
+  if (!readQmc5883(mag) || !readMpu6050(imu)) return;
+
+  const float mx = (static_cast<float>(mag.x) - magnetometerOffsetX) * magnetometerScaleX;
+  const float my = (static_cast<float>(mag.y) - magnetometerOffsetY) * magnetometerScaleY;
+  const float mz = static_cast<float>(mag.z);
+  const float roll = atan2f(imu.accelYG, imu.accelZG);
+  const float pitch = atan2f(-imu.accelXG,
+    sqrtf(imu.accelYG * imu.accelYG + imu.accelZG * imu.accelZG));
+  const float horizontalX = mx * cosf(pitch) + mz * sinf(pitch);
+  const float horizontalY = mx * sinf(roll) * sinf(pitch) + my * cosf(roll)
+    - mz * sinf(roll) * cosf(pitch);
+  float headingDegrees = atan2f(horizontalY, horizontalX) * 180.0f / PI;
+  if (headingDegrees < 0.0f) headingDegrees += 360.0f;
+  lastElrsStatusHeading = static_cast<int>(lroundf(headingDegrees)) % 360;
+  lastElrsStatusHeadingMs = now;
+
+  // ELRS converts MAVLink ATTITUDE into standard CRSF attitude sensors.
+  // This one-hertz estimate is not a high-rate or acceleration-corrected AHRS.
+  elrs.sendAttitude(roll, pitch, headingDegrees * PI / 180.0f);
+}
+
+bool loadManualHomeFromPreferences() {
+  manualHomeAvailable = false;
+  if (!manualHomePreferencesReady ||
+      manualHomePreferences.getBytesLength("manualHome") != sizeof(PersistedManualHome)) return false;
+  PersistedManualHome stored = {};
+  if (manualHomePreferences.getBytes("manualHome", &stored, sizeof(stored)) != sizeof(stored) ||
+      stored.magic != MANUAL_HOME_STORAGE_MAGIC) return false;
+  const double latitude = stored.latitudeE7 / 10000000.0;
+  const double longitude = stored.longitudeE7 / 10000000.0;
+  if (!isfinite(latitude) || !isfinite(longitude) || fabs(latitude) > 90.0 || fabs(longitude) > 180.0) return false;
+  manualHome.latitude = latitude;
+  manualHome.longitude = longitude;
+  manualHomeAvailable = true;
+  return true;
+}
+
+bool saveManualHomeToPreferences(const MissionCoordinate& home) {
+  if (!manualHomePreferencesReady || !isfinite(home.latitude) || !isfinite(home.longitude) ||
+      fabs(home.latitude) > 90.0 || fabs(home.longitude) > 180.0) return false;
+  PersistedManualHome stored = {
+    MANUAL_HOME_STORAGE_MAGIC,
+    static_cast<int32_t>(lround(home.latitude * 10000000.0)),
+    static_cast<int32_t>(lround(home.longitude * 10000000.0))
+  };
+  return manualHomePreferences.putBytes("manualHome", &stored, sizeof(stored)) == sizeof(stored);
+}
+
+bool activeTelemetryHome(MissionCoordinate& home, uint8_t& homeKind) {
+  if (missionModeRequested && missionMetadata.hasHome) {
+    home = missionMetadata.home;
+    homeKind = 2;
+    return true;
+  }
+  if (!missionModeRequested && manualHomeAvailable) {
+    home = manualHome;
+    homeKind = 1;
+    return true;
+  }
+  home = {};
+  homeKind = 0;
+  return false;
+}
+
+void sendElrsHomeTelemetry() {
+  MissionCoordinate home = {};
+  uint8_t homeKind = 0;
+  const bool hasHome = activeTelemetryHome(home, homeKind);
+  const bool changed = homeKind != lastElrsHomeKind ||
+    (hasHome && (fabs(home.latitude - lastElrsHomeLatitude) > 0.00000001 ||
+                 fabs(home.longitude - lastElrsHomeLongitude) > 0.00000001));
+  if (changed) {
+    char statusText[51];
+    if (hasHome) {
+      snprintf(statusText, sizeof(statusText), "HOME %s %.7f %.7f",
+        homeKind == 1 ? "MANUAL" : "MISSION", home.latitude, home.longitude);
+      lastElrsHomeLatitude = home.latitude;
+      lastElrsHomeLongitude = home.longitude;
+    } else {
+      strlcpy(statusText, "HOME NONE", sizeof(statusText));
+      lastElrsHomeLatitude = NAN;
+      lastElrsHomeLongitude = NAN;
     }
+    elrs.sendStatusText(statusText);
+    elrs.sendHomeKind(homeKind);
+    lastElrsHomeKind = homeKind;
+  }
+  elrs.sendHomePosition(hasHome ? home.latitude : 0.0,
+                        hasHome ? home.longitude : 0.0, 0.0f);
+  if (hasHome && gps.location.isValid() && gps.location.age() < 2000) {
+    const double distance = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(),
+      home.latitude, home.longitude);
+    if (isfinite(distance)) elrs.sendScienceValue("HOME_DIST", static_cast<float>(distance));
+  }
+}
+
+void sendWifiHomeTelemetry(uint32_t now) {
+  if (telemetryMode != TELEMETRY_MODE_WIFI || now - lastWifiHomeStatusMs < 5000 || !controlClientConnected()) return;
+  lastWifiHomeStatusMs = now;
+  MissionCoordinate home = {};
+  uint8_t homeKind = 0;
+  if (!activeTelemetryHome(home, homeKind)) {
+    emitLine("TEL STATUS ACTIVE_HOME NONE");
+    emitLine("TEL STATUS HOME_DISTANCE UNKNOWN");
     return;
   }
-  elrs.sendLinkAndChannels(now);
+  emitLine(String("TEL STATUS ACTIVE_HOME ") + (homeKind == 1 ? "MANUAL " : "MISSION ") +
+    String(home.latitude, 7) + " " + String(home.longitude, 7));
+  if (gps.location.isValid() && gps.location.age() < 2000) {
+    const double distance = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(), home.latitude, home.longitude);
+    emitLine(isfinite(distance) ? String("TEL STATUS HOME_DISTANCE ") + String(distance, 1) + " M"
+                                : String("TEL STATUS HOME_DISTANCE UNKNOWN"));
+  } else {
+    emitLine("TEL STATUS HOME_DISTANCE UNKNOWN");
+  }
+}
+
+// Versioned, bounded status for EdgeTX CRSF passthrough text and the Backpack.
+// Fields: armed, manual assist, mission state/percent/waypoint/count,
+// session, audio, heading, home distance, GPS fix, home kind, start block.
+void sendElrsCompactStatus(uint32_t now) {
+  if (now - lastElrsCompactStatusMs < 2000) return;
+  lastElrsCompactStatusMs = now;
+  MissionCoordinate home = {};
+  uint8_t homeKind = 0;
+  const bool hasHome = activeTelemetryHome(home, homeKind);
+  const bool gpsFix = gps.location.isValid() && gps.location.age() < 2000;
+  long homeMeters = -1;
+  if (hasHome && gpsFix) {
+    const double meters = TinyGPSPlus::distanceBetween(
+      gps.location.lat(), gps.location.lng(), home.latitude, home.longitude);
+    if (isfinite(meters)) homeMeters = constrain(static_cast<long>(lround(meters)), 0L, 99999L);
+  }
+  const int heading = lastElrsStatusHeadingMs && now - lastElrsStatusHeadingMs < 3000
+    ? lastElrsStatusHeading : -1;
+  const int assist = missionModeRequested ? 3 : (!manualAssistRequested ? 0 :
+    (manualAssistHeadingAvailable ? 1 : 2));
+  char statusText[51];
+  snprintf(statusText, sizeof(statusText), "B1,%u,%d,%u,%u,%u,%u,%u,%u,%d,%ld,%u,%u,%u",
+    elrsArmed ? 1U : 0U, assist, missionTelemetryStatusCode(),
+    static_cast<unsigned>(constrain(static_cast<int>(lroundf(missionPercentComplete)), 0, 100)),
+    missionExecutionActive ? static_cast<unsigned>(missionCurrentWaypoint + 1) : 0U,
+    static_cast<unsigned>(missionWaypointCount), scienceExperimentState == 1 ? 1U : 0U,
+    audioRecordingEnabled ? 1U : 0U, heading, homeMeters, gpsFix ? 1U : 0U,
+    static_cast<unsigned>(homeKind), static_cast<unsigned>(missionStartBlockCode));
+  elrs.sendStatusText(statusText);
+  if (elrsCalibrationStatusCode != 0) {
+    char calibrationText[51];
+    snprintf(calibrationText, sizeof(calibrationText), "BC1,%u,%u,%u,%u,%lu",
+      static_cast<unsigned>(elrsCalibrationStatusCode),
+      static_cast<unsigned>(elrsCalibrationTestIndex + 1),
+      static_cast<unsigned>(elrsCalibrationCurrentPowerPercent),
+      static_cast<unsigned>(elrsCalibrationPowerPercent),
+      static_cast<unsigned long>(elrsCalibrationPulseDurationMs / 1000U));
+    elrs.sendStatusText(calibrationText);
+  }
+}
+
+void serviceElrsTelemetry(uint32_t now) {
+  if (telemetryMode == TELEMETRY_MODE_WIFI) {
+    sendWifiHomeTelemetry(now);
+  }
+  const bool detailedRadio = telemetryMode == TELEMETRY_MODE_MAVLINK;
+  if (detailedRadio) {
+    sampleElrsWaterMotion(now);
+    elrs.sendLinkAndChannels(now);
+  }
   if (now - lastElrsTelemetryMs >= ELRS_TELEMETRY_INTERVAL_MS) {
     lastElrsTelemetryMs = now;
     elrs.sendHeartbeat(elrsArmed && controlSource == CONTROL_SOURCE_ELRS);
@@ -2576,15 +4573,25 @@ void serviceElrsTelemetry(uint32_t now) {
     const int leftPwm = driveValues[1] < 0 ? -appliedMotorPwm[1] : appliedMotorPwm[1];
     const int rightPwm = driveValues[2] < 0 ? -appliedMotorPwm[2] : appliedMotorPwm[2];
     elrs.sendBuoyState(rearPwm, leftPwm, rightPwm, state);
+    elrs.sendBuoyAudioState(audioRecordingEnabled);
+    const int assistState = missionModeRequested ? 3 : (!manualAssistRequested ? 0 :
+      (manualAssistHeadingAvailable ? 1 : 2));
+    if (detailedRadio) elrs.sendScienceValue("MAN_AST", assistState);
   }
   if (now - lastElrsBatteryMs >= ELRS_BATTERY_INTERVAL_MS) {
     lastElrsBatteryMs = now;
     const float battery = readBatterySystemVoltage();
-    if (battery > 0) elrs.sendBattery(battery, readCurrentSensorAmps(), estimateBatteryPercent(battery));
+    if (battery > 0) {
+      latestBatteryVolts = battery;
+      latestCurrentAmps = readCurrentSensorAmps();
+      lastStandalonePowerSampleMs = now;
+      elrs.sendBattery(battery, latestCurrentAmps, estimateBatteryPercent(battery));
+    }
   }
   if (now - lastElrsGpsMs >= ELRS_GPS_INTERVAL_MS) {
     lastElrsGpsMs = now;
     if (gps.location.isValid() && gps.location.age() < 2000) {
+      sendElrsHomeTelemetry();
       elrs.sendGps(gps.location.lat(), gps.location.lng(),
                    gps.speed.isValid() ? gps.speed.mps() : NAN,
                    gps.course.isValid() ? gps.course.deg() : NAN,
@@ -2593,23 +4600,49 @@ void serviceElrsTelemetry(uint32_t now) {
                    gps.hdop.isValid() ? static_cast<float>(gps.hdop.hdop()) : NAN);
     }
   }
+  sendElrsAttitudeTelemetry(now);
+  sendElrsCompactStatus(now);
+  if (!detailedRadio) return;
+  sendElrsNavigationTelemetry(now);
   if (now - lastElrsScienceMs >= ELRS_SCIENCE_INTERVAL_MS) {
     lastElrsScienceMs = now;
     // One small science value per second keeps the Backpack link light.
-    // Fields rotate so each measurement is refreshed every four seconds.
-    switch (elrsScienceField++ & 0x03) {
+    // Mission navigation values take priority while a route is active.
+    if (elrsCalibrationActive) {
+      switch (elrsScienceField++ % 5) {
+        case 0: elrs.sendScienceValue("CAL_STAT", 1); break;
+        case 1: elrs.sendScienceValue("CAL_STEP", elrsCalibrationTestIndex + 1); break;
+        case 2: elrs.sendScienceValue("CAL_PWR", elrsCalibrationCurrentPowerPercent); break;
+        case 3: elrs.sendScienceValue("CAL_MAX", elrsCalibrationPowerPercent); break;
+        case 4: elrs.sendScienceValue("CAL_DUR", elrsCalibrationPulseDurationMs / 1000U); break;
+      }
+    } else if (missionExecutionActive) {
+      switch (elrsScienceField++ % 6) {
+        case 0: elrs.sendScienceValue("MIS_PCT", missionPercentComplete); break;
+        case 1: if (isfinite(missionDistanceFromHomeMeters)) elrs.sendScienceValue("DIST_HOME", missionDistanceFromHomeMeters); break;
+        case 2: if (isfinite(missionDistanceToWaypointMeters)) elrs.sendScienceValue("DIST_WP", missionDistanceToWaypointMeters); break;
+        case 3: elrs.sendScienceValue("MIS_WP", missionCurrentWaypoint + 1); break;
+        case 4: elrs.sendScienceValue("MIS_STATE", missionTelemetryStatusCode()); break;
+        case 5: elrs.sendScienceValue("MIS_COUNT", missionWaypointCount); break;
+      }
+    } else switch (elrsScienceField++ % 5) {
+      // Keep the terminal/idle mission state visible while rotating sensor fields.
       case 0:
-        if (ds18b20HasReading) elrs.sendScienceValue("WATER_TEMP", ds18b20TemperatureC);
+        elrs.sendScienceValue("MIS_STATE", missionTelemetryStatusCode());
+        elrs.sendScienceValue("MIS_BLOCK", missionStartBlockCode);
         break;
       case 1:
+        if (ds18b20HasReading) elrs.sendScienceValue("WATER_TEMP", ds18b20TemperatureC);
+        break;
+      case 2:
         if (latestRangeValid) elrs.sendScienceValue("DEPTH_M", latestRangeDistanceMm / 1000.0f);
         break;
-      case 2: {
+      case 3: {
         const float value = readAds1115AverageVoltage(ADS1115_TDS_CHANNEL, 1);
         if (!isnan(value)) elrs.sendScienceValue("TDS_V", value);
         break;
       }
-      case 3: {
+      case 4: {
         const float value = readAds1115AverageVoltage(ADS1115_TURBIDITY_CHANNEL, 1);
         if (!isnan(value)) elrs.sendScienceValue("TURBIDITY", value / TURBIDITY_INPUT_DIVIDER_RATIO);
         break;
@@ -2641,6 +4674,171 @@ void printCsvFloat(File& file, float value, uint8_t decimals) {
   }
 }
 
+bool recordStandaloneTelemetrySnapshot() {
+  if (!ensureStandaloneLogDirectory() || serviceMode || sdTransferActive) return false;
+  const String path = standaloneLogPath("telemetry", ".csv");
+  File file = SD.open(path.c_str(), FILE_APPEND);
+  if (!file) {
+    ++sdWriteFailures;
+    return false;
+  }
+  if (file.size() == 0) {
+    file.println(F("boot_id,timestamp_us,gps_valid,gps_age_ms,gps_date_ddmmyy,gps_time_hhmmsscc,latitude,longitude,gps_satellites,gps_hdop,speed_mps,course_deg,control_mode,control_source,telemetry_mode,hold_position,mission_mode_requested,elrs_armed,elrs_arm_ready,elrs_rc_fresh,elrs_rc_age_ms,elrs_link_fresh,elrs_link_age_ms,elrs_link_quality,elrs_rssi_dbm,elrs_snr_db,elrs_rc_frames,elrs_radio_status,elrs_crc_errors,elrs_override_frames,elrs_crc_ok,elrs_crc_bad,elrs_short,elrs_target_reject,elrs_channel_reject,ch1_us,ch2_us,ch3_us,ch4_us,ch5_us,ch6_us,ch7_us,ch8_us,ch9_us,ch10_us,ch11_us,ch12_us,ch13_us,ch14_us,ch15_us,ch16_us,drive_rear,left,right,target_rear,target_left,target_right,pwm_rear_signed,pwm_left_signed,pwm_right_signed,motors_enabled,battery_v,current_a,battery_valid,power_sample_age_ms,range_valid,range_mm,water_temp_valid,water_temp_c,aux_sensor_sample_age_ms,imu_valid,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,imu_temp_c,tds_v,turbidity_probe_v,sd_mount_failures,sd_write_failures,audio_frames_dropped,last_failsafe"));
+  }
+
+  const uint32_t nowMs = millis();
+  const bool rcFresh = elrs.rcFresh(nowMs);
+  const bool linkFresh = elrs.linkFresh(nowMs);
+  file.print(sdLogBootId, HEX);
+  file.print(',');
+  printSdTimestamp(file, static_cast<uint64_t>(esp_timer_get_time()));
+  file.print(',');
+  file.print(gps.location.isValid() ? 1 : 0);
+  file.print(',');
+  if (gps.location.isValid()) file.print(gps.location.age());
+  file.print(',');
+  if (gps.date.isValid()) file.print(gps.date.value());
+  file.print(',');
+  if (gps.time.isValid()) file.print(gps.time.value());
+  file.print(',');
+  if (gps.location.isValid()) file.print(gps.location.lat(), 7);
+  file.print(',');
+  if (gps.location.isValid()) file.print(gps.location.lng(), 7);
+  file.print(',');
+  if (gps.satellites.isValid()) file.print(gps.satellites.value());
+  file.print(',');
+  if (gps.hdop.isValid()) file.print(gps.hdop.hdop(), 2);
+  file.print(',');
+  if (gps.speed.isValid()) file.print(gps.speed.mps(), 3);
+  file.print(',');
+  if (gps.course.isValid()) file.print(gps.course.deg(), 2);
+  file.print(',');
+  file.print(encodeControlMode(controlMode));
+  file.print(',');
+  file.print(controlSource == CONTROL_SOURCE_ELRS ? "ELRS" : controlSource == CONTROL_SOURCE_WIFI ? "WIFI" : "NONE");
+  file.print(',');
+  file.print(telemetryMode == TELEMETRY_MODE_MAVLINK ? "MAVLINK" : "WIFI");
+  file.print(',');
+  file.print(holdPositionEnabled ? 1 : 0);
+  file.print(',');
+  file.print(missionModeRequested ? 1 : 0);
+  file.print(',');
+  file.print(elrsArmed ? 1 : 0);
+  file.print(',');
+  file.print(elrsArmReady ? 1 : 0);
+  file.print(',');
+  file.print(rcFresh ? 1 : 0);
+  file.print(',');
+  file.print(elrs.lastRcMs() == 0 ? 0 : nowMs - elrs.lastRcMs());
+  file.print(',');
+  file.print(linkFresh ? 1 : 0);
+  file.print(',');
+  file.print(elrs.lastLinkMs() == 0 ? 0 : nowMs - elrs.lastLinkMs());
+  file.print(',');
+  file.print(elrs.linkQuality());
+  file.print(',');
+  file.print(elrs.rssiDbm());
+  file.print(',');
+  file.print(elrs.snrDb());
+  file.print(',');
+  file.print(elrs.validRcFrames());
+  file.print(',');
+  file.print(elrs.validRadioStatus());
+  file.print(',');
+  file.print(elrs.crcErrors());
+  file.print(',');
+  file.print(elrs.rcOverrideFrames());
+  file.print(',');
+  file.print(elrs.rcOverrideCrcOk());
+  file.print(',');
+  file.print(elrs.rcOverrideCrcBad());
+  file.print(',');
+  file.print(elrs.rcOverrideShort());
+  file.print(',');
+  file.print(elrs.rcOverrideTargetReject());
+  file.print(',');
+  file.print(elrs.rcOverrideChannelReject());
+  for (uint8_t channel = 0; channel < 16; ++channel) {
+    file.print(',');
+    file.print(elrs.channel(channel));
+  }
+  for (int i = 0; i < MOTOR_COUNT; ++i) {
+    file.print(',');
+    file.print(driveValues[i]);
+  }
+  for (int i = 0; i < MOTOR_COUNT; ++i) {
+    file.print(',');
+    file.print(targetDriveValues[i]);
+  }
+  for (int i = 0; i < MOTOR_COUNT; ++i) {
+    const int signedPwm = driveValues[i] < 0 ? -appliedMotorPwm[i] : appliedMotorPwm[i];
+    file.print(',');
+    file.print(signedPwm);
+  }
+  file.print(',');
+  file.print(motorsEnabled() ? 1 : 0);
+  file.print(',');
+  file.print(latestBatteryVolts, 3);
+  file.print(',');
+  file.print(latestCurrentAmps, 3);
+  file.print(',');
+  file.print(latestBatteryVolts > 0.0f ? 1 : 0);
+  file.print(',');
+  file.print(nowMs - lastStandalonePowerSampleMs);
+  file.print(',');
+  file.print(latestRangeValid ? 1 : 0);
+  file.print(',');
+  if (latestRangeValid) file.print(latestRangeDistanceMm);
+  file.print(',');
+  file.print(ds18b20HasReading ? 1 : 0);
+  file.print(',');
+  if (ds18b20HasReading) file.print(ds18b20TemperatureC, 3);
+  file.print(',');
+  file.print(nowMs - lastStandaloneScienceSampleMs);
+  file.print(',');
+  file.print(standaloneImuValid ? 1 : 0);
+  const float imuValues[] = {standaloneImuReadings.accelXG, standaloneImuReadings.accelYG,
+    standaloneImuReadings.accelZG, standaloneImuReadings.gyroXDps, standaloneImuReadings.gyroYDps,
+    standaloneImuReadings.gyroZDps, standaloneImuReadings.temperatureC};
+  for (float value : imuValues) {
+    file.print(',');
+    if (standaloneImuValid) file.print(value, 4);
+  }
+  file.print(',');
+  printCsvFloat(file, standaloneTdsVoltage, 5);
+  file.print(',');
+  printCsvFloat(file, standaloneTurbidityVoltage, 5);
+  file.print(',');
+  file.print(sdMountFailures);
+  file.print(',');
+  file.print(sdWriteFailures);
+  file.print(',');
+  file.print(audioFramesDropped);
+  file.print(',');
+  printCsvQuoted(file, lastElrsFailsafeStatus);
+  file.println();
+  file.flush();
+  const bool writeError = file.getWriteError();
+  file.close();
+  if (writeError) ++sdWriteFailures;
+  return !writeError;
+}
+
+void printMissionSampleContext(File& file) {
+  file.print(',');
+  if (missionExecutionActive && missionCurrentWaypoint < missionWaypointCount) {
+    file.print(missionCurrentWaypoint + 1);
+  }
+  file.print(',');
+  file.print(missionExecutionActive && missionCheckpointActive ? 1 : 0);
+  file.print(',');
+  if (missionExecutionActive && missionCurrentWaypoint < missionWaypointCount) {
+    file.print(missionWaypoints[missionCurrentWaypoint].measurementMask);
+  } else {
+    file.print(0);
+  }
+}
+
 void recordScienceSnapshot() {
   if (!sdRecordingAvailable) {
     return;
@@ -2663,6 +4861,7 @@ void recordScienceSnapshot() {
   }
 
   printSdTimestamp(sdScienceFile, static_cast<uint64_t>(esp_timer_get_time()));
+  printMissionSampleContext(sdScienceFile);
   sdScienceFile.print(',');
   sdScienceFile.print(imuValid ? 1 : 0);
   float imuValues[] = {
@@ -2711,6 +4910,7 @@ void recordTelemetrySnapshot() {
   if (gps.location.isValid()) sdTelemetryFile.print(gps.location.lng(), 7);
   sdTelemetryFile.print(',');
   sdTelemetryFile.print(encodeControlMode(controlMode));
+  printMissionSampleContext(sdTelemetryFile);
   sdTelemetryFile.print(',');
   sdTelemetryFile.print(holdPositionEnabled ? 1 : 0);
   sdTelemetryFile.print(',');
@@ -2763,6 +4963,29 @@ void updateSdCardTelemetry() {
 }
 
 void serviceSdRecorder(uint32_t nowMs) {
+  if (!sdCardMounted) return;
+  if (!serviceMode && !sdTransferActive &&
+      nowMs - lastStandalonePowerSampleMs >= ELRS_BATTERY_INTERVAL_MS) {
+    lastStandalonePowerSampleMs = nowMs;
+    latestBatteryVolts = readBatterySystemVoltage();
+    latestCurrentAmps = readCurrentSensorAmps();
+  }
+  const uint32_t standaloneSensorIntervalMs = missionExecutionActive && missionCheckpointActive
+    ? SD_SCIENCE_INTERVAL_MS
+    : (audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : SD_STANDALONE_TELEMETRY_INTERVAL_MS);
+  if (!serviceMode && !sdTransferActive && nowMs - lastStandaloneScienceSampleMs >= standaloneSensorIntervalMs) {
+    lastStandaloneScienceSampleMs = nowMs;
+    standaloneImuValid = readMpu6050(standaloneImuReadings);
+    standaloneTdsVoltage = readAds1115AverageVoltage(ADS1115_TDS_CHANNEL, 1);
+    const float turbidityAdcVoltage = readAds1115AverageVoltage(ADS1115_TURBIDITY_CHANNEL, 1);
+    standaloneTurbidityVoltage = isnan(turbidityAdcVoltage)
+      ? NAN : turbidityAdcVoltage / TURBIDITY_INPUT_DIVIDER_RATIO;
+  }
+  if (!serviceMode && !sdTransferActive &&
+      nowMs - lastStandaloneTelemetryMs >= SD_STANDALONE_TELEMETRY_INTERVAL_MS) {
+    lastStandaloneTelemetryMs = nowMs;
+    recordStandaloneTelemetrySnapshot();
+  }
   if (!sdRecordingAvailable) {
     if (nowMs - lastSdCardTelemetryMs >= SD_CARD_TELEMETRY_INTERVAL_MS) {
       lastSdCardTelemetryMs = nowMs;
@@ -2774,8 +4997,10 @@ void serviceSdRecorder(uint32_t nowMs) {
     return;
   }
   if (scienceExperimentState != 1) return;
-  uint32_t sensorLogIntervalMs = audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : SD_SCIENCE_INTERVAL_MS;
-  uint32_t telemetryLogIntervalMs = audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : SD_TELEMETRY_INTERVAL_MS;
+  uint32_t sensorLogIntervalMs = audioRecordingEnabled && !missionCheckpointActive
+    ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : SD_SCIENCE_INTERVAL_MS;
+  uint32_t telemetryLogIntervalMs = audioRecordingEnabled && !missionCheckpointActive
+    ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : SD_TELEMETRY_INTERVAL_MS;
   if (nowMs - lastSdScienceMs >= sensorLogIntervalMs) {
     lastSdScienceMs = nowMs;
     recordScienceSnapshot();
@@ -3049,6 +5274,9 @@ void sendUdpImuTelemetry() {
 void sendUdpPowerTelemetry() {
   float batteryVolts = readBatterySystemVoltage();
   float currentAmps = readCurrentSensorAmps();
+  latestBatteryVolts = batteryVolts;
+  latestCurrentAmps = currentAmps;
+  lastStandalonePowerSampleMs = millis();
   int batteryPct = estimateBatteryPercent(batteryVolts);
 
   PowerPacketPayload payload = {
@@ -3276,9 +5504,29 @@ void handleControlCommand(String command) {
     return;
   }
 
+  const bool motorCalibrationCommand = command.startsWith("CTRL MOTOR CAL ");
+  if (motorCalibrationCommand && (elrsArmed || missionModeRequested)) {
+    emitLine("ERR MOTOR CAL REQUIRES DISARMED MANUAL MODE");
+    return;
+  }
+
+  const bool mixerCalibrationMutation = command.startsWith("CTRL MIX POINT ") || command == "CTRL MIX SAVE";
+  if (mixerCalibrationMutation && (elrsArmed || missionModeRequested)) {
+    emitLine("ERR MIX CAL REQUIRES DISARMED MANUAL MODE");
+    return;
+  }
+
   const bool wifiPropulsionCommand = command.startsWith("CTRL MOTION ") ||
-    command.startsWith("CTRL VECTOR ") || command.startsWith("CTRL MOTOR ") ||
+    command.startsWith("CTRL VECTOR ") ||
+    (command.startsWith("CTRL MOTOR ") && !motorCalibrationCommand) ||
     command.startsWith("CTRL HOLD ") || command.startsWith("CTRL GOTO ");
+  if (elrsCalibrationActive && (wifiPropulsionCommand || command.startsWith("CTRL MOTOR ") ||
+      command.startsWith("CTRL MIX ") || command.startsWith("CTRL CONFIG MAGCAL") ||
+      command.startsWith("CTRL SCIENCE ") || command.startsWith("CTRL SERVICE ") ||
+      command.startsWith("CTRL MISSION "))) {
+    emitLine("ERR CALIBRATION ACTIVE");
+    return;
+  }
   if (missionModeRequested && wifiPropulsionCommand && command != "CTRL MOTOR STOP") {
     emitLine("ERR MISSION MODE UNAVAILABLE; PROPULSION INHIBITED");
     return;
@@ -3287,7 +5535,10 @@ void handleControlCommand(String command) {
     emitLine("ERR ELRS CONTROL ACTIVE");
     return;
   }
-  if (wifiPropulsionCommand && command != "CTRL MOTOR STOP") controlSource = CONTROL_SOURCE_WIFI;
+  if (wifiPropulsionCommand && command != "CTRL MOTOR STOP") {
+    if (controlSource != CONTROL_SOURCE_WIFI) recordLogLine("WIFI CONTROL AUTHORITY ACQUIRED");
+    controlSource = CONTROL_SOURCE_WIFI;
+  }
 
   // Only explicit control traffic and the control-station heartbeat refresh
   // the propulsion watchdog. Telemetry requests cannot keep a stale motor
@@ -3308,6 +5559,22 @@ void handleControlCommand(String command) {
   if (command == "REQ STATUS ALL") {
     emitLine("ACK REQ STATUS ALL");
     sendStatusSnapshot();
+    return;
+  }
+
+  if (command == "CTRL MISSION STOP") {
+    if (missionExecutionActive) stopMissionExecution("CONTROL_STATION_STOP", false);
+    else { stopAllMotors(); missionStartLocked = true; }
+    emitLine("ACK CTRL MISSION STOP");
+    return;
+  }
+  if (command == "CTRL MISSION RETURN HOME") {
+    if (!missionExecutionActive || !missionMetadata.hasHome) {
+      emitLine("ERR MISSION NOT RUNNING");
+      return;
+    }
+    beginMissionReturnHome("OPERATOR_REQUEST");
+    emitLine("ACK CTRL MISSION RETURN HOME");
     return;
   }
 
@@ -3594,12 +5861,14 @@ void handleControlCommand(String command) {
     imuStreamEnabled = false;
     serviceMode = true;
     if (audioFrameQueue) xQueueReset(audioFrameQueue);
+    recordLogLine("SD SERVICE MODE STARTED");
     emitLine("ACK CTRL SERVICE START");
     sendStatusSnapshot();
     return;
   }
   if (command == "CTRL SERVICE STOP") {
     serviceMode = false;
+    recordLogLine("SD SERVICE MODE STOPPED");
     emitLine("ACK CTRL SERVICE STOP");
     sendStatusSnapshot();
     return;
@@ -3640,6 +5909,7 @@ void handleControlCommand(String command) {
       emitLine("ERR SCIENCE SESSION CREATE FAILED");
       return;
     }
+    recordLogLine("SCIENCE SESSION STARTED " + sdSessionDirectory);
     emitLine("ACK CTRL SCIENCE START " + sdSessionDirectory);
     sendStatusSnapshot();
     return;
@@ -3656,8 +5926,17 @@ void handleControlCommand(String command) {
     sdScienceFile.flush();
     sdTelemetryFile.flush();
     File manifest = SD.open((sdSessionDirectory + "/manifest.txt").c_str(), FILE_APPEND);
-    if (manifest) { manifest.println("stopped_utc=" + stopUtc); manifest.close(); }
+    if (manifest) {
+      if (stopUtc.startsWith("00000000T")) {
+        manifest.println(F("stopped_utc=UNKNOWN"));
+        manifest.println("stopped_elapsed_ms=" + String(millis()));
+      } else {
+        manifest.println("stopped_utc=" + stopUtc);
+      }
+      manifest.close();
+    }
     scienceExperimentState = 2;
+    recordLogLine("SCIENCE SESSION STOPPED " + sdSessionDirectory);
     emitLine("ACK CTRL SCIENCE STOP " + sdSessionDirectory);
     sendStatusSnapshot();
     return;
@@ -3667,6 +5946,7 @@ void handleControlCommand(String command) {
     String saveUtc = command.substring(17);
     saveUtc.trim();
     if (!saveSdRecorder(saveUtc)) { emitLine("ERR SCIENCE SAVE FAILED"); return; }
+    recordLogLine("SCIENCE SESSION SAVED " + sdSessionDirectory);
     emitLine("ACK CTRL SCIENCE SAVE " + sdSessionDirectory);
     sendStatusSnapshot();
     return;
@@ -3749,6 +6029,7 @@ void handleControlCommand(String command) {
   }
 
   if (command == "CTRL STOP" || command == "STOP") {
+    recordLogLine("CTRL STOP RECEIVED");
     stopAllMotors();
     controlMode = CONTROL_MODE_IDLE;
     controlSource = CONTROL_SOURCE_NONE;
@@ -3756,6 +6037,58 @@ void handleControlCommand(String command) {
     elrsArmReady = false;
     holdPositionEnabled = false;
     emitLine("ACK CTRL STOP");
+    return;
+  }
+
+  if (command.startsWith("CTRL MIX POINT ")) {
+    int power = 0, axis = -1, rear = 0, frontLeft = 0, frontRight = 0;
+    if (sscanf(command.c_str(), "CTRL MIX POINT %d %d %d %d %d", &power, &axis, &rear, &frontLeft, &frontRight) != 5 ||
+        power < 10 || power > 100 || power % 10 != 0 || axis < 0 || axis >= MIXER_CAL_AXIS_COUNT ||
+        rear < -100 || rear > 100 || frontLeft < -100 || frontLeft > 100 || frontRight < -100 || frontRight > 100) {
+      emitLine("ERR MIX CAL POINT VALUES");
+      return;
+    }
+    const uint8_t step = power / 10 - 1;
+    mixerCalValues[step][axis][0] = static_cast<int8_t>(rear);
+    mixerCalValues[step][axis][1] = static_cast<int8_t>(frontLeft);
+    mixerCalValues[step][axis][2] = static_cast<int8_t>(frontRight);
+    mixerCalPointSet[step][axis] = true;
+    mixerCalProfileLoaded = false;  // A changed candidate is not active until saved and read back.
+    emitLine("ACK CTRL MIX POINT " + String(power) + " " + String(axis) + " " +
+      String(rear) + " " + String(frontLeft) + " " + String(frontRight));
+    return;
+  }
+
+  if (command == "CTRL MIX SAVE") {
+    if (!sdCardMounted) { emitLine("ERR MIX PROFILE SD UNAVAILABLE"); return; }
+    if (!saveMixerCalibrationToSd()) { emitLine("ERR MIX PROFILE SAVE"); return; }
+    bool crcOk = false;
+    mixerCalProfileCrc = missionCrc32File("/config/propulsion.cfg", crcOk);
+    emitLine(String("ACK CTRL MIX SAVE ") + String(mixerCalibrationPointCount(mixerCalPointSet)) + " " +
+      String(mixerCalibrationComplete() ? 1 : 0) + " " + (crcOk ? String(mixerCalProfileCrc, HEX) : "UNKNOWN"));
+    return;
+  }
+
+  if (command == "REQ MIX PROFILE") {
+    if (sdCardMounted) {
+      loadMixerCalibrationFromSd();  // Read the durable candidate, never echo an unsaved RAM edit.
+    } else {
+      memset(mixerCalPointSet, 0, sizeof(mixerCalPointSet));
+      mixerCalProfileLoaded = false;
+    }
+    for (uint8_t step = 0; step < MIXER_CAL_POWER_STEPS; ++step) {
+      for (uint8_t axis = 0; axis < MIXER_CAL_AXIS_COUNT; ++axis) {
+        if (!mixerCalPointSet[step][axis]) continue;
+        emitLine(String("TEL MIX POINT ") + String((step + 1) * 10) + " " + String(axis) + " " +
+          String(mixerCalValues[step][axis][0]) + " " + String(mixerCalValues[step][axis][1]) + " " + String(mixerCalValues[step][axis][2]));
+      }
+    }
+    bool crcOk = false;
+    const char* profilePath = mixerCalLoadedFromBackup ? "/config/propulsion.bak" : "/config/propulsion.cfg";
+    const uint32_t crc = sdCardMounted ? missionCrc32File(profilePath, crcOk) : 0;
+    emitLine(String("TEL MIX PROFILE ") + String(mixerCalibrationPointCount(mixerCalPointSet)) + " " +
+      String(mixerCalibrationComplete() ? 1 : 0) + " " + String(mixerCalProfileLoaded ? 1 : 0) + " " +
+      (crcOk ? String(crc, HEX) : "NONE"));
     return;
   }
 
@@ -3796,6 +6129,8 @@ void handleControlCommand(String command) {
     }
 
     applyMotorCalibration(motorIndex, forwardDirection, directionInvertedValue != 0, startBoostPwm, startBoostMs, sustainMinPwm, maxPwm, curve, rampSeconds);
+    recordLogLine(String("MOTOR CALIBRATION ") + String(motorName) + " " + String(directionText) +
+      " INVERTED " + String(directionInvertedValue) + " MAX_PWM " + String(maxPwm));
     emitLine(
       "ACK CTRL MOTOR CAL " + String(motorName) + " " + String(directionText) +
       " " + String(startBoostPwm) + " " + String(startBoostMs) + " " + String(sustainMinPwm) + " " +
@@ -4041,6 +6376,10 @@ void setupMotors() {
 }
 
 void setup() {
+  sdLogBootId = esp_random();
+  if (sdLogBootId == 0) sdLogBootId = static_cast<uint32_t>(millis()) ^ 0xB00F1DUL;
+  manualHomePreferencesReady = manualHomePreferences.begin("buoy_home", false);
+  const bool manualHomeLoaded = loadManualHomeFromPreferences();
   gpsSerial.begin(GPS_BAUDRATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   magnetometerAvailable = setupQmc5883();
@@ -4053,6 +6392,7 @@ void setup() {
   ads1115Available = setupAds1115();
   sdCardMounted = mountSdCard();
   magnetometerCalibrationLoaded = loadNavigationConfigFromSd();
+  mixerCalProfileLoaded = loadMixerCalibrationFromSd();
   if (sdCardMounted && !loadSelectedMissionFromSd() &&
       !migrateSelectedMissionCollectionFromSd()) migrateLegacyMissionFromSd();
   setupWifiControl();
@@ -4069,24 +6409,85 @@ void setup() {
   emitLine("ESP32 buoy firmware " + firmwareVersionString());
   emitLine("ESP32 buoy firmware ready");
   emitLine("SD card: " + String(sdCardMounted ? "ready" : "unavailable"));
+  emitLine(String("Mixer profile: ") + (mixerCalProfileLoaded ? (mixerCalibrationComplete() ? "loaded and active" : "loaded; incomplete, using safe default mixer") : "not configured; using safe default mixer"));
   emitLine("ADS1115: " + String(ads1115Available ? "ready" : "unavailable"));
   emitLine("MPU6050: " + String(mpu6050Available ? "ready" : "unavailable"));
   emitLine("QMC5883 magnetometer: " + String(magnetometerAvailable ? "ready at 0x0D" : "unavailable"));
   emitLine("Navigation config: " + String(magnetometerCalibrationLoaded ? "magnetometer calibration loaded from SD" : "default; no calibration file"));
+  emitLine(String("TEL STATUS MANUAL_HOME_STORAGE ") +
+    (manualHomeLoaded ? "LOADED NVS" : (manualHomePreferencesReady ? "NVS_READY" : "NVS_UNAVAILABLE")));
+  emitLine(manualHomeLoaded
+    ? String("TEL STATUS MANUAL_HOME SET ") + String(manualHome.latitude, 7) + " " + String(manualHome.longitude, 7)
+    : String("TEL STATUS MANUAL_HOME UNSET"));
   emitLine("INMP441 audio: " + String(audioInputAvailable ? "ready" : "unavailable"));
   emitLine("ELRS UART2: MAVLink 460800");
   updateSdCardTelemetry();
   emitSensorDiagnostics();
+  recordLogLine(String("BOOT firmware=") + firmwareVersionString() +
+    " sd=" + (sdCardMounted ? "READY" : "UNAVAILABLE") +
+    " ads1115=" + (ads1115Available ? "READY" : "UNAVAILABLE") +
+    " manual_home=" + (manualHomeLoaded ? "NVS" : (manualHomePreferencesReady ? "UNSET" : "NVS_FAILED")) +
+    " gps_uart=" + String(GPS_BAUDRATE));
+}
+
+void setupOtaService() {
+  if (WiFi.status() != WL_CONNECTED || otaServiceReady) return;
+
+  ArduinoOTA.setHostname("ESP32-BUOY");
+  ArduinoOTA.setPassword(WIFI_STA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    otaUpdateInProgress = true;
+    stopAllMotors();
+    controlMode = CONTROL_MODE_IDLE;
+    controlSource = CONTROL_SOURCE_NONE;
+    elrsArmed = false;
+    serviceMode = true;
+    recordLogLine("OTA UPDATE STARTED");
+    emitLine("TEL STATUS OTA UPDATE STARTED");
+  });
+  ArduinoOTA.onEnd([]() {
+    recordLogLine("OTA UPDATE COMPLETE");
+    emitLine("TEL STATUS OTA UPDATE COMPLETE");
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    otaUpdateInProgress = false;
+    serviceMode = false;
+    recordLogLine("OTA UPDATE FAILED " + String(static_cast<int>(error)));
+    emitLine("TEL STATUS OTA UPDATE FAILED " + String(static_cast<int>(error)));
+  });
+  ArduinoOTA.begin();
+  otaServiceReady = true;
+  recordLogLine("OTA SERVICE READY");
+  emitLine("TEL STATUS OTA READY");
+}
+
+void serviceOtaUpdate() {
+  if (WiFi.status() != WL_CONNECTED) {
+    otaServiceReady = false;
+    return;
+  }
+
+  setupOtaService();
+  if (!otaServiceReady) return;
+
+  const bool safeToStartUpdate = !elrsArmed && controlSource != CONTROL_SOURCE_WIFI &&
+    !missionExecutionActive && scienceExperimentState == 0 && !sdTransferActive &&
+    !serviceMode && !elrsCalibrationActive && !motorCommandActive();
+  if (otaUpdateInProgress || safeToStartUpdate) ArduinoOTA.handle();
 }
 
 void loop() {
   processElrsControl();
-  if (!serviceMode) processAudioFrames();
+  if (!serviceMode && !elrsCalibrationActive) processAudioFrames();
   processTcpControl();
-  processSdFileServer();
+  if (!elrsCalibrationActive) processSdFileServer();
+  serviceOtaUpdate();
   elrs.poll();
   updateMotorCommandWatchdog();
   if (serviceMode) {
+    serviceElrsCalibration(millis());
+    updateMissionExecution(millis());
+    updateManualReturnHome(millis());
     serviceElrsTelemetry(millis());
     updateStatusLed();
     flushTcpTelemetry();
@@ -4099,13 +6500,27 @@ void loop() {
     magnetometerAvailable = setupQmc5883();
   }
   serviceElrsTelemetry(millis());
+  updateMissionExecution(millis());
+  updateManualReturnHome(millis());
   updateStatusLed();
   updateMotorRamps();
+  serviceElrsCalibration(millis());
+
+  // During the calibration run, keep the radio/control, GPS, motor safety,
+  // calibration sensor reads, and TCP status path alive. Skip unrelated
+  // telemetry streams and standalone SD recorder work to prioritize samples.
+  if (elrsCalibrationActive) {
+    flushTcpTelemetry();
+    delay(1);
+    return;
+  }
 
   uint32_t nowMs = millis();
   updateDs18b20Sensor(nowMs);
   uint32_t sensorStreamIntervalMs = audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : IMU_STREAM_INTERVAL_MS;
-  uint32_t rangeIntervalMs = audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : RANGE_STREAM_INTERVAL_MS;
+  uint32_t rangeIntervalMs = missionExecutionActive && missionCheckpointActive
+    ? SD_SCIENCE_INTERVAL_MS
+    : (audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : RANGE_STREAM_INTERVAL_MS);
   uint32_t waterTemperatureIntervalMs = audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : WATER_TEMP_STREAM_INTERVAL_MS;
   uint32_t powerIntervalMs = audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : POWER_STREAM_INTERVAL_MS;
   uint32_t diagnosticsIntervalMs = audioRecordingEnabled ? AUDIO_PRIORITY_SENSOR_INTERVAL_MS : 5000UL;

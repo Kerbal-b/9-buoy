@@ -1,16 +1,27 @@
-# Propulsion calibration design
+# Propulsion calibration
 
-The Propulsion tab currently applies each motor's PWM start boost, minimum, maximum, curve, ramp, and polarity through `CTRL MOTOR CAL`. The firmware applies those values in RAM. It does not yet save a propulsion profile to the buoy SD card or derive thrust from a water trial.
+## Mixer profile workflow
 
-## Desired buoy configuration
+The calibration CSV is analyzed deterministically and then interpreted with the rules in [`../tx12/skills/mixer-calibration-analysis/SKILL.md`](../../tx12/skills/mixer-calibration-analysis/SKILL.md). The processed artifact is a `buoy_mixer_candidate_v1` JSON containing a complete 60-point profile, the exact tested baseline and CRC, and the measured response. AI processing changes only values supported by the recorded response and documents those changes in `candidate_deltas`.
 
-Store a versioned propulsion profile in `/config/propulsion.cfg`, separate from `/config/navigation.cfg`. Include each motor's wiring direction, forward and reverse PWM limits, start boost, ramp, and measured response table. Upload the complete file, validate its version and checksum, write it to a temporary SD file, then atomically replace the active profile with a backup. Return the saved version and checksum so the control station can read it back. Load the active profile during buoy startup; reject invalid values and use the last valid profile or safe defaults. Apply a new profile only while the motors are stopped.
+In **Propulsion → Mixer calibration**, connect to the buoy, disarm it, and leave Mission mode. Press **Upload processed mixer profile** and select the processed `.mixer-candidate.json`. The station validates run metadata, all 60 baseline points, and every unique movement/power value; it then fills the adjustment table and sends all 60 profile points to the buoy. Firmware saves `/config/propulsion.cfg`. The buoy receives the values over the existing control protocol and does not parse JSON. Wait for the buoy's save confirmation and profile CRC in the station.
 
-## Water calibration
+The table displays the profile from the imported file and its measured evidence. The station requires a complete profile; incomplete drafts cannot be uploaded. A complete profile loads at boot and drives TX12 manual mixing. Motor PWM startup/ramp settings remain separate from this mixer table.
 
-1. With the buoy floating in open, bounded water, calibrate the waterline and magnetic heading first. Record GPS satellite count, HDOP, coordinates, heading, roll, pitch, gyro yaw rate, motor PWM, battery voltage, and current together with timestamps.
-2. Run brief, supervised forward and reverse pulses on each motor at several safe PWM levels. Let the buoy settle between pulses and stop immediately when the operator releases the control.
-3. Estimate translation from GPS displacement and yaw response from the magnetometer and gyro. Compare paired runs in opposite directions to reduce the effect of steady current and wind. Reject trials with poor GPS quality, large waves, or a stale heading signal.
-4. Fit a bounded motor response profile and show the observed data before upload. The operator should be able to accept or edit the profile in the Propulsion tab.
+## Calibration data and interpretation
 
-GPS measures motion over the ground, so these trials estimate *installed propulsion response*, not absolute thrust in newtons. Water current, wind, hull drag, battery voltage, and waves affect the result. The mission controller can use the saved profile for an initial motor command, then adjust from fresh GPS position and magnetic heading feedback while staying inside the mission boundary.
+Calibration mode records at 20 Hz and suspends optional sensor streaming and standalone SD logging while keeping ELRS control/safety, GPS parsing, direct IMU/magnetometer/current/battery reads, and TCP status alive. It records current, battery voltage, motor commands, applied PWM, IMU/gyro, compass, GPS, and RC channels. After the November 8 water test, the sweep starts at 30% power and uses 10-second pulses by default or 20-second pulses in a large pool, with a neutral interval between pulses. Compare repeated trials with the same movement, duration, power, battery range, and buoy setup. Each run records the exact mixer CRC and motor settings.
+
+Check direction signs first. Use gyro Z for yaw during short pulses; compass heading can be distorted by motor fields. Use axis-aligned acceleration and valid GPS speed/course for translation when fix and sample interval support it. Current and PWM reveal stalls and unequal loading but do not prove movement direction. Compare repeated runs and require a change to exceed the run-to-run spread. Ground speed is affected by current and wind, and acceleration can include tilt.
+
+The deterministic analyzer parses and summarizes the data. AI interprets the measured response and creates the processed candidate; it must preserve the tested baseline and explain every supported adjustment. It must retain baseline values when measurements are inconclusive. See the mixer calibration analysis skill for the full procedure and output schema.
+
+## Buoy profile format
+
+`/config/propulsion.cfg` uses `BUOY_MIXER_PROFILE_V1` with `POINT,power,axis,rear,front_left,front_right` rows. Axis ids are 0 forward, 1 reverse, 2 strafe right, 3 strafe left, 4 clockwise yaw, and 5 counter-clockwise yaw. Motor values are signed command percentages. Firmware validates ranges, writes and verifies a temporary file, then atomically replaces the active file with backup recovery. Runtime interpolates adjacent power rows, adds simultaneous axis contributions, and scales the complete vector together at saturation. It uses the empirical profile for TX12 manual mixing only when all 60 points exist. Incomplete profiles and mission control retain their safe existing mix paths.
+
+## Motor-load compass calibration
+
+Navigation keeps motors-off base calibration separate from water-only motor correction capture. For a load survey, hold the buoy at a known fixed heading, record a motors-off baseline, then capture each motor separately in forward and reverse at selected water power levels while confirming gyro yaw stays near baseline. The capture records raw magnetometer XYZ, battery current and voltage, commanded motor/PWM, gyro, and timestamps. These captures do not modify the base compass calibration.
+
+Fit any compensation against measured current, not commanded throttle alone. With one total-current sensor, isolate each motor in turn to estimate its contribution, then validate combined-motor cases. If the field change is not repeatable or a current-based fit leaves large heading errors, move the magnetometer farther from motors and power wiring or rely on gyro during those loads. Propellers unloaded on dry land may draw less current than in water, so validate accepted compensation under representative tethered water loads.

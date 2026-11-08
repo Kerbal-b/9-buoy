@@ -69,7 +69,8 @@ class ElrsLink {
   void sendBuoyState(int rearPwm, int leftPwm, int rightPwm, uint8_t state) {
     // NAMED_VALUE_INT is one compact MAVLink packet per second. Three signed
     // bytes represent applied motor PWM scaled to +/-127; byte 3 carries
-    // mode, source, arm, recording, and recovery flags. See ELRS-MAVLINK.md.
+    // mode, source, arm, science-session recording, and recovery flags. Audio
+    // recording has its own BUOY_AUDIO NAMED_VALUE_INT. See ELRS-MAVLINK.md.
     uint8_t payload[18] = {};
     putLe32(payload, millis());
     const int pwm[3] = {rearPwm, leftPwm, rightPwm};
@@ -82,6 +83,22 @@ class ElrsLink {
     sendMavlink(252, 44, payload, sizeof(payload), kComponentId);
   }
 
+  void sendBuoyAudioState(bool recording) {
+    uint8_t payload[18] = {};
+    putLe32(payload, millis());
+    putLe32(payload + 4, recording ? 1 : 0);
+    memcpy(payload + 8, "BUOY_AUDIO", 10);
+    sendMavlink(252, 44, payload, sizeof(payload), kComponentId);
+  }
+
+  void sendHomeKind(uint8_t homeKind) {
+    uint8_t payload[18] = {};
+    putLe32(payload, millis());
+    putLe32(payload + 4, homeKind);
+    memcpy(payload + 8, "HOME_KIND", 9);
+    sendMavlink(252, 44, payload, sizeof(payload), kComponentId);
+  }
+
   void sendScienceValue(const char* name, float value) {
     if (!name || !isfinite(value)) return;
     uint8_t payload[18] = {};
@@ -91,17 +108,46 @@ class ElrsLink {
     sendMavlink(251, 170, payload, sizeof(payload), kComponentId);
   }
 
+  void sendAttitude(float rollRadians, float pitchRadians, float yawRadians) {
+    if (!isfinite(rollRadians) || !isfinite(pitchRadians) || !isfinite(yawRadians)) return;
+    uint8_t payload[28] = {};
+    putLe32(payload, millis());
+    memcpy(payload + 4, &rollRadians, sizeof(float));
+    memcpy(payload + 8, &pitchRadians, sizeof(float));
+    memcpy(payload + 12, &yawRadians, sizeof(float));
+    // Angular rates are unavailable in the calibrated body frame; leave zero.
+    sendMavlink(30, 39, payload, sizeof(payload), kComponentId);
+  }
+
   void sendBattery(float volts, float amps, int percent) {
     if (!isfinite(volts) || volts <= 0) return;
     volts = constrain(volts, 0.0f, 65.0f);
     amps = isfinite(amps) ? constrain(amps, 0.0f, 327.0f) : 0.0f;
     percent = constrain(percent, 0, 100);
-    // SYS_STATUS includes measured battery fields; other health fields are zero.
+    // Keep SYS_STATUS for the control station's existing telemetry path.
     uint8_t payload[31] = {};
     putLe16(payload + 14, static_cast<uint16_t>(roundf(volts * 1000.0f)));
     putLe16(payload + 16, static_cast<uint16_t>(roundf(amps * 100.0f)));
     payload[30] = static_cast<uint8_t>(percent);
     sendMavlink(1, 124, payload, sizeof(payload), kComponentId);
+
+    // ExpressLRS translates BATTERY_STATUS (not SYS_STATUS) to the standard
+    // CRSF battery sensor EdgeTX discovers on the handset.
+    uint8_t batteryPayload[36] = {};
+    putLe32(batteryPayload, UINT32_MAX);      // current_consumed: unavailable
+    putLe32(batteryPayload + 4, UINT32_MAX);  // energy_consumed: unavailable
+    putLe16(batteryPayload + 8, INT16_MAX);   // temperature: unavailable
+    putLe16(batteryPayload + 10, static_cast<uint16_t>(roundf(volts * 1000.0f)));
+    for (uint8_t cell = 1; cell < 10; ++cell) {
+      putLe16(batteryPayload + 10 + cell * 2, UINT16_MAX);
+    }
+    const int16_t centiamps = static_cast<int16_t>(roundf(amps * 100.0f));
+    putLe16(batteryPayload + 30, static_cast<uint16_t>(centiamps));
+    batteryPayload[32] = 0;  // Battery ID 0 is the primary battery.
+    batteryPayload[33] = 0;  // MAV_BATTERY_FUNCTION_ALL.
+    batteryPayload[34] = 0;  // Chemistry/type unknown.
+    batteryPayload[35] = static_cast<uint8_t>(static_cast<int8_t>(percent));
+    sendMavlink(147, 154, batteryPayload, sizeof(batteryPayload), kComponentId);
   }
 
   void sendGps(double latitude, double longitude, float speedMps,
@@ -137,6 +183,28 @@ class ElrsLink {
     putLe16(rawPayload + 27, isfinite(courseDegrees) ? static_cast<uint16_t>(constrain(roundf(courseDegrees * 100.0f), 0.0f, 35999.0f)) : 0xFFFF);
     rawPayload[29] = satellites;
     sendMavlink(24, 24, rawPayload, sizeof(rawPayload), kComponentId);
+  }
+
+  void sendHomePosition(double latitude, double longitude, float altitudeMeters) {
+    if (!isfinite(latitude) || !isfinite(longitude) || latitude < -90 || latitude > 90 ||
+        longitude < -180 || longitude > 180) return;
+    // MAVLink HOME_POSITION (242), 52-byte MAVLink 1 payload. Local position
+    // and approach vector are unavailable; quaternion is identity.
+    uint8_t payload[52] = {};
+    putLe32(payload, static_cast<uint32_t>(static_cast<int32_t>(round(latitude * 1e7))));
+    putLe32(payload + 4, static_cast<uint32_t>(static_cast<int32_t>(round(longitude * 1e7))));
+    putLe32(payload + 8, static_cast<uint32_t>(static_cast<int32_t>(roundf(altitudeMeters * 1000.0f))));
+    const float identityQuaternionW = 1.0f;
+    memcpy(payload + 24, &identityQuaternionW, sizeof(identityQuaternionW));
+    sendMavlink(242, 104, payload, sizeof(payload), kComponentId);
+  }
+
+  void sendStatusText(const char* message) {
+    if (!message) return;
+    uint8_t payload[51] = {};
+    payload[0] = 6;  // MAV_SEVERITY_INFO.
+    strncpy(reinterpret_cast<char*>(payload + 1), message, 50);
+    sendMavlink(253, 83, payload, sizeof(payload), kComponentId);
   }
 
   void sendLinkAndChannels(uint32_t now) {
