@@ -10,10 +10,22 @@ src/control_station/missions/*_tiles/
 src/control_station/tmp/
 src/firmware/esp32/**/build/
 /.codex_parent_trace.jsonl
+src/tx12/models/BOUY-model02.yml
 
-# Only src/ is tracked among top-level folders.
+# Track source and the buoy OTA upload helper among top-level folders.
 /*/
 !/src/
+!/notes/
+/notes/**/desktop.ini
+!/scripts/
+/scripts/*
+!/scripts/upload-buoy-ota.ps1
+!/build/
+/build/*
+!/build/README.md
+!/build/package_control_station.py
+!/build/build_windows.ps1
+!/build/build_macos.sh
 
 # Root documentation remains local.
 /README.md
