@@ -11,6 +11,7 @@ import json
 import ipaddress
 from pathlib import Path
 import queue
+import shutil
 import socket
 import sys
 import time
@@ -31,13 +32,16 @@ from .models import ScienceSample
 from .mission_plans import (MissionStore, boundary_point_near, generate_automatic_waypoints,
                             mission_estimate, new_plan, point_inside_boundary, rebuild_mission_routes, untangle_boundary,
                             uuid4_from_string, valid_point, validate_plan)
-from .power_history import add_power_sample
+from .power_history import POWER_HISTORY_WINDOWS, add_power_sample, load_power_histories, save_power_histories
 from .mavlink_telemetry import decode_datagram, gcs_heartbeat
 from .navigation import GpsSpeedTracker, NavigationAssist
 from .log_categories import (
     NAVIGATION_LOG,
     SCIENTIFIC_LOG,
     classify_log_entry,
+    communication_kind,
+    communication_severity,
+    communication_source,
     display_timestamp,
     interpret_log_entry,
 )
@@ -59,14 +63,38 @@ from .serial_link import (
     send_command,
     send_text,
 )
-from .sd_card_client import delete_sd_session, download_sd_file, download_sd_session, list_sd_files, list_sd_session
+from .sd_card_client import delete_sd_session, download_sd_file, download_sd_logs, download_sd_session, list_sd_files, list_sd_session
 from .test_session import PersistentTestSession
 from .telemetry_quality import ImuStreamQuality
+from .mixer_calibration_csv import (
+    analyze_calibration_csv,
+    compare_calibration_trials,
+    load_candidate_json,
+    make_candidate_json,
+)
 from .tx12_mapping import DEFAULT_TX12_MAPPING_PATH, load_tx12_mapping
 
 DEFAULT_MIXER_POWER_LIMIT = 0.50
 ELRS_MAVLINK_UDP_PORT = 14550
 BUOY_ROUTER_NETWORK = ipaddress.IPv4Network("192.168.8.0/24")
+MISSION_START_BLOCK_REASONS = {
+    0: "", 1: "Cycle the arm switch low, then high",
+    2: "Set power to minimum and center the sticks",
+    3: "Wi-Fi control currently owns the buoy",
+    4: "Mission setup is not ready",
+    5: "GPS fix must be fresh, with 5 satellites and HDOP 3.0 or lower",
+    6: "Buoy GPS position is outside the mission boundary",
+    7: "Move within 30 m of mission Home",
+    8: "Magnetometer calibration or heading is unavailable",
+    9: "Cycle SE low before retrying Mission",
+    10: "Load a V4 mission with Home and a boundary",
+    11: "Buoy SD card is unavailable",
+    12: "Stop or save the existing science session first",
+    13: "Mission route point or speed is invalid",
+    14: "Move the arm switch fully high",
+    15: "Buoy service mode or SD transfer is active",
+    16: "Could not create the mission's SD session; check the card and retry",
+}
 
 
 class _MissionTilesSignals(QObject):
@@ -427,6 +455,15 @@ class ControlStationBackend(QObject):
         super().__init__()
         self._args = args
         self._log_file = log_file
+        self._compass_load_baseline_path = log_file.parent / "system" / "compass_load_baseline.json"
+        self._compass_load_baseline: dict[str, object] | None = None
+        try:
+            loaded_baseline = json.loads(self._compass_load_baseline_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_baseline, dict) and isinstance(loaded_baseline.get("means"), dict):
+                self._compass_load_baseline = loaded_baseline
+        except (OSError, ValueError):
+            pass
+        self._link_log_file = log_file.with_name(log_file.stem + "-link-events.jsonl")
         self._prefs_path = prefs_path
         self._mission_store = MissionStore(mission_folder or prefs_path.parent / "missions")
         self._mission_tile_tasks: list[_MissionTilesTask] = []
@@ -445,6 +482,7 @@ class ControlStationBackend(QObject):
             "radioWifiStatus": "Not scanned",
             "radioWifiIp": "",
             "radioWifiScanning": False,
+            "linkLogExportStatus": "",
             "networkBuoyDevices": [],
             "networkScanStatus": "Looking for the 192.168.8.0/24 buoy network",
             "networkScanning": False,
@@ -453,6 +491,8 @@ class ControlStationBackend(QObject):
             "wifiMessageRate": 0.0,
             "wifiThroughputKib": 0.0,
             "wifiTrafficStatus": "No active buoy control link",
+            "wifiSafetyTelemetryLive": False,
+            "wifiDetailTelemetryLive": False,
             "tcpPort": int(args.tcp_port),
             "udpPort": int(args.udp_port),
             "audioPort": int(args.audio_port),
@@ -471,13 +511,22 @@ class ControlStationBackend(QObject):
             "radioBuoyMode": "Unknown",
             "radioMotorOutput": "Unknown",
             "radioRecordingStatus": "Unknown",
+            "radioAudioRecording": None,
+            "radioAssistMode": "Unknown",
+            "radioCalibrationStatus": "Waiting for calibration telemetry",
+            "radioCalibrationStep": 0,
+            "radioCalibrationPower": 0,
+            "radioCalibrationMaxPower": 0,
+            "radioCalibrationDuration": 0,
             "radioMissionStatus": "No mission mode yet",
+            "missionStartBlockReason": "",
             "missionDraft": self._mission_draft,
             "missionPreviewPlan": self._mission_draft,
             "missionPreviewSelectedId": self._mission_draft["id"],
             "missionPreviewIsDraft": True,
             "missionPreviewMessage": "Previewing the current draft",
             "missionProgress": None,
+            "radioMissionProgress": None,
             "missionUploadPending": False,
             "missionUploadSucceeded": False,
             "buoyMissionExpectedPointCount": 0,
@@ -498,9 +547,14 @@ class ControlStationBackend(QObject):
             "missionList": self._mission_store.list_plans(),
             "missionIssues": validate_plan(self._mission_draft),
             "missionDirty": False,
-            "missionMessage": "Missions are uploaded to SD and survive buoy restarts; propulsion execution is not implemented yet.",
+            "missionMessage": "Upload a mission, then select Mission on SB/CH7 and arm with SE/CH5. Propulsion stops when Mission is deselected or disarmed.",
             "radioBuoyState": None,
             "radioChannels": [],
+            "manualHomeStatus": "Not available",
+            "manualHomeStorageStatus": "Unknown",
+            "activeHomeStatus": "No active Home",
+            "activeHomeCoordinates": "Unknown",
+            "homeDistanceMeters": None,
             "tx12Controls": [],
             "tx12MapPath": str(self._tx12_mapping_path),
             "tx12MapStatus": "Mapping not loaded",
@@ -536,6 +590,8 @@ class ControlStationBackend(QObject):
             "frontLeftMotorTargetPwm": 0,
             "frontRightMotorTargetPwm": 0,
             "motorOutputTelemetry": False,
+            "motorEnergyWh": {"rear": 0.0, "left": 0.0, "right": 0.0},
+            "motorEnergyEstimatorStatus": "Waiting for motor and battery telemetry",
             "batteryStatus": "N/A",
             "currentLocation": "Unknown",
             "targetLocation": "Not set",
@@ -556,9 +612,14 @@ class ControlStationBackend(QObject):
             "imuGyro": "N/A",
             "imuTemperature": "N/A",
             "magnetometerRaw": "N/A",
+            "magnetometerRawX": None,
+            "magnetometerRawY": None,
+            "magnetometerRawZ": None,
             "magnetometerHeadingDeg": None,
             "magnetometerTiltHeadingDeg": None,
             "magnetometerTiltStatus": "Waiting for calibrated level",
+            "navigationSeaAccelerationRmsG": None,
+            "navigationSeaAngularRateRmsDps": None,
             "magnetometerStatus": "Unknown",
             "magnetometerCalibrationActive": False,
             "magnetometerCalibrationSaved": False,
@@ -600,6 +661,25 @@ class ControlStationBackend(QObject):
             "motorConfigFetchId": 0,
             "motorConfigMotor": "",
             "motorConfigDirection": "",
+            "motorConfigurations": {},
+            "motorCalibrationStatus": "",
+            "motorCalibrationAckId": 0,
+            "motorCalibrationAckMotor": "",
+            "mixerCalibrationRows": [],
+            "mixerCalibrationStatus": "Upload an AI-processed mixer profile to populate the table and update the buoy",
+            "mixerCalibrationProfileLoaded": False,
+            "mixerCalibrationProfileComplete": False,
+            "mixerCalibrationProfileActive": False,
+            "mixerCalibrationStoredCount": 0,
+            "mixerCalibrationCrc": "",
+            "mixerCalibrationSourceLog": "",
+            "mixerCalibrationAnalysisJson": "",
+            "mixerCalibrationCandidateJsonPath": "",
+            "mixerCalibrationComparisonStatus": "",
+            "compassLoadCapturePhase": "",
+            "compassLoadCaptureStatus": "Select motors-off baseline or motor-load capture in Navigation",
+            "compassLoadBaselineStatus": "Loaded previous motors-off water baseline" if self._compass_load_baseline else "No water motors-off baseline saved",
+            "compassLoadLastSummary": {},
             "motorConfigStartBoostPwm": 0,
             "motorConfigStartBoostMs": 0,
             "motorConfigSustainMinPwm": 0,
@@ -613,6 +693,7 @@ class ControlStationBackend(QObject):
             "navigationRequestedTurn": 0,
             "navigationRequestedThrust": 0,
             "navigationRequestedYaw": 0,
+            "buoyMixerInput": None,
             "navigationCorrectedTurn": 0,
             "navigationCorrectedThrust": 0,
             "navigationCorrectedYaw": 0,
@@ -667,9 +748,13 @@ class ControlStationBackend(QObject):
             "navigationCorrectedFrontLeftMotor": 0,
             "navigationCorrectedFrontRightMotor": 0,
         }
+        self._state["mixerCalibrationRows"] = self._empty_mixer_calibration_rows()
         self.reloadTx12Mapping()
         self._comm_log: list[str] = []
         self._command_trace_pending: list[str] = []
+        self._link_log_pending: list[str] = []
+        self._link_log_sequence = 0
+        self._link_log: list[dict[str, object]] = []
         self._last_command_trace_flush = time.monotonic()
         self._categorized_log: list[dict[str, str]] = []
         self._system_log: list[dict[str, str]] = []
@@ -719,6 +804,7 @@ class ControlStationBackend(QObject):
                 "default_reversed": True,
             },
         }
+        self._pending_motor_calibration: dict[str, set[str]] = {}
         self._dashboard_tab = "overview"
         self._audio_muted = False
         self._network_interfaces = list_wifi_interfaces()
@@ -805,6 +891,8 @@ class ControlStationBackend(QObject):
         self._mag_calibration_max: list[int] | None = None
         self._mag_calibration_samples = 0
         self._last_mag_raw: tuple[float, float, float] | None = None
+        self._last_mag_raw_at: float | None = None
+        self._last_mixer_input_at: float | None = None
         self._last_imu_accel: tuple[float, float, float] | None = None
         self._level_calibration_path = prefs_path.parent / "imu_level_calibration.json"
         self._level_roll_offset = 0.0
@@ -846,15 +934,34 @@ class ControlStationBackend(QObject):
         self._last_navigation_log_time = 0.0
         self._navigation_requires_center = False
         self._test_session: PersistentTestSession | None = None
+        self._compass_load_capture_phase = ""
+        self._compass_load_capture_setup: dict[str, object] = {}
+        self._compass_load_capture_values: dict[str, list[float]] = {}
         self._test_imu_quality: ImuStreamQuality | None = None
         self._latest_power: dict[str, float | int | None] = {
             "battery_voltage_v": None,
             "current_a": None,
             "battery_percent": None,
         }
-        self._power_histories: dict[int, list[dict[str, float | int]]] = {10: [], 30: [], 300: []}
+        self._power_history_path = prefs_path.parent / "system" / "power_history.json"
+        self._power_histories = load_power_histories(self._power_history_path)
+        now_epoch = time.time()
+        for interval, points in self._power_histories.items():
+            cutoff = now_epoch - POWER_HISTORY_WINDOWS[interval]
+            points[:] = [point for point in points if float(point["t"]) >= cutoff]
+        self._last_power_history_persist_bucket = 0
+        ten_second_points = self._power_histories[10]
+        if ten_second_points:
+            self._last_power_history_persist_bucket = int(float(ten_second_points[-1]["t"]))
+            self._state.update(
+                powerHistory=[dict(point) for point in self._power_histories[300]],
+                powerHistorySampleCount=sum(int(point["count"]) for point in self._power_histories[300]),
+                powerHistoryStatus="Stored local power history loaded; waiting for live telemetry",
+            )
         self._power_history_interval_seconds = 300
         self._last_power_history_publish_at = 0.0
+        self._motor_energy_last_at = 0.0
+        self._motor_energy_wh = {"rear": 0.0, "left": 0.0, "right": 0.0}
         self._last_recorded_imu_arrival_at: float | None = None
         self._last_motor_output_at: float | None = None
         self._last_motor_output_log_at = 0.0
@@ -863,11 +970,20 @@ class ControlStationBackend(QObject):
         self._last_motor_test_send_at = 0.0
         self._last_motor_test_actual_drive = 0
         self._last_power_at: float | None = None
+        self._wifi_safety_last_at = 0.0
+        self._wifi_detail_last_at = 0.0
         self._last_tick_at = 0.0
 
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._tick)
+        # A status snapshot updates many fields in one event-loop turn. Queue
+        # one QML refresh for the completed batch instead of refreshing the
+        # entire dashboard for every telemetry line.
+        self._state_update_timer = QTimer(self)
+        self._state_update_timer.setSingleShot(True)
+        self._state_update_timer.setInterval(0)
+        self._state_update_timer.timeout.connect(self.stateChanged.emit)
         self._log_update_timer = QTimer(self)
         self._log_update_timer.setSingleShot(True)
         self._log_update_timer.setInterval(250)
@@ -884,6 +1000,10 @@ class ControlStationBackend(QObject):
     @Property(list, notify=logChanged)
     def categorizedLog(self) -> list[dict[str, str]]:
         return self._categorized_log
+
+    @Property(list, notify=logChanged)
+    def linkLog(self) -> list[dict[str, object]]:
+        return self._link_log
 
     @Property(list, notify=logChanged)
     def systemLog(self) -> list[dict[str, str]]:
@@ -1178,8 +1298,12 @@ class ControlStationBackend(QObject):
             return
         measurement_bits = {"water_temperature": 1, "depth": 2, "conductivity": 4,
                             "turbidity": 8, "air_temperature": 16}
-        rows = [f"BUOY_MISSION_V3,{plan_id.upper()},{len(points)},{len(boundary)},"
-                f"{int(plan.get('home') is not None)},{int(plan.get('end') is not None)}"]
+        failsafes = plan.get("failsafes", {})
+        action_code = lambda name: 1 if failsafes.get(name, "return_home") == "return_home" else 0
+        rows = [f"BUOY_MISSION_V4,{plan_id.upper()},{len(points)},{len(boundary)},"
+                f"{int(plan.get('home') is not None)},{int(plan.get('end') is not None)},"
+                f"{action_code('link_loss')},{action_code('boundary_breach')},"
+                f"{action_code('low_battery')},{int(failsafes.get('battery_threshold_percent', 20))}"]
         for tag in ("HOME", "END"):
             coordinate = plan.get(tag.lower())
             if coordinate is not None:
@@ -1619,15 +1743,68 @@ class ControlStationBackend(QObject):
                     self.stopAllMotors()
 
     def _record_power_sample(self, voltage: float, current: float) -> None:
+        self._integrate_motor_energy_estimate(voltage, current)
         now = time.time()
-        windows = {10: 1800, 30: 7200, 300: 86400}
         for interval, points in self._power_histories.items():
             add_power_sample(points, now, voltage, current, interval)
-            while points and points[0]["t"] < now - windows[interval]:
+            while points and points[0]["t"] < now - POWER_HISTORY_WINDOWS[interval]:
                 points.pop(0)
+        current_bucket = int(now // 10) * 10
+        if current_bucket != self._last_power_history_persist_bucket:
+            self._last_power_history_persist_bucket = current_bucket
+            self._persist_power_histories()
         if now - self._last_power_history_publish_at >= 2.0:
             self._last_power_history_publish_at = now
             self._publish_power_history()
+
+    def _integrate_motor_energy_estimate(self, voltage: float, current: float) -> None:
+        """Allocate measured pack load to observed motors using a PWM-cubed model."""
+        now = time.monotonic()
+        previous = self._motor_energy_last_at
+        self._motor_energy_last_at = now
+        if not previous:
+            return
+        elapsed = now - previous
+        if elapsed <= 0 or elapsed > 5.0:
+            return
+
+        outputs = None
+        radio_outputs = False
+        if self._state.get("motorOutputTelemetry") and time.time() - self._last_motor_output_at <= 2.5:
+            outputs = [self._state.get("rearMotorPwm", -1),
+                       self._state.get("frontLeftMotorPwm", -1),
+                       self._state.get("frontRightMotorPwm", -1)]
+        else:
+            radio_state = self._state.get("radioBuoyState")
+            last_state = self._radio_field_last_at.get("buoy_state", 0.0)
+            values = radio_state.get("motor_pwm") if isinstance(radio_state, dict) else None
+            if values and now - last_state <= 2.5:
+                outputs = values[:3]
+                radio_outputs = True
+        if not outputs or voltage <= 0 or current <= 0:
+            return
+        try:
+            numeric_outputs = [float(value) for value in outputs]
+        except (TypeError, ValueError):
+            return
+        if not radio_outputs and any(value < 0 for value in numeric_outputs):
+            return
+
+        # A propeller's electrical load rises faster than linearly with speed.
+        # This estimate uses PWM^3 weights, the measured pack watts, and a
+        # small electronics baseline; calibration can replace these weights.
+        weights = [abs(value) ** 3 for value in numeric_outputs]
+        weight_sum = sum(weights)
+        if weight_sum <= 0:
+            return
+        propulsion_watts = max(0.0, voltage * (current - 0.21))
+        if propulsion_watts <= 0:
+            return
+        scale = propulsion_watts * elapsed / 3600.0 / weight_sum
+        for key, weight in zip(("rear", "left", "right"), weights):
+            self._motor_energy_wh[key] += weight * scale
+        self._set_state(motorEnergyWh=dict(self._motor_energy_wh),
+                        motorEnergyEstimatorStatus="Estimated from pack current and PWM³ · since station telemetry started")
 
     def _publish_power_history(self) -> None:
         interval = self._power_history_interval_seconds
@@ -1636,7 +1813,13 @@ class ControlStationBackend(QObject):
                  300: "5-minute bars / last 24 hours"}[interval]
         self._set_state(powerHistory=[dict(point) for point in points],
                         powerHistorySampleCount=sum(int(point["count"]) for point in points),
-                        powerHistoryStatus=f"Live {label}; positive current = discharge")
+                        powerHistoryStatus=f"Local rolling history · {label}; positive current = discharge")
+
+    def _persist_power_histories(self) -> None:
+        try:
+            save_power_histories(self._power_history_path, self._power_histories)
+        except OSError as exc:
+            self._set_state(powerHistoryStatus=f"Could not save local power history: {exc}")
 
     @Slot(int)
     def setPowerHistoryInterval(self, interval_seconds: int) -> None:
@@ -1688,6 +1871,15 @@ class ControlStationBackend(QObject):
 
     @Slot()
     def startMagnetometerCalibration(self) -> None:
+        if self._test_session is not None and self._test_session.active:
+            self._set_state(magnetometerCalibrationStatus="Stop the active telemetry capture before base calibration")
+            return
+        if self._last_motor_output_at is None or time.time() - self._last_motor_output_at > 2.0:
+            self._set_state(magnetometerCalibrationStatus="Waiting for fresh motor-output telemetry; base calibration requires motors off")
+            return
+        if any(abs(int(self._state.get(key, 0))) > 2 for key in ("rearMotorActualDrive", "frontLeftMotorActualDrive", "frontRightMotorActualDrive")):
+            self._set_state(magnetometerCalibrationStatus="Stop all motors before base compass calibration")
+            return
         self._mag_calibration_active = True
         self._mag_calibration_min = None
         self._mag_calibration_max = None
@@ -1860,6 +2052,12 @@ class ControlStationBackend(QObject):
         if destination:
             self._start_sd_card_operation("session_download", remote_path=session_path, destination=destination)
 
+    @Slot(QUrl)
+    def downloadSdLogsFromUrl(self, destination_url: QUrl) -> None:
+        destination = destination_url.toLocalFile()
+        if destination:
+            self._start_sd_card_operation("logs_download", remote_path="/logs", destination=destination)
+
     @Slot()
     def cancelSdDownload(self) -> None:
         if self._state.get("sdDownloadActive"):
@@ -1876,7 +2074,7 @@ class ControlStationBackend(QObject):
         if self._args.transport != "wifi" or self._transport is None or not self._transport.is_open:
             self._set_state(sdCardStatus="SD browsing requires an active Wi-Fi connection")
             return
-        is_download = operation in {"download", "session_download"}
+        is_download = operation in {"download", "session_download", "logs_download"}
         requires_service_mode = is_download or operation == "delete"
         if requires_service_mode and self._state.get("scienceExperimentState") != "IDLE":
             action = "deleting" if operation == "delete" else "downloading"
@@ -1913,7 +2111,7 @@ class ControlStationBackend(QObject):
             sdTransferEtaSeconds=-1.0,
             sdTransferFileName="",
             sdDownloadActive=is_download,
-            sdDownloadSessionPath=(remote_path if operation == "session_download" else str(Path(remote_path).parent).replace("\\", "/")) if is_download else "",
+            sdDownloadSessionPath=(remote_path if operation in {"session_download", "logs_download"} else str(Path(remote_path).parent).replace("\\", "/")) if is_download else "",
             sdTransferStatus=(
                 f"Downloading {remote_path}" if operation in {"download", "session_download"}
                 else (f"Deleting {remote_path}" if operation == "delete" else f"Reading {remote_path or 'SD sessions'}")
@@ -1935,6 +2133,12 @@ class ControlStationBackend(QObject):
                             self._sd_progress_pending = (received, total, file_name)
 
                     result = str(download_sd_session(host, remote_path, destination, local_ip, update_session_progress, self._sd_cancel_event.is_set))
+                elif operation == "logs_download":
+                    def update_logs_progress(received: int, total: int, file_name: str) -> None:
+                        with self._sd_operation_lock:
+                            self._sd_progress_pending = (received, total, file_name)
+
+                    result = str(download_sd_logs(host, destination, local_ip, update_logs_progress, self._sd_cancel_event.is_set))
                 else:
                     def update_progress(received: int, total: int) -> None:
                         with self._sd_operation_lock:
@@ -1993,7 +2197,16 @@ class ControlStationBackend(QObject):
                 path = str(entry.get("path", ""))
                 parts = path.strip("/").split("/")
                 if entry.get("isDirectory") and len(parts) == 1 and parts[0].lower().startswith("session"):
-                    sessions[parts[0]] = {"name": parts[0], "path": path, "size": int(entry.get("size", 0)), "files": [], "loaded": False}
+                    sessions[parts[0]] = {
+                        "name": parts[0],
+                        "path": path,
+                        "size": int(entry.get("size", 0)),
+                        "files": [],
+                        "loaded": False,
+                        "sessionOrigin": str(entry.get("sessionOrigin", "unknown")),
+                        "missionId": str(entry.get("missionId", "NONE")),
+                        "missionRunId": str(entry.get("missionRunId", "NONE")),
+                    }
             session_rows = [
                 sessions[name] for name in sorted(sessions, reverse=True)
             ]
@@ -2015,7 +2228,7 @@ class ControlStationBackend(QObject):
                 "audio.idx": ("AUDIO INDEX", "Recording index"),
                 "science.csv": ("SCIENCE", "Sensor measurements"),
                 "telemetry.csv": ("TELEMETRY", "GPS, control, and system readings"),
-                "manifest.txt": ("SESSION INFO", "Experiment timestamps and details"),
+                "manifest.txt": ("SESSION INFO", "Mission/run reference and route measurement snapshot"),
             }
             session_files = []
             for entry in result["files"]:
@@ -2031,7 +2244,7 @@ class ControlStationBackend(QObject):
                 else:
                     rows.append(row)
             self._set_state(sdSessions=rows, sdBusy=False, sdTransferStatus=f"Loaded {result['path']}")
-        elif result_kind in {"download", "session_download"}:
+        elif result_kind in {"download", "session_download", "logs_download"}:
             self._set_state(
                 sdBusy=False,
                 sdTransferStatus=f"Saved locally: {result}",
@@ -2461,6 +2674,23 @@ class ControlStationBackend(QObject):
         self._set_state(elrsPacketLogging=bool(enabled))
 
     @Slot()
+    def exportLinkLog(self) -> None:
+        try:
+            self._flush_command_traces()
+            if not self._link_log_file.exists():
+                self._set_state(linkLogExportStatus="No saved link events to export")
+                return
+            export_folder = self._log_file.parent / "exports"
+            export_folder.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            destination = export_folder / f"link-events-{stamp}.jsonl"
+            shutil.copyfile(self._link_log_file, destination)
+        except OSError as exc:
+            self._set_state(linkLogExportStatus=f"Export failed: {exc}")
+            return
+        self._set_state(linkLogExportStatus=f"Exported {destination}")
+
+    @Slot()
     def scanBuoyNetwork(self) -> None:
         target = str(self._state.get("serialTarget", ""))
         if self._network_scanning:
@@ -2632,7 +2862,7 @@ class ControlStationBackend(QObject):
                         # remrssi is the positive magnitude of RSSI in dBm.
                         self._set_state(
                             radioLinkStatus="ELRS receiver status live",
-                            radioRssiStatus=f"-{remote_rssi} dBm (RX uplink)" if remote_rssi is not None else "Unknown",
+                            radioRssiStatus=f"-{remote_rssi} dBm (RX uplink)" if remote_rssi is not None and remote_rssi > 0 else "Unknown",
                             radioLinkQuality=f"{round(local_rssi * 100 / 255)}% (RX uplink)" if local_rssi is not None else "Unknown",
                             radioSnrStatus=(f"{message['noise_raw'] if message['noise_raw'] < 128 else message['noise_raw'] - 256} dB (RX uplink)"
                                             if message["noise_raw"] is not None else "Unknown"),
@@ -2653,16 +2883,55 @@ class ControlStationBackend(QObject):
                 self._radio_telemetry_last_at = time.monotonic()
                 self._radio_telemetry_packets += 1
                 updates: dict[str, object] = {
-                    "radioTelemetryStatus": (
-                        "ELRS heartbeat; detailed telemetry on buoy Wi-Fi"
-                        if self._state.get("telemetryMode") == "WIFI"
-                        else "Receiving buoy telemetry over ELRS"
-                    ),
+                    "radioTelemetryStatus": "Receiving buoy telemetry over ELRS",
                     "radioTelemetryPackets": self._radio_telemetry_packets,
                     "radioSystemId": str(system_id),
                 }
                 kind = message["kind"]
-                if kind == "heartbeat":
+                if kind == "compact_status":
+                    self._radio_field_last_at["buoy_state"] = self._radio_telemetry_last_at
+                    self._radio_field_last_at["mission_progress"] = self._radio_telemetry_last_at
+                    mission_status = {0: "IDLE", 1: "STARTING", 2: "MOVING", 3: "COLLECTING",
+                                      4: "RETURNING_HOME", 5: "STOPPED", 6: "COMPLETE",
+                                      7: "RETURNED_HOME", 8: "BLOCKED"}.get(message["mission_state"], "UNKNOWN")
+                    progress = dict(self._state.get("radioMissionProgress") or {})
+                    progress.update(status=mission_status, percent_complete=message["percent"],
+                                    current_waypoint_index=max(0, message["waypoint"] - 1),
+                                    waypoint_count=message["waypoint_count"])
+                    block_reason = MISSION_START_BLOCK_REASONS.get(message["mission_block"], "Unknown start interlock")
+                    if block_reason:
+                        progress["block_reason"] = block_reason
+                    else:
+                        progress.pop("block_reason", None)
+                    if message["home_distance_m"] >= 0:
+                        progress["distance_from_home_m"] = message["home_distance_m"]
+                    else:
+                        progress.pop("distance_from_home_m", None)
+                    updates.update(radioArmStatus="ARMED" if message["armed"] else "DISARMED",
+                                   radioAssistMode={0: "Direct", 1: "Assist", 2: "Assist, no heading",
+                                                    3: "Mission"}.get(message["assist"], "Unknown"),
+                                   radioRecordingStatus="Recording" if message["recording"] else "Not recording",
+                                   radioAudioRecording=message["audio_recording"],
+                                   radioMissionProgress=progress, radioMissionStatus=mission_status.replace("_", " "),
+                                   missionStartBlockReason=block_reason,
+                                   activeHomeStatus={0: "No active Home", 1: "Manual Home", 2: "Mission Home"}.get(message["home_kind"], "Unknown"),
+                                   gpsFixValid=message["gps_fix"],
+                                   homeDistanceMeters=message["home_distance_m"] if message["home_distance_m"] >= 0 else None)
+                    buoy_state = dict(self._state.get("radioBuoyState") or {})
+                    buoy_state.update(armed=message["armed"], recording=message["recording"])
+                    updates["radioBuoyState"] = buoy_state
+                    if self._radio_is_primary():
+                        updates["scienceExperimentState"] = "RECORDING" if message["recording"] else "IDLE"
+                        updates["audioRecordingEnabled"] = message["audio_recording"]
+                        if message["heading_deg"] >= 0:
+                            updates["magnetometerTiltHeadingDeg"] = message["heading_deg"]
+                elif kind == "calibration_status":
+                    updates.update(radioCalibrationStatus={0: "Idle", 1: "Active", 2: "Stopped",
+                                                           3: "Complete"}.get(message["state"], "Unknown"),
+                                   radioCalibrationStep=message["step"], radioCalibrationPower=message["power"],
+                                   radioCalibrationMaxPower=message["max_power"],
+                                   radioCalibrationDuration=message["duration_s"])
+                elif kind == "heartbeat":
                     self._radio_field_last_at["arm"] = self._radio_telemetry_last_at
                     updates["radioArmStatus"] = "ARMED" if message["armed"] else "DISARMED"
                 elif kind == "power":
@@ -2701,7 +2970,11 @@ class ControlStationBackend(QObject):
                         else "GPS motion unknown"
                     )
                     if self._radio_is_primary():
-                        updates.update(currentLocation=location, telemetrySource="ELRS")
+                        updates.update(currentLocation=location, telemetrySource="ELRS",
+                                       navigationGpsSpeedAvailable=speed is not None,
+                                       navigationGpsSpeedMps=round(speed, 3) if speed is not None else 0.0,
+                                       navigationGpsCourseAvailable=track is not None,
+                                       navigationGpsCourseDeg=round(track, 1) if track is not None else 0.0)
                 elif kind == "gps_quality":
                     self._radio_field_last_at["gps_quality"] = self._radio_telemetry_last_at
                     updates.update(gpsSatelliteCount=message["satellites"], gpsHdop=message["hdop"], gpsFixValid=message["fix_valid"])
@@ -2710,6 +2983,9 @@ class ControlStationBackend(QObject):
                 elif kind == "buoy_state":
                     self._radio_field_last_at["buoy_state"] = self._radio_telemetry_last_at
                     motor_pwm = message["motor_pwm"]
+                    signed_motor_drive = [
+                        int(round(value * 100.0 / 255.0)) for value in motor_pwm
+                    ]
                     motor_text = " | ".join(
                         f"{name} {value:+d}/255" if value else f"{name} stopped"
                         for name, value in zip(("Rear", "Left", "Right"), motor_pwm)
@@ -2721,6 +2997,7 @@ class ControlStationBackend(QObject):
                         radioBuoyState=message,
                     )
                     if self._radio_is_primary():
+                        self._last_motor_output_at = time.time()
                         updates.update(
                             buoyMode=message["mode"].lower(),
                             controlSource=message["control_source"],
@@ -2728,12 +3005,95 @@ class ControlStationBackend(QObject):
                             recoveryStatus="MANUAL_STOP" if message["recovery_stop"] else "READY",
                             scienceExperimentState="RECORDING" if message["recording"] else "UNKNOWN",
                             telemetrySource="ELRS",
+                            rearMotorActualDrive=signed_motor_drive[0],
+                            frontLeftMotorActualDrive=signed_motor_drive[1],
+                            frontRightMotorActualDrive=signed_motor_drive[2],
+                            rearMotorPwm=motor_pwm[0],
+                            frontLeftMotorPwm=motor_pwm[1],
+                            frontRightMotorPwm=motor_pwm[2],
+                            motorOutputTelemetry=True,
                         )
+                elif kind == "buoy_audio_state":
+                    self._radio_field_last_at["buoy_audio_state"] = self._radio_telemetry_last_at
+                    updates["radioAudioRecording"] = bool(message["audio_recording"])
+                    if self._radio_is_primary():
+                        updates["telemetrySource"] = "ELRS"
+                elif kind == "home_position":
+                    coordinates = f"{message['latitude']:.7f}, {message['longitude']:.7f}"
+                    updates.update(activeHomeCoordinates=coordinates, telemetrySource="ELRS")
+                elif kind == "home_source":
+                    self._radio_field_last_at["home_source"] = self._radio_telemetry_last_at
+                    source = {0: "No active Home", 1: "Manual Home", 2: "Mission Home"}.get(message["source"], "Unknown Home source")
+                    updates.update(activeHomeStatus=source, telemetrySource="ELRS")
+                    if message["source"] == 0:
+                        updates.update(activeHomeCoordinates="Unknown", homeDistanceMeters=None)
                 elif kind == "science":
                     science_name = str(message["name"])
                     science_value = float(message["value"])
                     self._radio_field_last_at[f"science:{science_name}"] = self._radio_telemetry_last_at
+                    if science_name == "MAN_AST":
+                        updates["radioAssistMode"] = {0: "Direct", 1: "Assist", 2: "Assist, no heading",
+                                                      3: "Mission"}.get(int(round(science_value)), "Unknown")
+                    elif science_name == "CAL_STAT":
+                        updates["radioCalibrationStatus"] = {0: "Idle", 1: "Active", 2: "Stopped",
+                                                             3: "Complete", 4: "Blocked", 5: "SD error"}.get(int(round(science_value)), "Unknown")
+                    elif science_name in {"CAL_STEP", "CAL_PWR", "CAL_MAX", "CAL_DUR"}:
+                        state_key = {"CAL_STEP": "radioCalibrationStep", "CAL_PWR": "radioCalibrationPower",
+                                     "CAL_MAX": "radioCalibrationMaxPower", "CAL_DUR": "radioCalibrationDuration"}[science_name]
+                        updates[state_key] = int(round(science_value))
                     if self._radio_is_primary():
+                        if science_name in {"MIS_STATE", "MIS_BLOCK", "MIS_PCT", "MIS_COUNT", "MIS_WP", "DIST_HOME", "DIST_WP"}:
+                            self._radio_field_last_at["mission_progress"] = self._radio_telemetry_last_at
+                        progress = dict(self._state.get("radioMissionProgress") or {})
+                        if science_name == "MIS_STATE":
+                            mission_status = {0: "IDLE", 1: "STARTING", 2: "MOVING", 3: "COLLECTING",
+                                              4: "RETURNING_HOME", 5: "STOPPED", 6: "COMPLETE",
+                                              7: "RETURNED_HOME", 8: "BLOCKED"}.get(int(round(science_value)), "UNKNOWN")
+                            if mission_status in {"IDLE", "STARTING"}:
+                                progress = {"status": mission_status}
+                            else:
+                                progress.update(status=mission_status)
+                            updates["radioMissionProgress"] = progress
+                            updates["radioMissionStatus"] = mission_status.replace("_", " ")
+                        elif science_name == "MIS_BLOCK":
+                            reason = MISSION_START_BLOCK_REASONS.get(int(round(science_value)), "Unknown start interlock")
+                            if reason:
+                                progress["block_reason"] = reason
+                            else:
+                                progress.pop("block_reason", None)
+                            updates["radioMissionProgress"] = progress
+                            updates["missionStartBlockReason"] = reason
+                        elif science_name == "MIS_PCT":
+                            progress["percent_complete"] = int(round(science_value))
+                            updates["radioMissionProgress"] = progress
+                        elif science_name == "MIS_COUNT":
+                            progress["waypoint_count"] = int(round(science_value))
+                            updates["radioMissionProgress"] = progress
+                        elif science_name == "MIS_WP":
+                            progress["current_waypoint_index"] = max(0, int(round(science_value)) - 1)
+                            updates["radioMissionProgress"] = progress
+                        elif science_name == "DIST_HOME":
+                            progress["distance_from_home_m"] = science_value
+                            updates["radioMissionProgress"] = progress
+                        elif science_name == "DIST_WP":
+                            progress["distance_to_waypoint_m"] = science_value
+                            updates["radioMissionProgress"] = progress
+                        if science_name in ("HOME_DIST", "DIST_HOME"):
+                            updates["homeDistanceMeters"] = round(science_value, 1)
+                            updates["telemetrySource"] = "ELRS"
+                        if science_name == "MAG_HEAD":
+                            updates["magnetometerHeadingDeg"] = round(science_value, 1)
+                            updates["telemetrySource"] = "ELRS"
+                        elif science_name == "TILT_HEAD":
+                            updates["magnetometerTiltHeadingDeg"] = round(science_value, 1)
+                            updates["magnetometerTiltStatus"] = "Low-rate accelerometer tilt correction via Backpack"
+                            updates["telemetrySource"] = "ELRS"
+                        elif science_name == "SEA_ACC":
+                            updates["navigationSeaAccelerationRmsG"] = round(science_value, 4)
+                            updates["telemetrySource"] = "ELRS"
+                        elif science_name == "SEA_GYR":
+                            updates["navigationSeaAngularRateRmsDps"] = round(science_value, 1)
+                            updates["telemetrySource"] = "ELRS"
                         formatted = {
                             "WATER_TEMP": ("waterTemperature", f"{science_value:.2f} °C"),
                             "DEPTH_M": ("currentDepth", f"{science_value:.3f} m"),
@@ -2781,15 +3141,21 @@ class ControlStationBackend(QObject):
             self._radio_field_last_at.pop("position")
             updates = {"radioLocation": "Unknown", "radioGroundMotion": "Unknown"}
             if self._state.get("telemetrySource") == "ELRS":
-                updates["currentLocation"] = "Unknown"
+                updates.update(currentLocation="Unknown", navigationGpsSpeedAvailable=False,
+                               navigationGpsCourseAvailable=False)
             self._set_state(**updates)
         if self._radio_field_last_at.get("buoy_state", 0.0) and now - self._radio_field_last_at["buoy_state"] > 5.0:
             self._radio_field_last_at.pop("buoy_state")
             updates = {"radioBuoyMode": "Unknown", "radioMotorOutput": "Unknown",
-                       "radioRecordingStatus": "Unknown", "radioBuoyState": None}
+                       "radioRecordingStatus": "Unknown", "radioBuoyState": None,
+                       "radioAudioRecording": None}
             if self._radio_is_primary():
                 updates.update(buoyMode="unknown", controlSource="UNKNOWN", radioArmStatus="Unknown",
-                               recoveryStatus="Unknown", scienceExperimentState="UNKNOWN")
+                               recoveryStatus="Unknown", scienceExperimentState="UNKNOWN",
+                               rearMotorActualDrive=0, frontLeftMotorActualDrive=0,
+                               frontRightMotorActualDrive=0, rearMotorPwm=-1,
+                               frontLeftMotorPwm=-1, frontRightMotorPwm=-1,
+                               motorOutputTelemetry=False)
             self._set_state(**updates)
         for science_name, state_key in (("WATER_TEMP", "waterTemperature"), ("DEPTH_M", "currentDepth"),
                                         ("TDS_V", "conductivityVoltage"), ("TURBIDITY", "turbidityVoltage")):
@@ -2798,6 +3164,26 @@ class ControlStationBackend(QObject):
                 self._radio_field_last_at.pop(field_key, None)
                 if self._radio_is_primary():
                     self._set_state(**{state_key: "N/A"})
+        for science_name in ("HOME_DIST", "DIST_HOME"):
+            field_key = f"science:{science_name}"
+            if self._radio_field_last_at.get(field_key, 0.0) and now - self._radio_field_last_at[field_key] > 12.0:
+                self._radio_field_last_at.pop(field_key, None)
+                if self._radio_is_primary():
+                    self._set_state(homeDistanceMeters=None)
+        for science_name, state_key in (("MAG_HEAD", "magnetometerHeadingDeg"),
+                                        ("TILT_HEAD", "magnetometerTiltHeadingDeg"),
+                                        ("SEA_ACC", "navigationSeaAccelerationRmsG"),
+                                        ("SEA_GYR", "navigationSeaAngularRateRmsDps")):
+            field_key = f"science:{science_name}"
+            if self._radio_field_last_at.get(field_key, 0.0) and now - self._radio_field_last_at[field_key] > 12.0:
+                self._radio_field_last_at.pop(field_key, None)
+                if self._radio_is_primary():
+                    self._set_state(**{state_key: None})
+        if (self._radio_field_last_at.get("mission_progress", 0.0)
+                and now - self._radio_field_last_at["mission_progress"] > 12.0):
+            self._radio_field_last_at.pop("mission_progress", None)
+            if self._radio_is_primary():
+                self._set_state(radioMissionProgress=None, radioMissionStatus="Mission telemetry stale")
         if self._radio_telemetry_last_at and time.monotonic() - self._radio_telemetry_last_at > 5.0:
             self._radio_telemetry_last_at = 0.0
             self._radio_field_last_at.clear()
@@ -2812,16 +3198,28 @@ class ControlStationBackend(QObject):
                 "radioMotorOutput": "Unknown",
                 "radioRecordingStatus": "Unknown",
                 "radioBuoyState": None,
+                "radioAudioRecording": None,
+                "radioAssistMode": "Unknown",
+                "radioCalibrationStatus": "Telemetry stale",
             }
             if self._radio_is_primary():
                 updates.update(radioArmStatus="Unknown", waterTemperature="N/A", currentDepth="N/A",
-                               conductivityVoltage="N/A", turbidityVoltage="N/A")
+                               conductivityVoltage="N/A", turbidityVoltage="N/A",
+                               magnetometerHeadingDeg=None, magnetometerTiltHeadingDeg=None,
+                               navigationSeaAccelerationRmsG=None, navigationSeaAngularRateRmsDps=None)
             if self._state.get("telemetrySource") == "ELRS":
                 updates.update(
                     telemetrySource="No live telemetry",
                     batteryStatus="N/A",
                     currentDraw="N/A",
                     currentLocation="Unknown",
+                    rearMotorActualDrive=0,
+                    frontLeftMotorActualDrive=0,
+                    frontRightMotorActualDrive=0,
+                    rearMotorPwm=-1,
+                    frontLeftMotorPwm=-1,
+                    frontRightMotorPwm=-1,
+                    motorOutputTelemetry=False,
                 )
             self._set_state(**updates)
 
@@ -3005,7 +3403,11 @@ class ControlStationBackend(QObject):
         environment = str(self._state.get("navigationTestEnvironment", "water"))
         metadata = {
             "source": "buoy-control-station",
-            "test_kind": "water_imu_calibration" if environment == "water" else "dry_land_baseline",
+            "test_kind": (
+                "water_compass_motor_load" if self._compass_load_capture_phase
+                else "water_imu_calibration" if environment == "water"
+                else "dry_land_baseline"
+            ),
             "serial_target": str(self._state.get("serialTarget", "")),
             "control_input_mode": str(self._state.get("controlInputMode", "tx12")),
             "send_rate_hz": float(self._args.send_rate),
@@ -3016,6 +3418,8 @@ class ControlStationBackend(QObject):
                 "swap_xy": bool(self._state.get("navigationSwapXY", False)),
             },
             "motor_calibration": self._motor_calibrations,
+            "compass_load_capture_phase": self._compass_load_capture_phase or None,
+            "compass_load_capture_setup": dict(self._compass_load_capture_setup),
             "notes": "Motor PWM is commanded duty, not measured propeller RPM.",
         }
         try:
@@ -3031,9 +3435,10 @@ class ControlStationBackend(QObject):
 
         self._test_imu_quality = ImuStreamQuality(expected_interval_ms=50)
         self._last_recorded_imu_arrival_at = None
+        self._compass_load_capture_values = {key: [] for key in ("mag_x", "mag_y", "mag_z", "heading_deg", "current_a", "gyro_x_dps", "gyro_y_dps", "gyro_z_dps")}
         self._set_state(
             testSessionActive=True,
-            testSessionStatus="Recording synchronized telemetry",
+            testSessionStatus=("Recording compass " + self._compass_load_capture_phase if self._compass_load_capture_phase else "Recording synchronized telemetry"),
             testSessionFile=str(self._test_session.path),
             testSessionSampleCount=0,
             testSessionImuRateHz=0.0,
@@ -3041,12 +3446,54 @@ class ControlStationBackend(QObject):
         )
         self._append_comm_log(f"TEST RECORD START file={self._test_session.path}")
 
+    @Slot(str, str, str, int)
+    def startCompassLoadCapture(self, phase: str, motor: str, direction: str, power_percent: int) -> None:
+        normalized = str(phase or "").strip().lower()
+        if normalized not in {"motors_off_baseline", "motor_load"}:
+            return
+        if self._state.get("navigationTestEnvironment") != "water":
+            self._set_state(compassLoadCaptureStatus="Select Tethered water before compass load calibration")
+            return
+        if self._test_session is not None and self._test_session.active:
+            self._set_state(compassLoadCaptureStatus="Stop the active log before starting a compass capture")
+            return
+        if not self._state.get("imuStreamEnabled"):
+            self._set_state(compassLoadCaptureStatus="Start the IMU stream before capturing compass load data")
+            return
+        if normalized == "motors_off_baseline":
+            if self._last_motor_output_at is None or time.time() - self._last_motor_output_at > 2.0:
+                self._set_state(compassLoadCaptureStatus="Waiting for fresh motor-output telemetry before baseline capture")
+                return
+            actual = [
+                int(self._state.get("rearMotorActualDrive", 0)),
+                int(self._state.get("frontLeftMotorActualDrive", 0)),
+                int(self._state.get("frontRightMotorActualDrive", 0)),
+            ]
+            if any(abs(value) > 2 for value in actual):
+                self._set_state(compassLoadCaptureStatus="Stop all motors before capturing the water baseline")
+                return
+        self._compass_load_capture_phase = normalized
+        self._compass_load_capture_setup = {
+            "motor": str(motor or "none"),
+            "direction": str(direction or "none"),
+            "requested_power_percent": max(0, min(100, int(power_percent))),
+        }
+        self._set_state(compassLoadCapturePhase=normalized, compassLoadCaptureStatus="Starting water capture…")
+        self.startTestSession()
+        if self._test_session is None:
+            self._compass_load_capture_phase = ""
+            self._compass_load_capture_setup = {}
+            self._set_state(compassLoadCapturePhase="")
+        else:
+            self._set_state(compassLoadCaptureStatus="Capturing raw field, current, heading, gyro, and motor outputs")
+
     def _close_test_session(self, reason: str) -> None:
         session = self._test_session
         if session is None:
             return
         path = session.path
         sample_count = session.sample_count
+        capture_summary = self._test_session_summary().get("compass_motor_load", {})
         close_error: OSError | None = None
         try:
             session.close(reason, self._test_session_summary())
@@ -3055,6 +3502,40 @@ class ControlStationBackend(QObject):
         finally:
             self._test_session = None
             self._test_imu_quality = None
+            phase = self._compass_load_capture_phase
+            self._compass_load_capture_phase = ""
+            self._compass_load_capture_setup = {}
+        compass_summary_state: dict[str, object] = {}
+        compass_status = self._state.get("compassLoadCaptureStatus", "")
+        if phase and close_error is None and capture_summary:
+            compass_summary_state = {
+                "phase": phase,
+                "setup": capture_summary.get("setup", {}),
+                "means": capture_summary.get("means", {}),
+                "valid_mag_samples": capture_summary.get("valid_mag_samples", 0),
+            }
+            means = capture_summary.get("means", {})
+            if phase == "motors_off_baseline" and int(capture_summary.get("valid_mag_samples", 0)) > 0:
+                self._compass_load_baseline = compass_summary_state
+                try:
+                    self._compass_load_baseline_path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary_path = self._compass_load_baseline_path.with_suffix(".tmp")
+                    temporary_path.write_text(json.dumps(self._compass_load_baseline, indent=2), encoding="utf-8")
+                    temporary_path.replace(self._compass_load_baseline_path)
+                    compass_status = f"Saved water baseline: {capture_summary.get('valid_mag_samples')} magnetometer samples"
+                except OSError as exc:
+                    compass_status = f"Baseline captured in log but could not persist locally: {exc}"
+            elif phase == "motor_load":
+                baseline_means = (self._compass_load_baseline or {}).get("means", {})
+                if isinstance(means, dict) and isinstance(baseline_means, dict) and all(means.get(key) is not None and baseline_means.get(key) is not None for key in ("mag_x", "mag_y", "mag_z")):
+                    delta = {key: round(float(means[key]) - float(baseline_means[key]), 2) for key in ("mag_x", "mag_y", "mag_z")}
+                    base_heading, load_heading = baseline_means.get("heading_deg"), means.get("heading_deg")
+                    if base_heading is not None and load_heading is not None:
+                        delta["heading_deg"] = round((float(load_heading) - float(base_heading) + 180.0) % 360.0 - 180.0, 2)
+                    compass_summary_state["delta_from_baseline"] = delta
+                    compass_status = f"Load capture: Δfield X {delta['mag_x']:+.1f}, Y {delta['mag_y']:+.1f}, Z {delta['mag_z']:+.1f}; see log {path.name}"
+                else:
+                    compass_status = f"Load log saved: {path.name}; capture a same-heading motors-off baseline to calculate field delta"
         self._set_state(
             testSessionActive=False,
             testSessionStatus=(
@@ -3062,6 +3543,13 @@ class ControlStationBackend(QObject):
             ),
             testSessionFile=str(path),
             testSessionSampleCount=sample_count,
+            compassLoadCapturePhase="",
+            compassLoadCaptureStatus=compass_status,
+            compassLoadBaselineStatus=(
+                "Water baseline ready · " + self._compass_load_baseline_path.name
+                if self._compass_load_baseline else "No water motors-off baseline saved"
+            ),
+            compassLoadLastSummary=compass_summary_state or self._state.get("compassLoadLastSummary", {}),
         )
         self._append_comm_log(
             f"TEST RECORD STOP samples={sample_count} file={path}"
@@ -3071,21 +3559,6 @@ class ControlStationBackend(QObject):
     @Slot()
     def stopTestSession(self) -> None:
         self._close_test_session("operator_stop")
-
-    @Slot(str)
-    def sendText(self, text: str) -> None:
-        message = (text or "").strip()
-        if not message:
-            self._set_state(lastSendResult="Empty text", lastSentLine="")
-            return
-        if self._transport is None:
-            self._set_state(lastSendResult="No serial link", lastSentLine=message)
-            return
-
-        result = send_text(self._transport, message)
-        self._set_state(lastSendResult=result, lastSentLine=message)
-        if "failed" not in result.lower():
-            self._append_comm_log(f"TX {message}")
 
     @Slot(str, str, int, int, int, int, float, float, bool, int)
     def startMotorTest(
@@ -3207,6 +3680,8 @@ class ControlStationBackend(QObject):
     ) -> None:
         if self._transport is None:
             self._set_state(lastSendResult="No serial link", lastSentLine="")
+            self._append_comm_log(f"TX failed CTRL MOTOR CAL {motor} {direction}: no serial link")
+            self._set_state(motorCalibrationStatus=f"Apply failed for {motor}: no serial link")
             return
 
         normalized_motor = (motor or "").strip().lower().replace("-", "_")
@@ -3227,6 +3702,9 @@ class ControlStationBackend(QObject):
         self._set_state(lastSendResult=result, lastSentLine=command)
         if "failed" not in result.lower():
             self._append_comm_log(f"TX {command}")
+        else:
+            self._append_comm_log(f"TX failed {command}: {result}")
+            self._set_state(motorCalibrationStatus=f"Apply failed for {normalized_motor}: {result}")
 
     @Slot(str, int, int, int, int, float, float, bool)
     def sendSharedMotorCalibration(
@@ -3243,8 +3721,13 @@ class ControlStationBackend(QObject):
         """Apply one calibration profile to both motor directions."""
         if self._transport is None:
             self._set_state(lastSendResult="No serial link", lastSentLine="")
+            self._append_comm_log(f"TX failed CTRL MOTOR CAL {motor}: no serial link")
+            self._set_state(motorCalibrationStatus=f"Apply failed for {motor}: no serial link")
             return
 
+        normalized_motor = (motor or "").strip().lower().replace("-", "_")
+        self._pending_motor_calibration[normalized_motor] = set()
+        self._set_state(motorCalibrationStatus=f"Sending {normalized_motor} settings to buoy…")
         for direction in ("forward", "reverse"):
             self.sendMotorCalibration(
                 motor,
@@ -3257,6 +3740,8 @@ class ControlStationBackend(QObject):
                 ramp_seconds,
                 default_reversed,
             )
+        if not str(self._state.get("motorCalibrationStatus", "")).startswith("Apply failed"):
+            self._set_state(motorCalibrationStatus=f"Sent {normalized_motor} settings; waiting for buoy confirmation")
 
     @Slot(str, str)
     def requestMotorConfiguration(self, motor: str, direction: str) -> None:
@@ -3271,6 +3756,324 @@ class ControlStationBackend(QObject):
         self._set_state(lastSendResult=result, lastSentLine=command)
         if "failed" not in result.lower():
             self._append_comm_log(f"TX {command}")
+
+    @staticmethod
+    def _empty_mixer_calibration_rows() -> list[dict[str, object]]:
+        axes = ("forward", "reverse", "strafe_right", "strafe_left", "yaw_clockwise", "yaw_counterclockwise")
+        return [
+            {
+                "power": power, "axis": axis, "axis_index": axis_index,
+                "rear": 0, "front_left": 0, "front_right": 0, "set": False,
+                "samples": 0, "accel_x_g": None, "accel_y_g": None,
+                "yaw_rate_dps": None, "gyro_x_dps": None, "gyro_y_dps": None,
+                "current_a": None, "battery_voltage_v": None, "heading_deg": None,
+                "actual_drive_rear": None, "actual_drive_front_left": None, "actual_drive_front_right": None,
+                "applied_pwm_rear": None, "applied_pwm_front_left": None, "applied_pwm_front_right": None,
+                "gps_speed_mps": None, "gps_course_deg": None,
+                "mag_x": None, "mag_y": None, "mag_z": None,
+            }
+            for axis_index, axis in enumerate(axes)
+            for power in range(10, 101, 10)
+        ]
+
+    @Slot()
+    def requestMixerCalibrationProfile(self) -> None:
+        if self._transport is None:
+            self._set_state(mixerCalibrationStatus="Connect to the buoy to read its SD profile")
+            return
+        command = "REQ MIX PROFILE"
+        rows = self._empty_mixer_calibration_rows()
+        self._set_state(
+            mixerCalibrationRows=rows,
+            mixerCalibrationStatus="Reading the buoy SD mixer profile…",
+            mixerCalibrationSourceLog="",
+        )
+        result = send_text(self._transport, command)
+        if "failed" in result.lower():
+            self._set_state(mixerCalibrationStatus=f"Profile request failed: {result}")
+        else:
+            self._append_comm_log(f"TX {command}")
+
+    @Slot()
+    def importLatestMixerCalibrationLog(self) -> None:
+        log_dir = self._log_file.parent / "tests"
+        try:
+            candidates = sorted(log_dir.glob("*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True)
+        except OSError as exc:
+            self._set_state(mixerCalibrationStatus=f"Cannot list test logs: {exc}")
+            return
+        rows = self._empty_mixer_calibration_rows()
+        axis_lookup = {"thrust": (0, 1), "lateral": (2, 3), "yaw": (4, 5)}
+        accum: dict[tuple[int, int], dict[str, list[float]]] = {}
+        source_paths: list[str] = []
+        for candidate in candidates:
+            try:
+                with candidate.open("r", encoding="utf-8") as handle:
+                    records = [json.loads(line) for line in handle if line.strip()]
+            except (OSError, ValueError):
+                continue
+            metadata = next((record for record in records if record.get("record_type") == "metadata"), {})
+            if metadata.get("test_kind") != "water_imu_calibration":
+                continue
+            groups: dict[tuple[int, int], dict[str, list[float]]] = {}
+            for record in records:
+                if record.get("record_type") != "sample":
+                    continue
+                motion = record.get("motion", {}).get("requested_percent", {})
+                values = {name: float(motion.get(name, 0) or 0) for name in ("lateral", "thrust", "yaw")}
+                active = [(name, value) for name, value in values.items() if abs(value) >= 5.0]
+                if len(active) != 1:
+                    continue
+                name, value = active[0]
+                bucket = int(round(abs(value) / 10.0) * 10)
+                if bucket < 10 or bucket > 100:
+                    continue
+                positive_axis, negative_axis = axis_lookup[name]
+                axis_index = positive_axis if value > 0 else negative_axis
+                motors = record.get("motors", {})
+                vector = [motors.get(key, {}).get("mixed_percent") for key in ("rear", "front_left", "front_right")]
+                if any(item is None for item in vector):
+                    continue
+                response = record.get("navigation", {}).get("measured_linear_accel_g", {})
+                gyro = record.get("imu", {}).get("gyro_dps", {})
+                current = record.get("power", {}).get("current_a")
+                key = (axis_index, bucket)
+                group = groups.setdefault(key, {name: [] for name in (
+                    "rear", "front_left", "front_right", "accel_x_g", "accel_y_g", "yaw_rate_dps", "gyro_x_dps", "gyro_y_dps",
+                    "current_a", "battery_voltage_v", "heading_deg", "actual_drive_rear", "actual_drive_front_left", "actual_drive_front_right",
+                    "applied_pwm_rear", "applied_pwm_front_left", "applied_pwm_front_right",
+                    "gps_speed_mps", "gps_course_deg", "mag_x", "mag_y", "mag_z",
+                )})
+                for field, measured in zip(("rear", "front_left", "front_right"), vector):
+                    group[field].append(float(measured))
+                for field, measured in (("accel_x_g", response.get("x")), ("accel_y_g", response.get("y")),
+                                        ("yaw_rate_dps", gyro.get("z")), ("gyro_x_dps", gyro.get("x")),
+                                        ("gyro_y_dps", gyro.get("y")), ("current_a", current),
+                                        ("battery_voltage_v", record.get("power", {}).get("battery_voltage_v")),
+                                        ("heading_deg", record.get("navigation", {}).get("magnetometer_raw", {}).get("heading_deg")),
+                                        ("gps_speed_mps", record.get("navigation", {}).get("gps", {}).get("speed_mps")),
+                                        ("gps_course_deg", record.get("navigation", {}).get("gps", {}).get("course_deg")),
+                                        ("mag_x", record.get("navigation", {}).get("magnetometer_raw", {}).get("x")),
+                                        ("mag_y", record.get("navigation", {}).get("magnetometer_raw", {}).get("y")),
+                                        ("mag_z", record.get("navigation", {}).get("magnetometer_raw", {}).get("z"))):
+                    if measured is not None:
+                        group[field].append(float(measured))
+                for motor_name, log_key in (("rear", "rear"), ("front_left", "front_left"), ("front_right", "front_right")):
+                    motor_record = motors.get(log_key, {})
+                    for field in ("actual_drive", "applied_pwm"):
+                        measured = motor_record.get(field)
+                        if measured is not None and int(measured) >= 0:
+                            group[f"{field}_{motor_name}"].append(float(measured))
+            if groups:
+                source_paths.append(str(candidate))
+                for key, group in groups.items():
+                    target = accum.setdefault(key, {name: [] for name in group})
+                    for field, values in group.items():
+                        target[field].extend(values)
+        if not accum:
+            self._set_state(mixerCalibrationStatus=f"No directional samples found in {log_dir}")
+            return
+        axis_order = ("forward", "reverse", "strafe_right", "strafe_left", "yaw_clockwise", "yaw_counterclockwise")
+        for row in rows:
+            group = accum.get((int(row["axis_index"]), int(row["power"])))
+            if not group:
+                continue
+            row["set"] = True
+            row["samples"] = len(group["rear"])
+            for field in ("rear", "front_left", "front_right"):
+                row[field] = int(round(sum(group[field]) / len(group[field])))
+            for field in group:
+                if group[field]:
+                    row[field] = round(sum(group[field]) / len(group[field]), 4)
+        filled = sum(bool(row["set"]) for row in rows)
+        self._set_state(
+            mixerCalibrationRows=rows,
+            mixerCalibrationSourceLog=f"{len(source_paths)} water test logs",
+            mixerCalibrationStatus=f"Imported {filled}/60 power-direction points from {len(source_paths)} water test logs; inspect and edit the candidate before saving",
+        )
+
+    @Slot(str)
+    def analyzeMixerCalibrationCsv(self, file_url: str) -> None:
+        """Analyze a buoy SD calibration CSV and write a portable candidate JSON beside it."""
+        source_path = QUrl(file_url).toLocalFile() if file_url.startswith("file:") else file_url
+        try:
+            bundle = analyze_calibration_csv(source_path)
+            destination = Path(source_path).with_suffix(".mixer-candidate.json")
+            destination.write_text(json.dumps(bundle, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except (OSError, ValueError, TypeError) as exc:
+            self._set_state(mixerCalibrationStatus=f"CSV analysis failed: {exc}")
+            return
+        analysis = bundle["analysis"]
+        profile_rows = bundle["profile"]
+        self._set_state(
+            mixerCalibrationRows=profile_rows,
+            mixerCalibrationAnalysisJson=json.dumps(analysis, ensure_ascii=False),
+            mixerCalibrationSourceLog=analysis.get("source_file", ""),
+            mixerCalibrationCandidateJsonPath=str(destination),
+            mixerCalibrationStatus=(
+                f"Analyzed {analysis['active_sample_rows']} active samples across "
+                f"{analysis['measured_groups']} movement/power points. Candidate JSON: {destination.name}. "
+                "It preserves the tested baseline; review and edit before upload."
+            ),
+        )
+
+    @Slot(str)
+    def importMixerCalibrationCandidateJson(self, file_url: str) -> None:
+        source_path = QUrl(file_url).toLocalFile() if file_url.startswith("file:") else file_url
+        try:
+            bundle = load_candidate_json(source_path)
+            rows = bundle["profile"]
+            self._validateMixerRows(rows)
+        except (OSError, ValueError, TypeError) as exc:
+            self._set_state(mixerCalibrationStatus=f"Candidate JSON import failed: {exc}")
+            return
+        analysis = bundle.get("analysis", {})
+        self._set_state(
+            mixerCalibrationRows=rows,
+            mixerCalibrationAnalysisJson=json.dumps(analysis, ensure_ascii=False),
+            mixerCalibrationSourceLog=analysis.get("source_file", "Candidate JSON") if isinstance(analysis, dict) else "Candidate JSON",
+            mixerCalibrationCandidateJsonPath=str(source_path),
+            mixerCalibrationStatus=f"Loaded {sum(bool(row.get('set')) for row in rows)}/60 candidate points from {Path(source_path).name}; review before upload",
+        )
+
+    @Slot(str)
+    def applyMixerCalibrationCandidateJson(self, file_url: str) -> None:
+        """Load a completed, processed candidate and upload its full profile in one action."""
+        if self._transport is None:
+            self._set_state(mixerCalibrationStatus="Connect to the buoy before uploading a processed profile")
+            return
+        if str(self._state.get("radioArmStatus", "")).upper() != "DISARMED" or str(self._state.get("buoyMode", "")).lower() == "mission":
+            self._set_state(mixerCalibrationStatus="Disarm the buoy and leave Mission mode before uploading")
+            return
+        source_path = QUrl(file_url).toLocalFile() if file_url.startswith("file:") else file_url
+        try:
+            bundle = load_candidate_json(source_path)
+            rows = bundle["profile"]
+            self._validateMixerRows(rows)
+            analysis = bundle.get("analysis")
+            if not isinstance(analysis, dict) or analysis.get("completed") is not True:
+                raise ValueError("Processed profile must retain completed-run analysis metadata")
+            baseline = analysis.get("baseline_profile")
+            if not isinstance(baseline, list) or len(baseline) != 60:
+                raise ValueError("Processed profile must retain all 60 tested baseline points")
+            if any(not bool(row.get("set")) for row in rows):
+                raise ValueError("Processed profile must define all 60 movement and power points")
+        except (OSError, ValueError, TypeError) as exc:
+            self._set_state(mixerCalibrationStatus=f"Processed mixer file rejected: {exc}")
+            return
+
+        self._set_state(
+            mixerCalibrationRows=rows,
+            mixerCalibrationAnalysisJson=json.dumps(analysis, ensure_ascii=False),
+            mixerCalibrationSourceLog=analysis.get("source_file", Path(source_path).name),
+            mixerCalibrationCandidateJsonPath=str(source_path),
+            mixerCalibrationStatus=f"Loaded all 60 values from {Path(source_path).name}; uploading to buoy SD",
+        )
+        self.saveMixerCalibrationProfile(json.dumps(rows, ensure_ascii=False))
+
+    @Slot(str, str)
+    def exportMixerCalibrationCandidateJson(self, rows_json: str, file_url: str) -> None:
+        destination_path = QUrl(file_url).toLocalFile() if file_url.startswith("file:") else file_url
+        try:
+            bundle = make_candidate_json(rows_json, str(self._state.get("mixerCalibrationAnalysisJson", "")))
+            self._validateMixerRows(bundle["profile"])
+            destination = Path(destination_path)
+            destination.write_text(json.dumps(bundle, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except (OSError, ValueError, TypeError) as exc:
+            self._set_state(mixerCalibrationStatus=f"Candidate JSON export failed: {exc}")
+            return
+        self._set_state(mixerCalibrationCandidateJsonPath=str(destination), mixerCalibrationStatus=f"Exported candidate JSON to {destination.name}")
+
+    @Slot(str)
+    def compareMixerCalibrationTrials(self, file_urls_json: str) -> None:
+        try:
+            urls = json.loads(file_urls_json)
+            if not isinstance(urls, list):
+                raise ValueError("Select multiple calibration CSV files")
+            paths = [QUrl(str(url)).toLocalFile() if str(url).startswith("file:") else str(url) for url in urls]
+            comparison = compare_calibration_trials(paths)
+            destination = Path(paths[0]).with_suffix(".trial-comparison.json")
+            destination.write_text(json.dumps(comparison, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except (OSError, ValueError, TypeError) as exc:
+            self._set_state(mixerCalibrationComparisonStatus=f"Trial comparison failed: {exc}")
+            return
+        config_labels = ", ".join(
+            f"{item['mixer_profile_crc32']} ({item['trial_count']} runs)"
+            for item in comparison["configurations"]
+        )
+        self._set_state(
+            mixerCalibrationComparisonStatus=(
+                f"Compared {len(comparison['runs'])} completed runs across {len(comparison['configurations'])} mixer profile(s): "
+                f"{config_labels}. Saved {destination.name}; use 3+ runs per profile and compare changes with run-to-run spread."
+            )
+        )
+
+    @staticmethod
+    def _validateMixerRows(rows: object) -> None:
+        if not isinstance(rows, list) or len(rows) != 60:
+            raise ValueError("A configuration needs exactly 60 profile rows")
+        seen: set[tuple[int, int]] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("Profile row is invalid")
+            power = int(row.get("power", 0))
+            axis = int(row.get("axis_index", -1))
+            motors = [int(row.get(field, 0)) for field in ("rear", "front_left", "front_right")]
+            if power not in range(10, 101, 10) or axis not in range(6) or any(value < -100 or value > 100 for value in motors):
+                raise ValueError("Motor values must be -100..100, at power steps 10..100, on axes 0..5")
+            point = (axis, power)
+            if point in seen:
+                raise ValueError("Configuration contains a duplicate movement/power point")
+            seen.add(point)
+        if len(seen) != 60:
+            raise ValueError("Configuration must define every movement at every power step")
+
+    @Slot(str)
+    def saveMixerCalibrationProfile(self, rows_json: str) -> None:
+        if self._transport is None:
+            self._set_state(mixerCalibrationStatus="Connect to the buoy before saving")
+            return
+        if str(self._state.get("radioArmStatus", "")).upper() != "DISARMED" or str(self._state.get("buoyMode", "")).lower() == "mission":
+            self._set_state(mixerCalibrationStatus="Disarm the buoy and leave Mission mode before saving")
+            return
+        try:
+            rows = json.loads(rows_json)
+        except (TypeError, ValueError):
+            self._set_state(mixerCalibrationStatus="Candidate profile data is invalid")
+            return
+        try:
+            self._validateMixerRows(rows)
+        except (TypeError, ValueError) as exc:
+            self._set_state(mixerCalibrationStatus=f"Candidate profile is invalid: {exc}")
+            return
+        commands: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                self._set_state(mixerCalibrationStatus="Candidate profile row is invalid")
+                return
+            if not row.get("set"):
+                continue
+            try:
+                power = int(row["power"])
+                axis = int(row["axis_index"])
+                motors = [int(row[field]) for field in ("rear", "front_left", "front_right")]
+            except (KeyError, TypeError, ValueError):
+                self._set_state(mixerCalibrationStatus="Candidate profile has an invalid motor value")
+                return
+            if power not in range(10, 101, 10) or axis not in range(6) or any(value < -100 or value > 100 for value in motors):
+                self._set_state(mixerCalibrationStatus="Motor values must be between -100% and +100%")
+                return
+            commands.append(f"CTRL MIX POINT {power} {axis} {motors[0]} {motors[1]} {motors[2]}")
+        if not commands:
+            self._set_state(mixerCalibrationStatus="Enter or import at least one calibrated point before saving a draft")
+            return
+        payload = "\n".join(commands + ["CTRL MIX SAVE"])
+        result = send_text(self._transport, payload)
+        if "failed" in result.lower():
+            self._set_state(mixerCalibrationStatus=f"Profile upload failed: {result}")
+            return
+        self._set_state(mixerCalibrationStatus=f"Sent {len(commands)} calibrated mixer points; waiting for SD save confirmation")
+        self._append_comm_log(f"TX CTRL MIX POINT [{len(commands)} calibrated rows] + CTRL MIX SAVE")
 
     @Slot(str, bool)
     def setKeyboardInput(self, key: str, pressed: bool) -> None:
@@ -3316,6 +4119,20 @@ class ControlStationBackend(QObject):
         }
         self._comm_log = (self._comm_log + [entry])[-120:]
         self._categorized_log = (self._categorized_log + [display_entry])[-360:]
+        kind = communication_kind(entry)
+        if kind is not None:
+            self._link_log_sequence += 1
+            link_entry = {
+                **display_entry,
+                "sequence": self._link_log_sequence,
+                "utc": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="milliseconds"),
+                "epochMs": int(timestamp * 1000),
+                "kind": kind,
+                "source": communication_source(entry),
+                "severity": communication_severity(entry),
+            }
+            self._link_log = (self._link_log + [link_entry])[-360:]
+            self._link_log_pending.append(json.dumps(link_entry, ensure_ascii=False) + "\n")
         if category == NAVIGATION_LOG:
             self._navigation_log = (self._navigation_log + [display_entry])[-120:]
         elif category == SCIENTIFIC_LOG:
@@ -3333,12 +4150,18 @@ class ControlStationBackend(QObject):
             self._log_update_timer.start()
 
     def _flush_command_traces(self) -> None:
-        if not self._command_trace_pending:
+        if not self._command_trace_pending and not self._link_log_pending:
             return
-        lines = self._command_trace_pending
-        self._command_trace_pending = []
-        with self._log_file.open("a", encoding="utf-8") as handle:
-            handle.writelines(lines)
+        if self._command_trace_pending:
+            lines = self._command_trace_pending[:]
+            with self._log_file.open("a", encoding="utf-8") as handle:
+                handle.writelines(lines)
+            del self._command_trace_pending[:len(lines)]
+        if self._link_log_pending:
+            link_lines = self._link_log_pending[:]
+            with self._link_log_file.open("a", encoding="utf-8") as handle:
+                handle.writelines(link_lines)
+            del self._link_log_pending[:len(link_lines)]
         self._last_command_trace_flush = time.monotonic()
 
     def _set_state(self, **updates: object) -> None:
@@ -3346,7 +4169,11 @@ class ControlStationBackend(QObject):
         if not updates:
             return
         self._state = {**self._state, **updates}
-        self.stateChanged.emit()
+        timer = getattr(self, "_state_update_timer", None)
+        if timer is None or QCoreApplication.instance() is None:
+            self.stateChanged.emit()
+        elif not timer.isActive():
+            timer.start()
 
     def _motor_pwm_for_percent(self, motor_name: str, power_percent: int) -> int:
         calibration = self._motor_calibrations[motor_name]
@@ -3365,6 +4192,8 @@ class ControlStationBackend(QObject):
             stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             self._command_trace_pending.append(f"{stamp} MOTOR TEST LINK LOST status={status}\n")
         self._transport = None
+        self._wifi_safety_last_at = 0.0
+        self._wifi_detail_last_at = 0.0
         self._active_motor_test = None
         self._last_motor_test_log_command = None
         self._last_motor_test_actual_drive = 0
@@ -3381,6 +4210,8 @@ class ControlStationBackend(QObject):
         self._set_state(
             serialStatus=status,
             serialTarget="No port selected",
+            wifiSafetyTelemetryLive=False,
+            wifiDetailTelemetryLive=False,
             batteryStatus=self._state["radioBatteryStatus"] if radio_fresh else "N/A",
             currentDraw=self._state["radioCurrentDraw"] if radio_fresh else "N/A",
             currentLocation=self._state["radioLocation"] if radio_fresh else "Unknown",
@@ -3432,6 +4263,7 @@ class ControlStationBackend(QObject):
 
     def shutdown(self) -> None:
         self._timer.stop()
+        self._persist_power_histories()
         if self._radio_telemetry_socket is not None:
             self._radio_telemetry_socket.close()
             self._radio_telemetry_socket = None
@@ -3802,6 +4634,65 @@ class ControlStationBackend(QObject):
 
     def _process_text_line(self, response_text: str) -> None:
         self._set_state(lastResponse=response_text)
+        if response_text.startswith("TEL MIX INPUT "):
+            fields = response_text.split()
+            if len(fields) == 7:
+                try:
+                    self._last_mixer_input_at = time.time()
+                    self._set_state(buoyMixerInput={
+                        "lateral": int(fields[3]), "thrust": int(fields[4]),
+                        "yaw": int(fields[5]), "tx12": fields[6] == "1",
+                    })
+                except ValueError:
+                    self._set_state(buoyMixerInput=None)
+                    self._last_mixer_input_at = None
+            return
+        if response_text.startswith("TEL MIX POINT "):
+            fields = response_text.split()
+            if len(fields) == 8:
+                try:
+                    power, axis = int(fields[3]), int(fields[4])
+                    values = [int(fields[index]) for index in (5, 6, 7)]
+                    if power in range(10, 101, 10) and axis in range(6) and all(-100 <= value <= 100 for value in values):
+                        rows = list(self._state.get("mixerCalibrationRows", self._empty_mixer_calibration_rows()))
+                        row_index = axis * 10 + power // 10 - 1
+                        row = dict(rows[row_index])
+                        row.update(rear=values[0], front_left=values[1], front_right=values[2], set=True)
+                        rows[row_index] = row
+                        self._set_state(mixerCalibrationRows=rows)
+                except (IndexError, TypeError, ValueError):
+                    pass
+            return
+        if response_text.startswith("TEL MIX PROFILE "):
+            fields = response_text.split()
+            if len(fields) >= 7:
+                try:
+                    count, complete, loaded = int(fields[3]), fields[4] == "1", fields[5] == "1"
+                    self._set_state(
+                        mixerCalibrationStoredCount=count,
+                        mixerCalibrationProfileComplete=complete,
+                        mixerCalibrationProfileLoaded=loaded,
+                        mixerCalibrationProfileActive=loaded and complete,
+                        mixerCalibrationCrc=fields[6],
+                        mixerCalibrationStatus=(
+                            f"Buoy SD profile read back: {count}/60 points, {'active' if loaded and complete else 'not active until complete'}"
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    self._set_state(mixerCalibrationStatus="Buoy returned an invalid mixer profile summary")
+            return
+        if response_text.startswith("ACK CTRL MIX SAVE "):
+            fields = response_text.split()
+            if len(fields) >= 7:
+                self._set_state(
+                    mixerCalibrationStoredCount=int(fields[4]),
+                    mixerCalibrationProfileComplete=fields[5] == "1",
+                    mixerCalibrationProfileLoaded=True,
+                    mixerCalibrationProfileActive=fields[5] == "1",
+                    mixerCalibrationCrc=fields[6],
+                    mixerCalibrationStatus=f"Saved and verified on buoy SD: {fields[4]}/60 points; {'profile active' if fields[5] == '1' else 'incomplete profile saved but safe default mix remains active'}",
+                )
+            return
         if response_text.startswith("TEL MOTOR OUT "):
             output = _parse_motor_output_telemetry(response_text)
             if output is not None:
@@ -3839,6 +4730,17 @@ class ControlStationBackend(QObject):
         self._append_comm_log(f"RX {response_text}")
         if response_text.startswith("TEL EVENT TELEMETRY_MODE "):
             self._set_state(telemetryMode=response_text.rsplit(" ", 1)[-1])
+        if response_text.startswith("TEL EVENT MISSION_START BLOCKED "):
+            fields = response_text.split()
+            try:
+                block_code = int(fields[5])
+            except (IndexError, ValueError):
+                block_code = -1
+            reason = MISSION_START_BLOCK_REASONS.get(block_code, "Mission start interlock is active")
+            self._set_state(missionStartBlockReason=reason,
+                            radioMissionStatus="Mission start blocked: " + reason)
+        elif response_text.startswith("TEL EVENT MISSION_START ") or response_text == "TEL EVENT MISSION_MODE MANUAL":
+            self._set_state(missionStartBlockReason="")
 
         ack = parse_acknowledgement(response_text)
         if ack is not None:
@@ -3888,10 +4790,40 @@ class ControlStationBackend(QObject):
                 self._set_state(ackVector=f"{ack_values[1]},{ack_values[2]}")
             elif ack_kind == "CTRL" and len(ack_values) >= 4 and ack_values[0] == "MOTION":
                 self._set_state(ackVector=f"{ack_values[1]},{ack_values[2]}, yaw {ack_values[3]}")
+            elif ack_kind == "CTRL" and len(ack_values) >= 4 and ack_values[:2] == ("MOTOR", "CAL"):
+                motor_name = ack_values[2].strip().lower().replace("-", "_")
+                direction = ack_values[3].strip().lower()
+                acknowledged = self._pending_motor_calibration.get(motor_name)
+                if direction in {"forward", "reverse"} and acknowledged is not None:
+                    acknowledged.add(direction)
+                    if acknowledged == {"forward", "reverse"}:
+                        self._pending_motor_calibration.pop(motor_name, None)
+                        self._set_state(
+                            motorCalibrationStatus=f"Applied {motor_name} settings in buoy RAM (both directions confirmed)",
+                            motorCalibrationAckMotor=motor_name,
+                            motorCalibrationAckId=int(self._state.get("motorCalibrationAckId", 0)) + 1,
+                        )
             elif ack_kind == "CTRL" and len(ack_values) >= 2 and ack_values[0] == "HOLD":
                 self._set_state(holdPosition=(ack_values[1] == "ON"))
             elif ack_kind == "CONFIG" and len(ack_values) >= 2 and ack_values[0] == "MAGCAL" and ack_values[1] == "STORED":
                 self._set_state(magnetometerBuoyConfigStatus="Calibration saved to buoy SD card")
+
+        if response_text.startswith("TEL MISSION PROGRESS "):
+            fields = response_text.split()
+            if len(fields) >= 12:
+                try:
+                    progress = {
+                        "mission_id": fields[3].lower(), "status": fields[4],
+                        "current_waypoint_index": int(fields[5]), "waypoint_count": int(fields[6]),
+                        "completed_waypoints": int(fields[7]),
+                        "distance_to_waypoint_m": float(fields[8]), "distance_from_home_m": float(fields[9]),
+                        "percent_complete": int(fields[10]), "reason": fields[11],
+                    }
+                    running = progress["status"] not in ("COMPLETE", "RETURNED_HOME", "STOPPED")
+                    self._set_state(missionProgress=progress,
+                                    buoyMissionRunningId=(progress["mission_id"] if running else "NONE"))
+                except (TypeError, ValueError):
+                    self._set_state(missionMessage="Buoy returned invalid mission progress")
 
         if response_text.startswith("TEL MISSION POINT "):
             fields = response_text.split()
@@ -3999,6 +4931,13 @@ class ControlStationBackend(QObject):
         status_update = parse_status_update(response_text)
         if status_update is not None:
             status_key, status_values = status_update
+            if str(self._state.get("serialTarget", "")).startswith("WIFI:"):
+                if status_key in {"ELRS_ARM", "RECOVERY"}:
+                    self._wifi_safety_last_at = time.monotonic()
+                    self._set_state(wifiSafetyTelemetryLive=True)
+                if self._state.get("telemetryMode") == "WIFI" and status_key in {"POS", "BATTERY"}:
+                    self._wifi_detail_last_at = time.monotonic()
+                    self._set_state(wifiDetailTelemetryLive=True)
             if status_key == "TELEMETRY_MODE" and status_values:
                 self._set_state(telemetryMode=status_values[0])
             elif status_key == "MISSION" and status_values:
@@ -4017,12 +4956,12 @@ class ControlStationBackend(QObject):
                 self._set_state(sdCardStatus=("SD card ready" if available else "SD card unavailable"))
             elif status_key == "ELRS_CHANNELS" and self._state.get("telemetryMode") == "WIFI":
                 try:
-                    channels = [int(value) for value in status_values[:10]]
+                    channels = [int(value) for value in status_values[:16]]
                 except ValueError:
                     channels = []
                 if channels:
                     self._radio_field_last_at["channels"] = time.monotonic()
-                    self._set_state(radioChannels=[value if 900 <= value <= 2100 else None for value in channels] + [None] * 6)
+                    self._set_state(radioChannels=[value if 900 <= value <= 2100 else None for value in channels] + [None] * max(0, 16 - len(channels)))
             elif status_key == "ELRS_LINK" and self._state.get("telemetryMode") == "WIFI":
                 values = list(status_values)
                 try:
@@ -4038,21 +4977,62 @@ class ControlStationBackend(QObject):
                     self._set_state(
                         radioLinkStatus="ELRS receiver status via buoy Wi-Fi",
                         radioLinkQuality=f"{link_quality}% (RX uplink)",
-                        radioRssiStatus=f"{rssi} dBm (RX uplink)",
+                        radioRssiStatus=f"{rssi} dBm (RX uplink)" if rssi < 0 else "Unknown",
                         radioSnrStatus=f"{snr} dB (RX uplink)",
                     )
             elif status_key == "MODE" and status_values:
                 self._set_state(buoyMode=status_values[0].lower())
             elif status_key == "MISSION_CONTROL" and status_values:
                 mission_control = status_values[0]
-                self._set_state(radioMissionStatus=(
-                    "Mission requested; guidance unavailable, motors inhibited"
-                    if mission_control == "MISSION_REQUEST_BLOCKED" else "Manual mode"
-                ))
+                mission_status_label = mission_control.replace("_", " ").title()
+                if mission_control == "MANUAL":
+                    self._set_state(radioMissionStatus="Manual · Direct")
+                elif mission_control == "MANUAL_ASSIST":
+                    self._set_state(radioMissionStatus="Manual Assist · Heading hold")
+                elif mission_control == "MANUAL_ASSIST_NO_HEADING":
+                    self._set_state(radioMissionStatus="Manual Assist · Heading unavailable")
+                else:
+                    self._set_state(radioMissionStatus="Mission mode · " + mission_status_label)
             elif status_key == "CONTROL_SOURCE" and status_values:
                 self._set_state(controlSource=status_values[0])
             elif status_key == "ELRS_ARM" and status_values:
                 self._set_state(radioArmStatus=status_values[0])
+            elif status_key == "MANUAL_HOME" and status_values:
+                if status_values[0] == "SET":
+                    self._set_state(manualHomeStatus=("Set · " + " ".join(status_values[1:3]) if len(status_values) >= 3 else "Set"))
+                elif status_values[0] == "RETURNING":
+                    self._set_state(manualHomeStatus=("Returning · " + status_values[1] if len(status_values) > 1 else "Returning"))
+                else:
+                    self._set_state(manualHomeStatus="Not available")
+            elif status_key == "MANUAL_HOME_STORAGE" and status_values:
+                storage_status = " ".join(status_values)
+                if storage_status == "NVS_READY":
+                    storage_status = "Persistent storage ready"
+                elif storage_status == "LOADED NVS":
+                    storage_status = "Home loaded from persistent storage"
+                elif storage_status == "SAVED NVS":
+                    storage_status = "Saved across power cycles"
+                elif storage_status == "SAVE FAILED":
+                    storage_status = "Save failed · recapture Home"
+                elif storage_status == "NVS_UNAVAILABLE":
+                    storage_status = "Persistent storage unavailable"
+                self._set_state(manualHomeStorageStatus=storage_status)
+            elif status_key == "ACTIVE_HOME" and status_values:
+                source = status_values[0]
+                if source in ("MANUAL", "MISSION") and len(status_values) >= 3:
+                    try:
+                        coordinates = f"{float(status_values[1]):.7f}, {float(status_values[2]):.7f}"
+                    except ValueError:
+                        coordinates = "Unknown"
+                    self._set_state(activeHomeStatus=("Manual Home" if source == "MANUAL" else "Mission Home"),
+                                    activeHomeCoordinates=coordinates)
+                else:
+                    self._set_state(activeHomeStatus="No active Home", activeHomeCoordinates="Unknown", homeDistanceMeters=None)
+            elif status_key == "HOME_DISTANCE" and status_values:
+                try:
+                    self._set_state(homeDistanceMeters=round(float(status_values[0]), 1))
+                except ValueError:
+                    self._set_state(homeDistanceMeters=None)
             elif status_key == "RECOVERY" and status_values:
                 self._set_state(recoveryStatus=status_values[0])
             elif status_key == "FIRMWARE" and status_values:
@@ -4178,6 +5158,7 @@ class ControlStationBackend(QObject):
                         self._set_state(magnetometerRaw="N/A", magnetometerHeadingDeg=None)
                     else:
                         self._last_mag_raw = (float(x), float(y), float(z))
+                        self._last_mag_raw_at = time.time()
                         if self._mag_calibration_active:
                             if self._mag_calibration_min is None:
                                 self._mag_calibration_min = [x, y, z]
@@ -4194,6 +5175,9 @@ class ControlStationBackend(QObject):
                         heading_deg = (math.degrees(math.atan2(calibrated_y, calibrated_x)) + 360.0) % 360.0
                         updates = {
                             "magnetometerRaw": f"X {x}  |  Y {y}  |  Z {z}",
+                            "magnetometerRawX": x,
+                            "magnetometerRawY": y,
+                            "magnetometerRawZ": z,
                             "magnetometerHeadingDeg": round(heading_deg, 1),
                             "magnetometerCalibrationSamples": self._mag_calibration_samples,
                         }
@@ -4206,7 +5190,14 @@ class ControlStationBackend(QObject):
                         self._refresh_speed_source()
                 else:
                     self._last_mag_raw = None
-                    self._set_state(magnetometerRaw="N/A", magnetometerHeadingDeg=None)
+                    self._last_mag_raw_at = None
+                    self._set_state(
+                        magnetometerRaw="N/A",
+                        magnetometerRawX=None,
+                        magnetometerRawY=None,
+                        magnetometerRawZ=None,
+                        magnetometerHeadingDeg=None,
+                    )
             elif science_key == "MAG_HEADING" and science_values:
                 try:
                     self._set_state(magnetometerHeadingDeg=round(float(science_values[0]), 1),
@@ -4245,10 +5236,23 @@ class ControlStationBackend(QObject):
                         "curve": curve,
                     }
                     calibration["default_reversed"] = default_reversed
+                normalized_motor = motor_name.replace("-", "_")
+                configurations = dict(self._state.get("motorConfigurations", {}))
+                configurations[normalized_motor] = {
+                    "direction": direction,
+                    "start_boost_pwm": start_boost_pwm,
+                    "start_boost_ms": start_boost_ms,
+                    "sustain_min_pwm": sustain_min_pwm,
+                    "max_pwm": max_pwm,
+                    "curve": curve,
+                    "ramp_seconds": ramp_seconds,
+                    "default_reversed": default_reversed,
+                }
                 self._set_state(
                     motorConfigFetchId=int(self._state.get("motorConfigFetchId", 0)) + 1,
                     motorConfigMotor=motor_name,
                     motorConfigDirection=direction,
+                    motorConfigurations=configurations,
                     motorConfigStartBoostPwm=start_boost_pwm,
                     motorConfigStartBoostMs=start_boost_ms,
                     motorConfigSustainMinPwm=sustain_min_pwm,
@@ -4277,6 +5281,10 @@ class ControlStationBackend(QObject):
         error_text = parse_error(response_text)
         if error_text is not None:
             updates = {"lastSendResult": f"ERR {error_text}"}
+            if "MIX" in error_text.upper():
+                updates["mixerCalibrationStatus"] = f"Buoy rejected mixer profile: {error_text}"
+            if "MOTOR CAL" in error_text.upper():
+                updates["motorCalibrationStatus"] = f"Buoy rejected motor settings: {error_text}"
             if error_text.startswith("CONFIG "):
                 updates["magnetometerBuoyConfigStatus"] = f"Buoy rejected calibration config: {error_text}"
             if error_text.startswith("MISSION ") and self._mission_upload_active:
@@ -4344,8 +5352,36 @@ class ControlStationBackend(QObject):
                 return None
             return round(max(0.0, captured_at - last_update) * 1000.0, 1)
 
+        requested_mixer = {
+            "lateral": int(self._state.get("navigationRequestedTurn", 0)),
+            "thrust": int(self._state.get("navigationRequestedThrust", 0)),
+            "yaw": int(self._state.get("navigationRequestedYaw", 0)),
+        }
+        buoy_mixer_input = self._state.get("buoyMixerInput")
+        if isinstance(buoy_mixer_input, dict) and self._last_mixer_input_at is not None and captured_at - self._last_mixer_input_at <= 1.0:
+            requested_mixer = {key: int(buoy_mixer_input.get(key, 0)) for key in ("lateral", "thrust", "yaw")}
+        elif str(self._state.get("controlInputMode", "tx12")) == "tx12":
+            channels = self._state.get("radioChannels", [])
+            if isinstance(channels, list) and len(channels) >= 4:
+                try:
+                    def channel_axis(index: int) -> float:
+                        raw = int(channels[index])
+                        offset = max(-500, min(500, raw - 1500))
+                        return 0.0 if abs(offset) <= 40 else max(-100.0, min(100.0, offset / 5.0))
+                    power = max(0.0, min(100.0, (int(channels[2]) - 1000) / 10.0))
+                    requested_mixer = {
+                        "lateral": int(round(channel_axis(0) * power / 100.0)),
+                        "thrust": int(round(channel_axis(1) * power / 100.0)),
+                        "yaw": int(round(channel_axis(3) * power / 100.0)),
+                    }
+                except (TypeError, ValueError):
+                    pass
+        gps_location = _parse_location_pair(str(self._state.get("currentLocation", "")))
+
         sample = {
             "environment": str(self._state.get("navigationTestEnvironment", "")),
+            "compass_load_capture_phase": self._compass_load_capture_phase or None,
+            "compass_load_capture_setup": dict(self._compass_load_capture_setup),
             "link_status": str(self._state.get("serialStatus", "")),
             "imu": {
                 "sequence": sequence,
@@ -4366,9 +5402,7 @@ class ControlStationBackend(QObject):
             "motion": {
                 "input_mode": str(self._state.get("controlInputMode", "")),
                 "requested_percent": {
-                    "lateral": int(self._state.get("navigationRequestedTurn", 0)),
-                    "thrust": int(self._state.get("navigationRequestedThrust", 0)),
-                    "yaw": int(self._state.get("navigationRequestedYaw", 0)),
+                    **requested_mixer,
                 },
                 "output_percent": {
                     "lateral": int(self._state.get("turn", 0)),
@@ -4402,6 +5436,19 @@ class ControlStationBackend(QObject):
                 "telemetry_age_ms": age_ms(self._last_power_at),
             },
             "navigation": {
+                "magnetometer_raw": {
+                    "x": self._state.get("magnetometerRawX"),
+                    "y": self._state.get("magnetometerRawY"),
+                    "z": self._state.get("magnetometerRawZ"),
+                    "heading_deg": self._state.get("magnetometerHeadingDeg"),
+                    "telemetry_age_ms": age_ms(self._last_mag_raw_at),
+                },
+                "gps": {
+                    "latitude": gps_location[0] if gps_location else None,
+                    "longitude": gps_location[1] if gps_location else None,
+                    "speed_mps": self._state.get("navigationGpsSpeedMps") if self._state.get("navigationGpsSpeedAvailable") else None,
+                    "course_deg": self._state.get("navigationGpsCourseDeg") if self._state.get("navigationGpsCourseAvailable") else None,
+                },
                 "measured_linear_accel_g": {
                     "x": float(self._state.get("navigationMeasuredXG", 0.0)),
                     "y": float(self._state.get("navigationMeasuredYG", 0.0)),
@@ -4416,7 +5463,26 @@ class ControlStationBackend(QObject):
                 "correction_deg": float(self._state.get("navigationCorrectionDeg", 0.0)),
                 "assist_active": bool(self._state.get("navigationAssistActive", False)),
             },
+            "propulsion_load": {
+                "battery_voltage_v": self._latest_power.get("battery_voltage_v"),
+                "total_current_a": self._latest_power.get("current_a"),
+                "power_telemetry_age_ms": age_ms(self._last_power_at),
+            },
         }
+        if self._compass_load_capture_phase:
+            captured_fields = {
+                "mag_x": self._state.get("magnetometerRawX"),
+                "mag_y": self._state.get("magnetometerRawY"),
+                "mag_z": self._state.get("magnetometerRawZ"),
+                "heading_deg": self._state.get("magnetometerHeadingDeg"),
+                "current_a": self._latest_power.get("current_a"),
+                "gyro_x_dps": gx_dps,
+                "gyro_y_dps": gy_dps,
+                "gyro_z_dps": gz_dps,
+            }
+            for key, value in captured_fields.items():
+                if value is not None and (not key.startswith("mag_") and key != "heading_deg" or age_ms(self._last_mag_raw_at) is not None and age_ms(self._last_mag_raw_at) <= 1000.0):
+                    self._compass_load_capture_values.setdefault(key, []).append(float(value))
         try:
             session.write_sample(sample, captured_at)
         except (OSError, ValueError) as exc:
@@ -4450,7 +5516,7 @@ class ControlStationBackend(QObject):
             if received - 1 - quality.restart_count > 0 and elapsed_ms > 0
             else 0.0
         )
-        return {
+        summary: dict[str, object] = {
             "imu_stream": {
                 "target_hz": 20.0,
                 "received": received,
@@ -4463,6 +5529,20 @@ class ControlStationBackend(QObject):
                 "elapsed_firmware_ms": elapsed_ms,
             }
         }
+        if self._compass_load_capture_phase:
+            fields = self._compass_load_capture_values
+            means = {
+                key: round(sum(values) / len(values), 4) if values else None
+                for key, values in fields.items()
+            }
+            summary["compass_motor_load"] = {
+                "phase": self._compass_load_capture_phase,
+                "setup": dict(self._compass_load_capture_setup),
+                "valid_mag_samples": min(len(fields.get("mag_x", [])), len(fields.get("mag_y", [])), len(fields.get("mag_z", []))),
+                "means": means,
+                "mean_current_a": means["current_a"],
+            }
+        return summary
 
     def _process_binary_telemetry(self) -> None:
         packets = read_telemetry_packets(self._transport)
@@ -4716,6 +5796,15 @@ class ControlStationBackend(QObject):
 
     def _tick(self) -> None:
         tick_at = time.monotonic()
+        wifi_connected = (self._transport is not None and self._transport.is_open
+                          and str(self._state.get("serialTarget", "")).startswith("WIFI:"))
+        self._set_state(
+            wifiSafetyTelemetryLive=bool(wifi_connected and self._wifi_safety_last_at > 0
+                                         and tick_at - self._wifi_safety_last_at <= 5.0),
+            wifiDetailTelemetryLive=bool(wifi_connected and self._wifi_detail_last_at > 0
+                                         and self._state.get("telemetryMode") == "WIFI"
+                                         and tick_at - self._wifi_detail_last_at <= 5.0),
+        )
         if self._last_tick_at and tick_at - self._last_tick_at > 0.25:
             stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             gap_ms = int((tick_at - self._last_tick_at) * 1000)
@@ -4810,7 +5899,8 @@ def run(args: argparse.Namespace) -> None:
     QtWebEngineQuick.initialize()
     app = QGuiApplication(sys.argv)
 
-    app_dir = Path(__file__).resolve().parent.parent
+    app_dir = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+               else Path(__file__).resolve().parent.parent)
     log_dir = app_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     mission_dir = app_dir / "missions"

@@ -1,5 +1,5 @@
 import QtQuick
-import QtQuick.Controls
+import QtQuick.Controls.Basic
 import QtQuick.Dialogs
 import QtQuick.Layouts
 
@@ -10,6 +10,28 @@ Item {
     property string pendingSessionPath: ""
     property string deleteSessionPath: ""
     property string selectedSessionPath: ""
+
+    function wifiConnected() {
+        return backendObject
+            && String(backendObject.state.serialStatus || "").startsWith("Connected")
+            && String(backendObject.state.serialTarget || "").startsWith("WIFI:")
+    }
+
+    function canManageSessions() {
+        return backendObject && !backendObject.sdBusy && wifiConnected()
+            && backendObject.state.scienceExperimentState === "IDLE"
+    }
+
+    function sessionActionHint() {
+        if (!backendObject) return "Connect to the buoy over Wi-Fi to manage SD sessions."
+        if (backendObject.sdBusy) return "An SD card operation is already in progress."
+        if (!wifiConnected()) return "Connect to the buoy over Wi-Fi to manage SD sessions."
+        const state = String(backendObject.state.scienceExperimentState || "UNKNOWN")
+        if (state === "RECORDING") return "Save and close the active session before downloading or deleting sessions."
+        if (state === "STOPPED") return "Save the stopped session before downloading or deleting sessions."
+        if (state !== "IDLE") return "Session state is unknown. Refresh the connection status over buoy Wi-Fi."
+        return "Session downloads and deletion are ready."
+    }
 
     function formatBytes(value) {
         const bytes = Number(value) || 0
@@ -32,7 +54,18 @@ Item {
 
     function sessionDate(name) {
         const match = /(?:^session\d+-|^session-)(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z/i.exec(String(name))
+        if (match && match[1] === "0000") return "UTC unavailable · radio start"
         return match ? match[1] + "-" + match[2] + "-" + match[3] + "  " + match[4] + ":" + match[5] + ":" + match[6] + " UTC" : "Date unavailable for this older session"
+    }
+
+    function sessionProvenance(session) {
+        const origin = String(session.sessionOrigin || "unknown").toLowerCase()
+        const missionId = String(session.missionId || "NONE")
+        if (origin === "mission_auto" && missionId !== "NONE") {
+            return "MISSION SESSION | " + missionId
+        }
+        if (origin === "manual") return "MANUAL SESSION | no mission reference"
+        return "ORIGIN UNKNOWN | session predates provenance metadata"
     }
 
     function formatDuration(seconds) {
@@ -60,6 +93,13 @@ Item {
         title: "Choose where to download this session"
         currentFolder: backendObject ? backendObject.sdDownloadFolderUrl : ""
         onAccepted: if (backendObject) backendObject.downloadSdSessionFromUrl(root.pendingSessionPath, selectedFolder)
+    }
+
+    FolderDialog {
+        id: logsFolderDialog
+        title: "Choose where to save standalone Buoy logs"
+        currentFolder: backendObject ? backendObject.sdDownloadFolderUrl : ""
+        onAccepted: if (backendObject) backendObject.downloadSdLogsFromUrl(selectedFolder)
     }
 
     Dialog {
@@ -115,6 +155,13 @@ Item {
                     Layout.fillWidth: true
                 }
                 Button {
+                    text: "Download Buoy logs"
+                    enabled: root.canManageSessions()
+                    onClicked: logsFolderDialog.open()
+                    palette.buttonText: "#f0f5f9"
+                    background: Rectangle { radius: 6; color: parent.enabled ? "#1b3448" : "#17232e"; border.color: "#55748d" }
+                }
+                Button {
                     text: backendObject && backendObject.sdBusy ? "Working..." : "Refresh card"
                     enabled: backendObject && !backendObject.sdBusy
                     onClicked: if (backendObject) backendObject.refreshSdFiles()
@@ -137,6 +184,14 @@ Item {
                     Layout.fillWidth: true
                     elide: Text.ElideMiddle
                 }
+            }
+
+            Text {
+                Layout.fillWidth: true
+                text: root.sessionActionHint()
+                color: root.canManageSessions() ? "#75d9a7" : "#e8b968"
+                font.pixelSize: 10
+                wrapMode: Text.WordWrap
             }
 
             ProgressBar {
@@ -276,7 +331,7 @@ Item {
                                         spacing: 5
                                         RowLayout {
                                             width: sessionColumn.width
-                                            height: 56
+                                            height: 68
                                             spacing: 8
                                             Rectangle {
                                                 Layout.fillWidth: true
@@ -295,6 +350,13 @@ Item {
                                                         spacing: 1
                                                         Text { text: root.sessionTitle(modelData.name); color: "#e6ecf2"; font.bold: true; font.pixelSize: 14 }
                                                         Text { text: root.sessionDate(modelData.name); color: "#9eb5c7"; font.pixelSize: 11 }
+                                                        Text {
+                                                            text: root.sessionProvenance(modelData)
+                                                            color: String(modelData.sessionOrigin || "").toLowerCase() === "mission_auto" ? "#75d9a7" : "#9eb5c7"
+                                                            font.pixelSize: 10
+                                                            elide: Text.ElideMiddle
+                                                            Layout.fillWidth: true
+                                                        }
                                                     }
                                                     Text {
                                                         text: backendObject && backendObject.state.scienceSessionPath === modelData.path && backendObject.state.scienceExperimentState !== "IDLE" ? "Size after save" : root.formatBytes(modelData.size)
@@ -313,14 +375,14 @@ Item {
                                             }
                                             Button {
                                                 text: "Download session"
-                                                enabled: backendObject && !backendObject.sdBusy && backendObject.state.scienceExperimentState === "IDLE"
+                                                enabled: root.canManageSessions()
                                                 onClicked: { root.pendingSessionPath = modelData.path; sessionFolderDialog.open() }
                                                 palette.buttonText: "#f0f5f9"
                                                 background: Rectangle { radius: 5; color: parent.enabled ? "#1b3448" : "#17232e"; border.color: "#55748d" }
                                             }
                                             Button {
                                                 text: "Delete"
-                                                enabled: backendObject && !backendObject.sdBusy && backendObject.state.scienceExperimentState === "IDLE"
+                                                enabled: root.canManageSessions()
                                                 onClicked: {
                                                     root.deleteSessionPath = modelData.path
                                                     deleteSessionDialog.open()
@@ -353,7 +415,7 @@ Item {
                                                     }
                                                     Button {
                                                         text: "Download"
-                                                        enabled: backendObject && !backendObject.sdBusy && backendObject.state.scienceExperimentState === "IDLE"
+                                                        enabled: root.canManageSessions()
                                                         onClicked: {
                                                             root.pendingRemotePath = modelData.path
                                                             backendObject.prepareSdDownload(modelData.path)

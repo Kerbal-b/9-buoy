@@ -1,5 +1,5 @@
 import QtQuick
-import QtQuick.Controls
+import QtQuick.Controls.Basic
 import QtQuick.Layouts
 import QtWebEngine
 import QtWebChannel
@@ -9,7 +9,7 @@ Item {
     property var backendObject
     property var backendState: ({})
     property var plan: backendState.missionPreviewPlan || ({})
-    property var missionRun: backendState.missionProgress || null
+    property var missionRun: backendState.missionProgress || backendState.radioMissionProgress || null
     property bool webMapReady: false
     property bool initialBuoyCenterDone: false
     property string observedBuoyMissionId: ""
@@ -41,6 +41,45 @@ Item {
         const missions = backendState.buoyMissionList || []
         return missions.length ? missions[0] : null
     }
+    function missionHomeSummary() {
+        const loadedId = String(backendState.buoyMissionLoadedId || "NONE")
+        const home = backendState.buoyMissionHome
+        if (loadedId.toUpperCase() === "NONE" && backendState.transportMode !== "wifi")
+            return "MISSION HOME  |  Wi-Fi readback unavailable"
+        if (loadedId.toUpperCase() === "NONE") return "MISSION HOME  |  NO MISSION LOADED"
+        if (home && Number.isFinite(Number(home.lat)) && Number.isFinite(Number(home.lon)))
+            return "MISSION HOME SET  |  " + Number(home.lat).toFixed(6) + ", " + Number(home.lon).toFixed(6)
+        return backendState.buoyMissionScanComplete ? "MISSION HOME  |  NOT REPORTED" : "MISSION HOME  |  READING FROM BUOY"
+    }
+    function missionHomeColor() {
+        const home = backendState.buoyMissionHome
+        if (home && Number.isFinite(Number(home.lat)) && Number.isFinite(Number(home.lon))) return "#58d7a5"
+        return "#f1bd68"
+    }
+    function missionProgressSummary() {
+        const run = root.missionRun
+        if (backendState.missionStartBlockReason)
+            return "START BLOCKED  |  " + backendState.missionStartBlockReason
+        if (!run) return String(backendState.buoyMissionLoadedId || "NONE").toUpperCase() === "NONE"
+            ? "Upload a mission to begin"
+            : "Select Mission on SB, then arm with SE"
+        const status = String(run.status || "RUNNING").split("_").join(" ")
+        const blockReason = String(backendState.missionStartBlockReason || run.block_reason || "")
+        if (status === "BLOCKED") return blockReason ? "START BLOCKED  |  " + blockReason : "START BLOCKED  |  Check buoy interlocks"
+        const completed = Number(run.completed_waypoints || 0)
+        const count = Number(run.waypoint_count || 0)
+        const percent = Number(run.percent_complete)
+        const waypoint = Number(run.current_waypoint_index)
+        const distance = Number(run.distance_from_home_m)
+        if (run.percent_complete !== undefined && run.current_waypoint_index !== undefined) {
+            const progressText = Number.isFinite(percent) ? `  |  ${percent}%` : ""
+            const waypointText = Number.isFinite(waypoint) ? `  |  WP ${waypoint + 1}` : ""
+            const distanceText = Number.isFinite(distance) ? `  |  ${distance.toFixed(1)} m home` : ""
+            return status + progressText + waypointText + distanceText
+        }
+        const distanceText = distance >= 0 ? "  |  " + distance.toFixed(1) + " m to Home" : ""
+        return status + "  |  " + completed + "/" + count + " points" + distanceText
+    }
     function currentBuoyRoute() {
         const loadedId = String(backendState.buoyMissionLoadedId || "NONE").toLowerCase()
         const pointsId = String(backendState.buoyMissionPointsId || "NONE").toLowerCase()
@@ -71,6 +110,16 @@ Item {
             const action = String(progress.current_action || progress.action || progress.status || "").toLowerCase()
             let now = String(progress.current_action || progress.action || progress.status || "Mission active")
             let next = String(progress.next_action || "Awaiting the next mission status update")
+            if (action.includes("blocked")) {
+                now = "Mission start blocked"
+                next = String(backendState.missionStartBlockReason || progress.block_reason || "Check the buoy start interlocks")
+            } else if (action.includes("returning_home")) {
+                now = "Returning Home"
+                next = "Following the buoy's configured safe return path"
+            } else if (action.includes("stopped")) {
+                now = "Mission stopped"
+                next = String(progress.reason || "Buoy propulsion is stopped")
+            }
             if (action.includes("travel") || action.includes("moving") || action.includes("transit")) {
                 now = point ? "Traveling to point " + (index + 1) : "Traveling to the next point"
                 if (!progress.next_action) next = point && requested.length
@@ -85,9 +134,8 @@ Item {
             return {action: now, next_action: next}
         }
         const missionStatus = String(backendState.radioMissionStatus || "").toLowerCase()
-        if (missionStatus.includes("guidance unavailable")) {
-            return {action: "Waiting · mission guidance unavailable",
-                    next_action: "The current firmware cannot execute mission points"}
+        if (missionStatus.includes("blocked")) {
+            return {action: "Mission start blocked", next_action: backendState.missionStartBlockReason || "Check buoy interlocks"}
         }
         if (String(backendState.scienceExperimentState || "").toUpperCase() === "RECORDING") {
             return {action: "Taking measurements · recording session",
@@ -204,14 +252,14 @@ Item {
         spacing: 5
         Rectangle {
             Layout.fillWidth: true
-            Layout.preferredHeight: 104
+            Layout.preferredHeight: 108
             radius: 8
             color: "#111b27"
             border.color: "#395166"
             RowLayout {
                 anchors.fill: parent
-                anchors.margins: 5
-                spacing: 6
+                anchors.margins: 8
+                spacing: 10
 
                 Rectangle {
                     Layout.fillWidth: true
@@ -225,22 +273,64 @@ Item {
                         spacing: 7
                         ColumnLayout {
                             Layout.fillWidth: true
-                            spacing: 1
-                            Text { text: "MISSION ON BUOY"; color: "#7f99ad"; font.pixelSize: 9; font.bold: true }
+                            Layout.fillHeight: true
+                            Layout.alignment: Qt.AlignTop
+                            spacing: 2
                             Text {
                                 Layout.fillWidth: true
-                                text: String(backendState.buoyMissionLoadedId || "NONE") === "NONE"
-                                    ? "No mission on buoy" : root.buoyMissionTitle(backendState.buoyMissionLoadedId)
+                                text: "MISSION: " + (String(backendState.buoyMissionLoadedId || "NONE") === "NONE"
+                                    ? (backendState.radioMissionProgress
+                                        ? "Live telemetry (mission ID needs Wi-Fi)"
+                                        : (backendState.transportMode === "wifi" ? "No mission loaded" : "Status via Backpack"))
+                                    : root.buoyMissionTitle(backendState.buoyMissionLoadedId))
                                 color: root.ink
-                                font.pixelSize: 13
+                                font.pixelSize: 11
                                 font.bold: true
                                 elide: Text.ElideRight
                             }
+                            Text {
+                                Layout.fillWidth: true
+                                text: root.missionHomeSummary()
+                                color: root.missionHomeColor()
+                                font.pixelSize: 9
+                                font.bold: true
+                                elide: Text.ElideRight
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: "MISSION PROGRESSION"
+                                color: "#7f99ad"
+                                font.pixelSize: 8
+                                font.bold: true
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: root.missionProgressSummary()
+                                color: String(root.missionRun && root.missionRun.status || "").includes("BLOCKED")
+                                    ? "#ff8c8c" : (String(root.missionRun && root.missionRun.status || "").includes("RETURNING_HOME")
+                                        ? "#58d7a5" : root.ink)
+                                font.pixelSize: 11
+                                font.bold: true
+                                wrapMode: Text.WordWrap
+                                maximumLineCount: 2
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: backendState.transportMode === "wifi"
+                                    ? "Commands use buoy Wi-Fi; Backpack is telemetry only"
+                                    : "Backpack is telemetry only - Wi-Fi required for web commands"
+                                color: "#f1bd68"
+                                font.pixelSize: 8
+                                elide: Text.ElideRight
+                            }
                         }
-                        ColumnLayout {
-                            Layout.preferredWidth: 122
-                            Layout.fillHeight: true
-                            spacing: 3
+                        GridLayout {
+                            Layout.preferredWidth: 150
+                            Layout.preferredHeight: 62
+                            Layout.alignment: Qt.AlignTop
+                            columns: 1
+                            columnSpacing: 6
+                            rowSpacing: 4
                         MissionButton {
                             text: backendState.missionUploadPending ? "Uploading…" : "Upload mission"
                             enabled: !backendState.missionUploadPending
@@ -249,8 +339,9 @@ Item {
                                 && String(backendState.serialStatus || "").indexOf("Connected") === 0
                             onClicked: { root.uploadWasStarted = false; uploadMissionDialog.open() }
                             Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            font.pixelSize: 12
+                            Layout.preferredHeight: 28
+                            Layout.maximumHeight: 28
+                            font.pixelSize: 10
                             palette.buttonText: "#e6ecf2"
                             background: Rectangle {
                                 radius: 5
@@ -272,8 +363,9 @@ Item {
                                 deleteBuoyMissionDialog.open()
                             }
                             Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            font.pixelSize: 12
+                            Layout.preferredHeight: 28
+                            Layout.maximumHeight: 28
+                            font.pixelSize: 10
                             palette.buttonText: "#ffffff"
                             background: Rectangle {
                                 radius: 5

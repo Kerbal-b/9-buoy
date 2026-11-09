@@ -44,7 +44,7 @@ Item {
     }
     function compassStatus() {
         if (!headingAvailable) return "No magnetometer reading"
-        if (!tiltHeadingAvailable) return "Calibrate the waterline for tilt correction"
+        if (!tiltHeadingAvailable) return "Set hull level in the attitude instrument for tilt correction"
         return backendState.magnetometerTiltStatus || "Tilt correction active"
     }
     function headingDifference() {
@@ -102,6 +102,32 @@ Item {
                     text: backendState.imuStreamEnabled ? "Stop IMU stream" : "Start IMU stream"
                     enabled: root.connected()
                     onClicked: if (backendObject) backendObject.setImuStreamEnabled(!backendState.imuStreamEnabled)
+                }
+            }
+
+            RowLayout {
+                width: parent.width
+                spacing: 10
+                Text {
+                    Layout.fillWidth: true
+                    text: backendState.testSessionActive
+                        ? "TEST LOG  ·  " + Number(backendState.testSessionSampleCount || 0) + " samples  ·  "
+                            + Number(backendState.testSessionImuRateHz || 0).toFixed(1) + " Hz  ·  "
+                            + Number(backendState.testSessionImuLossPercent || 0).toFixed(1) + "% loss"
+                        : (backendState.testSessionStatus || "Test log ready")
+                    color: backendState.testSessionActive ? root.green : root.muted
+                    font.pixelSize: 10
+                    elide: Text.ElideRight
+                }
+                ActionButton {
+                    text: backendState.testSessionActive ? "Stop test log" : "Record test log"
+                    primary: !backendState.testSessionActive
+                    enabled: root.connected() && (backendState.testSessionActive || backendState.imuStreamEnabled)
+                    onClicked: {
+                        if (!backendObject) return
+                        if (backendState.testSessionActive) backendObject.stopTestSession()
+                        else backendObject.startTestSession()
+                    }
                 }
             }
 
@@ -259,7 +285,7 @@ Item {
 
                 Rectangle {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 362
+                    Layout.preferredHeight: 390
                     radius: 16
                     color: root.card
                     border.color: root.edge
@@ -301,6 +327,11 @@ Item {
                                     c.strokeStyle = "#ffd07c"; c.lineWidth = 3
                                     c.beginPath(); c.moveTo(cx - 55, cy); c.lineTo(cx - 17, cy); c.moveTo(cx + 17, cy); c.lineTo(cx + 55, cy); c.moveTo(cx, cy - 8); c.lineTo(cx, cy + 10); c.stroke()
                                     c.fillStyle = "#ffd07c"; c.beginPath(); c.arc(cx, cy, 3, 0, Math.PI * 2); c.fill()
+                                    // Keep live hull tilt visible in the horizon instrument itself.
+                                    c.fillStyle = "#e7f4f7"; c.font = "bold 10px sans-serif"; c.textAlign = "left"
+                                    c.fillText("R " + (root.imuAvailable ? Number(backendState.navigationRollDeg || 0).toFixed(1) + "°" : "—"), cx - r + 10, cy - r + 17)
+                                    c.textAlign = "right"
+                                    c.fillText("P " + (root.imuAvailable ? Number(backendState.navigationPitchDeg || 0).toFixed(1) + "°" : "—"), cx + r - 10, cy - r + 17)
                                 }
                             }
                         }
@@ -320,6 +351,15 @@ Item {
                             }
                         }
                         Text { text: root.imuAvailable ? "Linear acceleration   X " + root.number(backendState.navigationMeasuredXG, 3) + " g   ·   Y " + root.number(backendState.navigationMeasuredYG, 3) + " g" : "Waiting for IMU stream"; color: root.muted; font.pixelSize: 10; elide: Text.ElideRight; width: parent.width }
+                        RowLayout {
+                            width: parent.width; spacing: 8
+                            Text {
+                                Layout.fillWidth: true
+                                text: "Motion · 5 s   " + (backendState.navigationSeaAccelerationRmsG === undefined || backendState.navigationSeaAccelerationRmsG === null ? "—" : Number(backendState.navigationSeaAccelerationRmsG).toFixed(3) + " g") + " accel RMS   ·   " + (backendState.navigationSeaAngularRateRmsDps === undefined || backendState.navigationSeaAngularRateRmsDps === null ? "—" : Number(backendState.navigationSeaAngularRateRmsDps).toFixed(1) + " °/s") + " rotation RMS"
+                                color: root.blue; font.pixelSize: 9; elide: Text.ElideRight
+                            }
+                            ActionButton { text: backendState.navigationLevelCalibrated ? "Set level again" : "Set level"; enabled: root.imuAvailable; onClicked: if (backendObject) backendObject.calibrateNavigationLevel() }
+                        }
                     }
                 }
             }
@@ -340,35 +380,60 @@ Item {
             GridLayout {
                 width: parent.width; columns: width >= 760 ? 2 : 1; columnSpacing: 12; rowSpacing: 12
                 Rectangle {
-                    Layout.fillWidth: true; Layout.preferredHeight: 162; radius: 14; color: root.card; border.color: root.edge
-                    Column {
-                        anchors.fill: parent; anchors.margins: 16; spacing: 8
-                        Text { text: "WATERLINE LEVEL"; color: root.amber; font.pixelSize: 11; font.bold: true; font.letterSpacing: 1 }
-                        Text { width: parent.width; wrapMode: Text.WordWrap; text: "Float the buoy in its normal orientation with propulsion stopped, then set the IMU's zero level."; color: root.muted; font.pixelSize: 11 }
+                    Layout.fillWidth: true; Layout.preferredHeight: 340; radius: 14; color: root.card; border.color: root.edge
+                    ColumnLayout {
+                        anchors.fill: parent; anchors.margins: 14; spacing: 6
                         RowLayout {
-                            width: parent.width; spacing: 10
-                            ActionButton { text: backendState.navigationLevelCalibrated ? "Recalibrate level" : "Set level"; primary: true; enabled: root.imuAvailable; onClicked: if (backendObject) backendObject.calibrateNavigationLevel() }
-                            Text { text: backendState.navigationLevelCalibrated ? "LEVEL SAVED" : "LEVEL NEEDED"; color: backendState.navigationLevelCalibrated ? root.green : root.amber; font.pixelSize: 10; font.bold: true }
+                            Layout.fillWidth: true
+                            Text { text: "MAGNETOMETER CALIBRATION"; color: root.cyan; font.pixelSize: 11; font.bold: true; font.letterSpacing: 1; Layout.fillWidth: true }
+                            ComboBox {
+                                model: ["Dryland", "Tethered water"]
+                                currentIndex: String(backendState.navigationTestEnvironment || "dry") === "water" ? 1 : 0
+                                onActivated: function(index) { if (backendObject) backendObject.setNavigationTestEnvironment(index === 0 ? "dry" : "water") }
+                            }
                         }
-                        Text { text: backendState.navigationLevelCalibrationStatus || "Waiting for IMU"; color: root.muted; font.pixelSize: 10; elide: Text.ElideRight; width: parent.width }
-                    }
-                }
-                Rectangle {
-                    Layout.fillWidth: true; Layout.preferredHeight: 162; radius: 14; color: root.card; border.color: root.edge
-                    Column {
-                        anchors.fill: parent; anchors.margins: 16; spacing: 7
-                        Text { text: "MAGNETOMETER CALIBRATION"; color: root.cyan; font.pixelSize: 11; font.bold: true; font.letterSpacing: 1 }
-                        Text { width: parent.width; wrapMode: Text.WordWrap; text: "Rotate the level buoy through full turns. Save on the station, then upload to the buoy SD card."; color: root.muted; font.pixelSize: 11 }
+                        Text { Layout.fillWidth: true; wrapMode: Text.WordWrap; text: "Base calibration (motors off): rotate the level buoy through full turns, then save and upload the hard/soft-iron calibration."; color: root.muted; font.pixelSize: 10 }
                         Flow {
-                            width: parent.width; spacing: 6
-                            ActionButton { text: backendState.magnetometerCalibrationActive ? "Capturing…" : "Start"; primary: true; enabled: !backendState.magnetometerCalibrationActive; onClicked: if (backendObject) backendObject.startMagnetometerCalibration() }
+                            Layout.fillWidth: true; spacing: 5
+                            ActionButton { text: backendState.magnetometerCalibrationActive ? "Capturing…" : "Start base"; primary: true; enabled: !backendState.magnetometerCalibrationActive && !backendState.testSessionActive; onClicked: if (backendObject) backendObject.startMagnetometerCalibration() }
                             ActionButton { text: "Finish & save"; enabled: Boolean(backendState.magnetometerCalibrationActive) && Number(backendState.magnetometerCalibrationSamples || 0) >= 20; onClicked: if (backendObject) backendObject.finishMagnetometerCalibration() }
+                            ActionButton { text: "Upload base"; enabled: Boolean(backendState.magnetometerCalibrationSaved) && root.connected(); onClicked: if (backendObject) backendObject.uploadMagnetometerCalibration() }
                             ActionButton { text: "Cancel"; enabled: Boolean(backendState.magnetometerCalibrationActive); onClicked: if (backendObject) backendObject.cancelMagnetometerCalibration() }
-                            ActionButton { text: "Upload to buoy"; enabled: Boolean(backendState.magnetometerCalibrationSaved) && root.connected(); onClicked: if (backendObject) backendObject.uploadMagnetometerCalibration() }
-                            ActionButton { text: "Clear"; destructive: true; enabled: Boolean(backendState.magnetometerCalibrationSaved) && !backendState.magnetometerCalibrationActive; onClicked: if (backendObject) backendObject.resetMagnetometerCalibration() }
                         }
-                        Text { text: (backendState.magnetometerCalibrationStatus || "No saved calibration") + (backendState.magnetometerCalibrationActive ? " · " + Number(backendState.magnetometerCalibrationSamples || 0) + " samples" : ""); color: root.muted; font.pixelSize: 10; elide: Text.ElideRight; width: parent.width }
-                        Text { text: "Buoy: " + (backendState.magnetometerBuoyConfigStatus || "Not checked"); color: root.muted; font.pixelSize: 10; elide: Text.ElideRight; width: parent.width }
+                        Text { Layout.fillWidth: true; text: (backendState.magnetometerCalibrationStatus || "No saved base calibration") + (backendState.magnetometerCalibrationActive ? " · " + Number(backendState.magnetometerCalibrationSamples || 0) + " samples" : "") + " · Buoy: " + (backendState.magnetometerBuoyConfigStatus || "not checked"); color: root.muted; font.pixelSize: 9; elide: Text.ElideRight }
+                        Rectangle { Layout.fillWidth: true; height: 1; color: root.edge }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Text { text: "MOTOR CORRECTION · WATER ONLY"; color: root.amber; font.pixelSize: 10; font.bold: true; Layout.fillWidth: true }
+                            ComboBox {
+                                model: ["Motors-off baseline", "Motor load"]
+                                id: compassCaptureType
+                            }
+                            ComboBox { id: compassMotor; model: ["Rear", "Front left", "Front right"]; enabled: compassCaptureType.currentIndex === 1 }
+                            ComboBox { id: compassDirection; model: ["Forward", "Reverse"]; enabled: compassCaptureType.currentIndex === 1 }
+                            SpinBox { id: compassPower; from: 10; to: 100; stepSize: 10; value: 20; editable: true; enabled: compassCaptureType.currentIndex === 1; Layout.preferredWidth: 88 }
+                        }
+                        Text { Layout.fillWidth: true; wrapMode: Text.WordWrap; text: "Keep the buoy at the same heading and as still as possible. Capture a motors-off baseline, then use the transmitter to run one motor at a time at the selected load while recording. The panel logs actual motor outputs, current, raw field and gyro; it does not command the motors."; color: root.muted; font.pixelSize: 9 }
+                        RowLayout {
+                            Layout.fillWidth: true; spacing: 6
+                            ActionButton {
+                                text: backendState.testSessionActive ? "Capture running…" : (compassCaptureType.currentIndex === 0 ? "Capture baseline" : "Capture motor load")
+                                primary: true
+                                enabled: root.connected() && backendState.imuStreamEnabled && backendState.navigationTestEnvironment === "water" && !backendState.testSessionActive
+                                onClicked: if (backendObject) backendObject.startCompassLoadCapture(compassCaptureType.currentIndex === 0 ? "motors_off_baseline" : "motor_load", compassCaptureType.currentIndex === 0 ? "none" : ["rear", "front_left", "front_right"][compassMotor.currentIndex], compassCaptureType.currentIndex === 0 ? "none" : (compassDirection.currentIndex === 0 ? "forward" : "reverse"), compassCaptureType.currentIndex === 0 ? 0 : compassPower.value)
+                            }
+                            ActionButton { text: "Stop & save"; enabled: backendState.testSessionActive && Boolean(backendState.compassLoadCapturePhase); onClicked: if (backendObject) backendObject.stopTestSession() }
+                            Text { Layout.fillWidth: true; text: backendState.compassLoadCaptureStatus || "Start IMU stream and select water"; color: root.muted; font.pixelSize: 9; elide: Text.ElideRight }
+                        }
+                        Text { text: "Field " + (backendState.magnetometerRaw || "waiting") + "   ·   Current " + (backendState.currentDraw || "—") + "   ·   Gyro Z " + Number(backendState.navigationMeasuredYawDps || 0).toFixed(1) + " °/s"; color: root.ink; font.pixelSize: 9; elide: Text.ElideRight; Layout.fillWidth: true }
+                        Text { text: backendState.compassLoadBaselineStatus || "No water baseline saved"; color: root.muted; font.pixelSize: 9; elide: Text.ElideRight; Layout.fillWidth: true }
+                        Text {
+                            Layout.fillWidth: true; elide: Text.ElideRight
+                            text: backendState.compassLoadLastSummary && backendState.compassLoadLastSummary.delta_from_baseline
+                                ? "Last load Δ raw field   X " + Number(backendState.compassLoadLastSummary.delta_from_baseline.mag_x).toFixed(1) + "   Y " + Number(backendState.compassLoadLastSummary.delta_from_baseline.mag_y).toFixed(1) + "   Z " + Number(backendState.compassLoadLastSummary.delta_from_baseline.mag_z).toFixed(1) + "   Heading " + Number(backendState.compassLoadLastSummary.delta_from_baseline.heading_deg || 0).toFixed(1) + "°"
+                                : "Last load capture will show its field change here after a matching baseline"
+                            color: root.blue; font.pixelSize: 9
+                        }
                     }
                 }
             }

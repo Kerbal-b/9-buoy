@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import socket
 import time
-from pathlib import Path
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 from typing import Callable
 
 
@@ -22,6 +25,19 @@ def _connect(host: str, local_ip: str | None, timeout: float) -> socket.socket:
 
 def list_sd_files(host: str, local_ip: str | None = None) -> dict[str, object]:
     return _list_sd_directory(host, "/", local_ip)
+
+
+def list_sd_directory(host: str, directory: str, local_ip: str | None = None) -> dict[str, object]:
+    if (
+        not directory.startswith("/")
+        or ".." in directory
+        or "\\" in directory
+        or "|" in directory
+        or "\n" in directory
+        or "\r" in directory
+    ):
+        raise ValueError("Invalid SD directory path")
+    return _list_sd_directory(host, directory, local_ip)
 
 
 def list_sd_session(host: str, session_path: str, local_ip: str | None = None) -> dict[str, object]:
@@ -100,7 +116,15 @@ def _list_sd_directory(host: str, directory: str, local_ip: str | None) -> dict[
             if fields[0] == "FILE" and len(fields) >= 4:
                 entries.append({"path": fields[1], "name": fields[2], "size": int(fields[3]), "isDirectory": False})
             elif fields[0] == "DIR" and len(fields) >= 3:
-                entries.append({"path": fields[1], "name": fields[2], "size": int(fields[3]) if len(fields) >= 4 else 0, "isDirectory": True})
+                entries.append({
+                    "path": fields[1],
+                    "name": fields[2],
+                    "size": int(fields[3]) if len(fields) >= 4 else 0,
+                    "isDirectory": True,
+                    "sessionOrigin": fields[4] if len(fields) >= 5 else "unknown",
+                    "missionId": fields[5] if len(fields) >= 6 else "NONE",
+                    "missionRunId": fields[6] if len(fields) >= 7 else "NONE",
+                })
     return {"files": entries, "capacity": capacity}
 
 
@@ -223,3 +247,113 @@ def download_sd_session(
         progress(total, total, "Complete")
     incomplete.unlink()
     return target
+
+
+def list_sd_log_files(host: str, local_ip: str | None = None) -> list[dict[str, object]]:
+    """Recursively inventory files under the reserved standalone /logs tree."""
+    root = "/logs"
+    pending = [root]
+    visited: set[str] = set()
+    files: list[dict[str, object]] = []
+    while pending:
+        directory = pending.pop(0)
+        if directory in visited:
+            continue
+        visited.add(directory)
+        listing = list_sd_directory(host, directory, local_ip)
+        for entry in listing["files"]:
+            entry_path = str(entry.get("path", ""))
+            if not entry_path.startswith(root + "/"):
+                raise RuntimeError(f"SD log entry escaped {root}: {entry_path}")
+            if entry.get("isDirectory"):
+                pending.append(entry_path)
+            else:
+                files.append(entry)
+    return files
+
+
+def download_sd_logs(
+    host: str,
+    destination_parent: str,
+    local_ip: str | None = None,
+    progress: Callable[[int, int, str], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> Path:
+    """Download every file under the Buoy's standalone /logs directory."""
+    if cancelled and cancelled():
+        raise RuntimeError("Download cancelled")
+
+    root = "/logs"
+    files = list_sd_log_files(host, local_ip)
+
+    total = sum(int(entry["size"]) for entry in files)
+    parent = Path(destination_parent)
+    parent.mkdir(parents=True, exist_ok=True)
+    target = parent / "buoy-logs"
+    suffix = 2
+    while target.exists():
+        target = parent / f"buoy-logs-{suffix}"
+        suffix += 1
+    target.mkdir()
+    incomplete = target / ".download-incomplete"
+    incomplete.write_text("This Buoy log download was interrupted.\n", encoding="utf-8")
+    completed = 0
+    downloaded: list[dict[str, object]] = []
+    if progress:
+        progress(0, total, "Starting Buoy log download")
+    try:
+        for entry in files:
+            if cancelled and cancelled():
+                raise RuntimeError("Download cancelled")
+            remote_path = str(entry["path"])
+            relative = remote_path[len(root) + 1 :]
+            parts = PurePosixPath(relative).parts
+            if not parts or any(
+                part in {"", ".", ".."} or any(char in part for char in '<>:"|?*\\\x00')
+                for part in parts
+            ):
+                raise RuntimeError(f"Invalid path in Buoy log listing: {remote_path}")
+            local_path = target.joinpath(*parts)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            offset = completed
+            name = str(entry.get("name") or parts[-1])
+            download_sd_file(
+                host,
+                remote_path,
+                str(local_path),
+                local_ip,
+                lambda received, expected, file_name=name, base=offset: progress(base + received, total, file_name) if progress else None,
+                cancelled,
+            )
+            size = local_path.stat().st_size
+            if size != int(entry["size"]):
+                raise RuntimeError(f"Downloaded size mismatch for {remote_path}: {size} of {entry['size']} bytes")
+            digest = hashlib.sha256()
+            with local_path.open("rb") as downloaded_file:
+                for chunk in iter(lambda: downloaded_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            downloaded.append({
+                "remote_path": remote_path,
+                "local_path": str(local_path.relative_to(target)),
+                "bytes": size,
+                "sha256": digest.hexdigest(),
+            })
+            completed += size
+        (target / "collection-manifest.json").write_text(
+            json.dumps({
+                "source": host,
+                "remote_directory": root,
+                "collected_at_utc": datetime.now(timezone.utc).isoformat(),
+                "file_count": len(downloaded),
+                "total_bytes": completed,
+                "files": downloaded,
+            }, indent=2),
+            encoding="utf-8",
+        )
+        incomplete.unlink()
+        if progress:
+            progress(total, total, "Complete")
+        return target
+    except Exception:
+        # Preserve the incomplete marker and any completed files for diagnosis.
+        raise

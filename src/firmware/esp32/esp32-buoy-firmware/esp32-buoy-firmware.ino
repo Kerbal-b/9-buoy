@@ -101,11 +101,20 @@ const float ACS712_SENSITIVITY_VOLTS_PER_AMP = 0.066;  // 30A module
 const float BATTERY_SENSOR_MAX_VOLTAGE = 16.72f;  // 12.39 V pack at 2.445 V on ADS1115 A1
 const float BATTERY_FULL_VOLTAGE = 12.6;
 const float BATTERY_EMPTY_VOLTAGE = 9.6;
+const float BATTERY_MIN_VALID_PACK_VOLTAGE = 7.0f;
+const float BATTERY_MAX_VALID_PACK_VOLTAGE = 15.0f;
+const uint32_t BATTERY_RESTING_PERCENT_MAX_AGE_MS = 120000;
+const uint32_t MISSION_LOW_BATTERY_SUSTAIN_MS = 10000;
+const uint8_t MISSION_LOW_BATTERY_HYSTERESIS_PERCENT = 5;
 const int CURRENT_SENSOR_SAMPLE_COUNT = 8;
 const int BATTERY_VOLTAGE_SAMPLE_COUNT = 4;
 const int CURRENT_SENSOR_ZERO_CALIBRATION_SAMPLES = 64;
 const float CURRENT_SENSOR_NOISE_FLOOR_AMPS = 0.15;
 const float CURRENT_SENSOR_STARTUP_LOAD_AMPS = 0.21f;  // Measured at battery feed with motors off
+const float MOTOR_STALL_OVERCURRENT_AMPS = 12.0f;
+const uint32_t MOTOR_STALL_OVERCURRENT_MS = 5000;
+const float MOTOR_STALL_GPS_MOVEMENT_METERS = 2.0f;
+const uint32_t MOTOR_STALL_SAMPLE_INTERVAL_MS = 250;
 
 const int MOTOR_OUTPUT_LIMIT = 255;
 // Below this command magnitude, the calibrated sustain PWM is already near its
@@ -393,6 +402,14 @@ float magnetometerScaleY = 1.0f;
 bool missionHeadingCacheValid = false;
 float missionHeadingCacheDegrees = 0.0f;
 uint32_t missionHeadingCacheUpdatedMs = 0;
+MagnetometerReadings lastMagnetometerReadings = {};
+bool lastMagnetometerSampleValid = false;
+uint32_t lastMagnetometerSampleMs = 0;
+uint8_t lastMagnetometerStatus = 0;
+uint32_t magnetometerSamplesOk = 0;
+uint32_t magnetometerNotReady = 0;
+uint32_t magnetometerOverflows = 0;
+uint32_t magnetometerI2cErrors = 0;
 bool missionModeRequested = false;
 bool manualAssistRequested = false;
 bool manualAssistTargetValid = false;
@@ -650,13 +667,27 @@ uint32_t lastStandaloneTelemetryMs = 0;
 uint32_t lastStandalonePowerSampleMs = 0;
 uint32_t lastStandaloneScienceSampleMs = 0;
 uint32_t sdLogBootId = 0;
+bool standaloneFirstGpsFixRecorded = false;
 uint64_t sdCardSizeBytes = 0;
 uint64_t sdTotalBytes = 0;
 uint64_t sdUsedBytes = 0;
 uint16_t latestRangeDistanceMm = 0;
 bool latestRangeValid = false;
 float latestBatteryVolts = 0.0f;
+bool latestBatteryVoltageValid = false;
+uint32_t latestBatterySampleMs = 0;
+float latestRestingBatteryVolts = 0.0f;
+bool latestRestingBatteryVoltageValid = false;
+uint32_t latestRestingBatterySampleMs = 0;
 float latestCurrentAmps = 0.0f;
+bool latestCurrentSampleValid = false;
+uint32_t latestCurrentSampleMs = 0;
+uint32_t lastMotorStallSampleMs = 0;
+uint32_t motorStallNoMovementSinceMs = 0;
+bool motorStallGpsAnchorValid = false;
+double motorStallGpsAnchorLatitude = 0.0;
+double motorStallGpsAnchorLongitude = 0.0;
+uint32_t missionLowBatterySinceMs = 0;
 ImuReadings standaloneImuReadings = {};
 bool standaloneImuValid = false;
 float standaloneTdsVoltage = NAN;
@@ -666,6 +697,10 @@ bool readMpu6050(ImuReadings& readings);
 bool setupMpu6050();
 bool setupQmc5883();
 bool readQmc5883(MagnetometerReadings& readings);
+bool calculateTiltHeadingDegrees(const MagnetometerReadings& mag, const ImuReadings& imu,
+                                 float& headingDegrees);
+String standaloneRunDirectory();
+String standaloneBootId();
 void emitMagnetometerTelemetry();
 bool setupDs18b20();
 void updateDs18b20Sensor(uint32_t nowMs);
@@ -680,6 +715,7 @@ bool startAudioCaptureTask();
 void processAudioFrames();
 void handleControlCommand(String command);
 void stopMissionExecution(const String& reason, bool completed = false);
+void updateMotorStallProtection(uint32_t now);
 bool missionSegmentInsideBoundary(double fromLatitude, double fromLongitude, double toLatitude, double toLongitude);
 void updateMissionExecution(uint32_t now);
 void updateManualReturnHome(uint32_t now);
@@ -719,6 +755,8 @@ void writeElrsCalibrationSample(uint32_t now);
 float readCurrentSensorVoltage();
 float readBatterySystemVoltage();
 float currentAmpsFromSensorVoltage(float sensorVoltage);
+float updateLatestCurrentSample(float sensorVoltage);
+bool updateLatestBatteryVoltage(float volts);
 uint32_t missionCrc32File(const char* path, bool& ok);
 
 bool controlClientConnected() {
@@ -1432,6 +1470,8 @@ bool startSdRecorder(const String& startUtc) {
   File manifest = SD.open((sdSessionDirectory + "/manifest.txt").c_str(), FILE_WRITE);
   if (manifest) {
     const bool missionStartedSession = missionExecutionActive && runningMissionId[0] != '\0';
+    manifest.println(String("boot_id=") + standaloneBootId());
+    manifest.println(String("startup_logs=") + standaloneRunDirectory());
     manifest.println("firmware_version=" + firmwareVersionString());
     manifest.println("firmware_major=" + String(kFirmwareVersionMajor));
     manifest.println("firmware_minor=" + String(kFirmwareVersionMinor));
@@ -1539,28 +1579,49 @@ void stopRecordingForManualLinkLoss() {
   saveSdRecorder(stoppedAt);
 }
 
-String standaloneLogDateTag() {
-  char tag[16];
-  if (gps.date.isValid()) {
-    snprintf(tag, sizeof(tag), "%04u%02u%02u", gps.date.year(), gps.date.month(), gps.date.day());
-  } else {
-    snprintf(tag, sizeof(tag), "boot-%08lx", static_cast<unsigned long>(sdLogBootId));
-  }
-  return String(tag);
+String standaloneBootId() {
+  char bootId[9];
+  snprintf(bootId, sizeof(bootId), "%08lx", static_cast<unsigned long>(sdLogBootId));
+  return String(bootId);
+}
+
+String standaloneRunDirectory() {
+  return String("/logs/run-") + standaloneBootId();
 }
 
 String standaloneLogPath(const char* stem, const char* extension) {
-  char bootId[9];
-  snprintf(bootId, sizeof(bootId), "%08lx", static_cast<unsigned long>(sdLogBootId));
-  return String("/logs/") + stem + "-" + standaloneLogDateTag() + "-" + bootId + extension;
+  return standaloneRunDirectory() + "/" + stem + extension;
 }
 
 bool ensureStandaloneLogDirectory() {
   if (!sdCardMounted) return false;
-  if (SD.exists("/logs")) return true;
-  if (SD.mkdir("/logs")) return true;
-  ++sdWriteFailures;
-  return false;
+  if (!SD.exists("/logs") && !SD.mkdir("/logs")) {
+    ++sdWriteFailures;
+    return false;
+  }
+  const String runDirectory = standaloneRunDirectory();
+  if (SD.exists(runDirectory.c_str())) return true;
+  if (!SD.mkdir(runDirectory.c_str())) {
+    ++sdWriteFailures;
+    return false;
+  }
+  File manifest = SD.open((runDirectory + "/run.txt").c_str(), FILE_WRITE);
+  if (manifest) {
+    manifest.println(String("boot_id=") + standaloneBootId());
+    manifest.println(String("firmware_version=") + firmwareVersionString());
+    manifest.println(String("magnetometer_calibrated=") + String(magnetometerCalibrationLoaded ? 1 : 0));
+    manifest.println(String("mag_offset_x=") + String(magnetometerOffsetX, 4));
+    manifest.println(String("mag_offset_y=") + String(magnetometerOffsetY, 4));
+    manifest.println(String("mag_scale_x=") + String(magnetometerScaleX, 6));
+    manifest.println(String("mag_scale_y=") + String(magnetometerScaleY, 6));
+    manifest.println(F("telemetry=telemetry.csv"));
+    manifest.println(F("events=system.csv"));
+    manifest.println(F("time_source=GPS date and time columns in telemetry.csv"));
+    manifest.close();
+  } else {
+    ++sdWriteFailures;
+  }
+  return true;
 }
 
 void printCsvQuoted(File& file, const String& value) {
@@ -1591,7 +1652,7 @@ void recordLogLine(const String& line) {
   file.print(',');
   file.print(millis());
   file.print(',');
-  file.print(sdLogBootId, HEX);
+  file.print(standaloneBootId());
   file.print(',');
   printCsvQuoted(file, line);
   file.println();
@@ -1614,6 +1675,7 @@ void reportMissionStartBlock(uint8_t code, const char* reason) {
   missionStartBlockCode = code;
   missionStartBlockedLogged = true;
   emitLine(String("TEL EVENT MISSION_START BLOCKED ") + String(code) + " " + reason);
+  recordLogLine(String("MISSION START BLOCKED ") + String(code) + " " + reason);
   elrs.sendScienceValue("MIS_STATE", 8);
   elrs.sendScienceValue("MIS_BLOCK", code);
 }
@@ -1881,9 +1943,12 @@ void sendStatusSnapshot() {
     " TEST " + String(elrsCalibrationTestActive ? 1 : 0) +
     " EXPECTED " + String(elrsCalibrationExpectedIndex) + " " + String(elrsCalibrationExpectedPower));
 
-  float batteryVolts = readBatterySystemVoltage();
+  const float measuredBatteryVolts = readBatterySystemVoltage();
+  const bool batteryValid = updateLatestBatteryVoltage(measuredBatteryVolts);
+  const float batteryVolts = batteryValid ? measuredBatteryVolts :
+    (latestBatteryVoltageValid ? latestBatteryVolts : 0.0f);
   float currentAmps = readCurrentSensorAmps();
-  int batteryPct = estimateBatteryPercent(batteryVolts);
+  int batteryPct = batteryValid || latestBatteryVoltageValid ? estimateBatteryPercent(batteryVolts) : 0;
 
   emitLine("TEL STATUS BATTERY " + String(batteryVolts, 2) + " " + String(currentAmps, 2) + " " + String(batteryPct));
   emitLine("TEL STATUS CURRENT " + String(currentAmps, 2));
@@ -2454,13 +2519,19 @@ void stopElrsForFailsafe(uint32_t now) {
                        zeroLinkQuality ? "ZERO_LQ" : "ARM_STATE_LOST";
   const String rcAge = elrs.lastRcMs() == 0 ? String("UNKNOWN") : String(now - elrs.lastRcMs());
   const String linkAge = elrs.lastLinkMs() == 0 ? String("UNKNOWN") : String(now - elrs.lastLinkMs());
-  if (missionExecutionActive && missionMetadata.linkLossAction == 1 && missionMetadata.hasHome) {
+  const bool missionReturnGpsReady = gps.location.isValid() && gps.location.age() <= 1500 &&
+    gps.satellites.isValid() && gps.satellites.value() >= 5 &&
+    gps.hdop.isValid() && gps.hdop.hdop() <= 3.0;
+  if (missionExecutionActive && missionMetadata.linkLossAction == 1 &&
+      missionMetadata.hasHome && missionReturnGpsReady) {
     beginMissionReturnHome("ELRS LINK LOST");
     controlSource = CONTROL_SOURCE_NONE;
     elrsArmed = false;
     elrsArmReady = false;
   } else {
-    if (missionExecutionActive) stopMissionExecution("ELRS LINK LOST", false);
+    if (missionExecutionActive) {
+      stopMissionExecution(missionReturnGpsReady ? "ELRS LINK LOST" : "ELRS LINK LOST GPS UNAVAILABLE", false);
+    }
     stopMotorsForSafety(F("ELRS FAILSAFE"));
   }
   manualLinkLossStop = true;
@@ -2503,6 +2574,58 @@ void updateMotorCommandWatchdog() {
   if (lastControlHeartbeatMs == 0 || nowMs - lastControlHeartbeatMs > MOTOR_COMMAND_WATCHDOG_MS) {
     stopMotorsForSafety(F("COMMAND WATCHDOG TIMEOUT"));
   }
+}
+
+void updateMotorStallProtection(uint32_t now) {
+  if (!motorCommandActive()) {
+    motorStallNoMovementSinceMs = 0;
+    motorStallGpsAnchorValid = false;
+    return;
+  }
+  if (lastMotorStallSampleMs != 0 && now - lastMotorStallSampleMs < MOTOR_STALL_SAMPLE_INTERVAL_MS) return;
+  lastMotorStallSampleMs = now;
+
+  const float currentVoltage = readCurrentSensorVoltage();
+  const float currentAmps = updateLatestCurrentSample(currentVoltage);
+  const bool gpsFresh = gps.location.isValid() && gps.location.age() <= 1500;
+  if (!isfinite(currentAmps) || currentAmps <= MOTOR_STALL_OVERCURRENT_AMPS || !gpsFresh) {
+    motorStallNoMovementSinceMs = 0;
+    motorStallGpsAnchorValid = false;
+    return;
+  }
+
+  const double latitude = gps.location.lat();
+  const double longitude = gps.location.lng();
+  if (!motorStallGpsAnchorValid || motorStallNoMovementSinceMs == 0) {
+    motorStallGpsAnchorLatitude = latitude;
+    motorStallGpsAnchorLongitude = longitude;
+    motorStallGpsAnchorValid = true;
+    motorStallNoMovementSinceMs = now;
+    return;
+  }
+
+  const double movedMeters = TinyGPSPlus::distanceBetween(latitude, longitude,
+    motorStallGpsAnchorLatitude, motorStallGpsAnchorLongitude);
+  if (!isfinite(movedMeters)) {
+    motorStallNoMovementSinceMs = 0;
+    motorStallGpsAnchorValid = false;
+    return;
+  }
+  if (movedMeters >= MOTOR_STALL_GPS_MOVEMENT_METERS) {
+    motorStallGpsAnchorLatitude = latitude;
+    motorStallGpsAnchorLongitude = longitude;
+    motorStallNoMovementSinceMs = now;
+    return;
+  }
+  if (now - motorStallNoMovementSinceMs < MOTOR_STALL_OVERCURRENT_MS) return;
+
+  recordLogLine(String("MOTOR STALL PROTECTION current_a=") + String(currentAmps, 2) +
+    " duration_ms=" + String(now - motorStallNoMovementSinceMs) + " gps_moved_m=" + String(movedMeters, 2));
+  emitLine(String("TEL EVENT MOTOR_STALL_OVERCURRENT ") + String(currentAmps, 2) + "A");
+  if (missionExecutionActive) stopMissionExecution("MOTOR_STALL_OVERCURRENT", false);
+  else stopMotorsForSafety(F("MOTOR STALL OVERCURRENT"));
+  motorStallNoMovementSinceMs = 0;
+  motorStallGpsAnchorValid = false;
 }
 
 void processTcpControl() {
@@ -2912,6 +3035,7 @@ bool startElrsCalibrationLog(uint8_t mode, uint8_t maxPower, uint32_t pulseDurat
   if (!sdCalibrationFile) return false;
 
   sdCalibrationFile.println(F("#format=BUOY_ELRS_CALIBRATION_V1"));
+  sdCalibrationFile.println(String("#boot_id=") + standaloneBootId());
   sdCalibrationFile.println(String("#started_utc=") + stamp);
   sdCalibrationFile.println(String("#firmware_version=") + firmwareVersionString());
   sdCalibrationFile.println(String("#test_mode=") + (mode == 0 ? "mixer_response" : "magnetometer_motor_load"));
@@ -2967,7 +3091,7 @@ bool startElrsCalibrationLog(uint8_t mode, uint8_t maxPower, uint32_t pulseDurat
     }
   }
   sdCalibrationFile.println(F("#data follows; all motor commands are signed drive values in [-255,255], PWM columns are applied output PWM"));
-  sdCalibrationFile.println(F("record_type,elapsed_ms,test_index,test_name,requested_power_pct,test_active,commanded_lateral,commanded_thrust,commanded_yaw,drive_rear,drive_front_left,drive_front_right,target_rear,target_front_left,target_front_right,pwm_rear,pwm_front_left,pwm_front_right,current_a,battery_v,current_valid,battery_valid,accel_x_g,accel_y_g,accel_z_g,gyro_x_dps,gyro_y_dps,gyro_z_dps,mag_x_raw,mag_y_raw,mag_z_raw,mag_heading_deg,gps_valid,latitude,longitude,speed_mps,course_deg,satellites,hdop,ch1,ch2,ch3,ch4,ch5,ch7,ch11,ch12,ch13,ch14,ch15\n"));
+  sdCalibrationFile.println(F("record_type,elapsed_ms,test_index,test_name,requested_power_pct,test_active,commanded_lateral,commanded_thrust,commanded_yaw,drive_rear,drive_front_left,drive_front_right,target_rear,target_front_left,target_front_right,pwm_rear,pwm_front_left,pwm_front_right,current_a,battery_v,current_valid,battery_valid,accel_x_g,accel_y_g,accel_z_g,gyro_x_dps,gyro_y_dps,gyro_z_dps,mag_x_raw,mag_y_raw,mag_z_raw,mag_heading_deg,gps_valid,latitude,longitude,speed_mps,course_deg,satellites,hdop,ch1,ch2,ch3,ch4,ch5,ch7,ch11,ch12,ch13,ch14,ch15,mag_available,mag_valid,mag_status,mag_samples_ok,mag_not_ready,mag_overflows,mag_i2c_errors,gps_age_ms"));
   sdCalibrationFile.flush();
   if (sdCalibrationFile.getWriteError()) {
     sdCalibrationFile.close();
@@ -3293,12 +3417,13 @@ void writeElrsCalibrationSample(uint32_t now) {
   const float currentSensorVoltage = readCurrentSensorVoltage();
   const bool currentValid = isfinite(currentSensorVoltage);
   const float sampleCurrent = currentValid ? currentAmpsFromSensorVoltage(currentSensorVoltage) : NAN;
-  if (currentValid) latestCurrentAmps = sampleCurrent;
+  if (currentValid) updateLatestCurrentSample(currentSensorVoltage);
   const float sampleBattery = readBatterySystemVoltage();
-  const bool batteryValid = isfinite(sampleBattery) && sampleBattery > 0.0f;
-  if (batteryValid) latestBatteryVolts = sampleBattery;
+  const bool batteryValid = updateLatestBatteryVoltage(sampleBattery);
   float heading = NAN;
-  if (magValid) readMissionHeadingDegrees(heading);
+  if (magValid && imuValid && magnetometerCalibrationLoaded) {
+    calculateTiltHeadingDegrees(mag, imu, heading);
+  }
   const bool gpsValid = gps.location.isValid() && gps.location.age() < 2000;
   const int lateral = latestMixerInputLateral;
   const int thrust = latestMixerInputThrust;
@@ -3325,8 +3450,14 @@ void writeElrsCalibrationSample(uint32_t now) {
   for (uint8_t channel = 0; channel < 5; ++channel) {
     sdCalibrationFile.printf("%u,", elrs.channel(channel));
   }
-  sdCalibrationFile.printf("%u,%u,%u,%u,%u,%u\n", elrs.channel(6), elrs.channel(10), elrs.channel(11),
+  sdCalibrationFile.printf("%u,%u,%u,%u,%u,%u,", elrs.channel(6), elrs.channel(10), elrs.channel(11),
     elrs.channel(12), elrs.channel(13), elrs.channel(14));
+  sdCalibrationFile.printf("%u,%u,%u,%lu,%lu,%lu,%lu,", magnetometerAvailable ? 1U : 0U,
+    magValid ? 1U : 0U, static_cast<unsigned int>(lastMagnetometerStatus),
+    static_cast<unsigned long>(magnetometerSamplesOk), static_cast<unsigned long>(magnetometerNotReady),
+    static_cast<unsigned long>(magnetometerOverflows), static_cast<unsigned long>(magnetometerI2cErrors));
+  if (gps.location.isValid()) sdCalibrationFile.print(gps.location.age());
+  sdCalibrationFile.println();
   ++elrsCalibrationSampleCount;
 }
 
@@ -3378,11 +3509,21 @@ void processElrsControl() {
       emitLine("TEL EVENT MISSION_MODE REQUESTED");
     }
     missionModeRequested = true;
-    if (missionStartLocked) {
-      reportMissionStartBlock(9, "SELECT_MANUAL_THEN_MISSION");
-      return;
-    }
     const uint16_t armChannel = elrs.channel(4);  // CH5: low disarm, high arm
+    if (missionStartLocked) {
+      if (armChannel < 1300) {
+        missionStartLocked = false;
+        missionStartBlockCode = 0;
+        missionStartBlockedLogged = false;
+        elrsArmReady = true;
+        elrs.sendScienceValue("MIS_BLOCK", 0);
+        emitLine("TEL EVENT MISSION_RESTART_UNLOCKED ARM_SWITCH_LOW");
+        recordLogLine("MISSION RESTART UNLOCKED: ARM SWITCH LOW");
+      } else {
+        reportMissionStartBlock(9, "CYCLE_ARM_LOW_TO_RESTART");
+        return;
+      }
+    }
     if (armChannel < 1300) {
       if (missionExecutionActive) stopMissionExecution("RADIO DISARM", false);
       elrsArmReady = true;
@@ -3474,6 +3615,15 @@ void processElrsControl() {
       }
       float startingHeading = 0.0f;
       if (!magnetometerCalibrationLoaded || !magnetometerAvailable || !readMissionHeadingDegrees(startingHeading)) {
+        const uint32_t headingAge = missionHeadingCacheValid
+          ? millis() - missionHeadingCacheUpdatedMs : UINT32_MAX;
+        recordLogLine(String("MISSION HEADING SAMPLE FAILURE context=START calibrated=") +
+          String(magnetometerCalibrationLoaded ? 1 : 0) + " available=" +
+          String(magnetometerAvailable ? 1 : 0) + " cache_valid=" +
+          String(missionHeadingCacheValid ? 1 : 0) + " cache_age_ms=" +
+          String(headingAge) + " mag_status=" + String(lastMagnetometerStatus) +
+          " not_ready=" + String(magnetometerNotReady) + " i2c_errors=" +
+          String(magnetometerI2cErrors));
         reportMissionStartBlock(8, "MAGNETOMETER_CALIBRATION_UNAVAILABLE");
         missionStartBlockedLogged = true;
         return;
@@ -3485,6 +3635,7 @@ void processElrsControl() {
       missionExecutionActive = true;
       missionReturningHome = false;
       missionCheckpointActive = false;
+      missionLowBatterySinceMs = 0;
       missionCurrentWaypoint = 0;
       missionCompletedWaypoints = 0;
       missionRunStatus = "STARTING";
@@ -3724,11 +3875,8 @@ bool missionSegmentInsideBoundary(double fromLatitude, double fromLongitude, dou
   return true;
 }
 
-bool readHeadingDegrees(float& headingDegrees, bool requireCalibration) {
-  if (!magnetometerAvailable || (requireCalibration && !magnetometerCalibrationLoaded)) return false;
-  MagnetometerReadings mag = {};
-  ImuReadings imu = {};
-  if (!readQmc5883(mag) || !readMpu6050(imu)) return false;
+bool calculateTiltHeadingDegrees(const MagnetometerReadings& mag, const ImuReadings& imu,
+                                 float& headingDegrees) {
   const float mx = (static_cast<float>(mag.x) - magnetometerOffsetX) * magnetometerScaleX;
   const float my = (static_cast<float>(mag.y) - magnetometerOffsetY) * magnetometerScaleY;
   const float mz = static_cast<float>(mag.z);
@@ -3741,6 +3889,14 @@ bool readHeadingDegrees(float& headingDegrees, bool requireCalibration) {
   headingDegrees = atan2f(horizontalY, horizontalX) * 180.0f / PI;
   if (headingDegrees < 0.0f) headingDegrees += 360.0f;
   return isfinite(headingDegrees);
+}
+
+bool readHeadingDegrees(float& headingDegrees, bool requireCalibration) {
+  if (!magnetometerAvailable || (requireCalibration && !magnetometerCalibrationLoaded)) return false;
+  MagnetometerReadings mag = {};
+  ImuReadings imu = {};
+  if (!readQmc5883(mag) || !readMpu6050(imu)) return false;
+  return calculateTiltHeadingDegrees(mag, imu, headingDegrees);
 }
 
 bool readMissionHeadingDegrees(float& headingDegrees) {
@@ -3946,6 +4102,7 @@ void stopMissionExecution(const String& reason, bool completed) {
   missionReturningHome = false;
   missionReturnWaypointIndex = -1;
   missionCheckpointActive = false;
+  missionLowBatterySinceMs = 0;
   missionStartLocked = true;
   elrsArmed = false;
   elrsArmReady = false;
@@ -3988,9 +4145,23 @@ void updateMissionExecution(uint32_t now) {
     stopMissionExecution("MISSION_SESSION_UNAVAILABLE", false);
     return;
   }
-  if (!missionReturningHome && (!elrs.rcFresh(now) || !missionModeRequested || !elrsArmed)) {
-    stopMissionExecution("RADIO_CONTROL_LOST", false);
+  if (!missionReturningHome && !missionModeRequested && elrs.rcFresh(now) && elrsArmed) {
+    stopMissionExecution("MISSION_MODE_SWITCHED_TO_MANUAL", false);
     return;
+  }
+  const bool missionRadioLost = !elrs.rcFresh(now) || !elrsArmed;
+  if (!missionReturningHome && missionRadioLost) {
+    const bool gpsAllowsReturn = gps.location.isValid() && gps.location.age() <= 1500 &&
+      gps.satellites.isValid() && gps.satellites.value() >= 5 &&
+      gps.hdop.isValid() && gps.hdop.hdop() <= 3.0 && missionMetadata.hasHome;
+    if (missionMetadata.linkLossAction == 1 && gpsAllowsReturn) {
+      recordLogLine("MISSION RC LOST: RETURN-HOME ACTION SELECTED");
+      beginMissionReturnHome("ELRS LINK LOST");
+      if (!missionExecutionActive) return;
+    } else {
+      stopMissionExecution(gpsAllowsReturn ? "RADIO_CONTROL_LOST" : "RADIO_CONTROL_LOST_GPS_UNAVAILABLE", false);
+      return;
+    }
   }
   if (!gps.location.isValid() || gps.location.age() > 1500 || !gps.satellites.isValid() ||
       gps.satellites.value() < 5 || !gps.hdop.isValid() || gps.hdop.hdop() > 3.0) {
@@ -4000,6 +4171,15 @@ void updateMissionExecution(uint32_t now) {
 
   float heading = 0.0f;
   if (!readMissionHeadingDegrees(heading)) {
+    const uint32_t headingAge = missionHeadingCacheValid
+      ? now - missionHeadingCacheUpdatedMs : UINT32_MAX;
+    recordLogLine(String("MISSION HEADING SAMPLE FAILURE context=EXECUTION calibrated=") +
+      String(magnetometerCalibrationLoaded ? 1 : 0) + " available=" +
+      String(magnetometerAvailable ? 1 : 0) + " cache_valid=" +
+      String(missionHeadingCacheValid ? 1 : 0) + " cache_age_ms=" +
+      String(headingAge) + " mag_status=" + String(lastMagnetometerStatus) +
+      " not_ready=" + String(magnetometerNotReady) + " i2c_errors=" +
+      String(magnetometerI2cErrors));
     stopMissionExecution("HEADING_UNAVAILABLE", false);
     return;
   }
@@ -4011,12 +4191,23 @@ void updateMissionExecution(uint32_t now) {
     else { stopMissionExecution("BOUNDARY_BREACH", false); return; }
     if (!missionExecutionActive) return;
   }
-  const float batteryVolts = latestBatteryVolts;
-  if (batteryVolts > 0.1f && estimateBatteryPercent(batteryVolts) <= missionMetadata.batteryThresholdPercent &&
-      !missionReturningHome) {
-    if (missionMetadata.lowBatteryAction == 1 && missionMetadata.hasHome) beginMissionReturnHome("LOW_BATTERY");
-    else { stopMissionExecution("LOW_BATTERY", false); return; }
-    if (!missionExecutionActive) return;
+  const bool batterySampleFresh = latestBatteryVoltageValid &&
+    now - latestBatterySampleMs <= (ELRS_BATTERY_INTERVAL_MS * 3);
+  const int batteryPercent = batterySampleFresh ? estimateBatteryPercent(latestBatteryVolts) : -1;
+  if (!missionReturningHome && batterySampleFresh && batteryPercent >= 0 &&
+      batteryPercent <= missionMetadata.batteryThresholdPercent) {
+    if (missionLowBatterySinceMs == 0) missionLowBatterySinceMs = now;
+    if (now - missionLowBatterySinceMs >= MISSION_LOW_BATTERY_SUSTAIN_MS) {
+      recordLogLine(String("MISSION LOW BATTERY SUSTAINED percent=") +
+        String(batteryPercent) + " threshold=" + String(missionMetadata.batteryThresholdPercent));
+      if (missionMetadata.lowBatteryAction == 1 && missionMetadata.hasHome) beginMissionReturnHome("LOW_BATTERY");
+      else { stopMissionExecution("LOW_BATTERY", false); return; }
+      missionLowBatterySinceMs = 0;
+      if (!missionExecutionActive) return;
+    }
+  } else if (!batterySampleFresh || batteryPercent >
+      missionMetadata.batteryThresholdPercent + MISSION_LOW_BATTERY_HYSTERESIS_PERCENT || missionReturningHome) {
+    missionLowBatterySinceMs = 0;
   }
 
   MissionCoordinate target = {};
@@ -4296,7 +4487,31 @@ float readBatterySystemVoltage() {
   return isnan(sensorVoltage) ? 0.0f : sensorVoltage * (BATTERY_SENSOR_MAX_VOLTAGE / ADC_REFERENCE_VOLTAGE);
 }
 
+bool updateLatestBatteryVoltage(float volts) {
+  // All battery state is stored as whole-pack voltage. This rejects common
+  // per-cell-scale values while allowing the observed loaded sag near 8 V.
+  if (!isfinite(volts) || volts < BATTERY_MIN_VALID_PACK_VOLTAGE ||
+      volts > BATTERY_MAX_VALID_PACK_VOLTAGE) return false;
+  const uint32_t now = millis();
+  latestBatteryVolts = volts;
+  latestBatteryVoltageValid = true;
+  latestBatterySampleMs = now;
+  if (!motorCommandActive()) {
+    latestRestingBatteryVolts = volts;
+    latestRestingBatteryVoltageValid = true;
+    latestRestingBatterySampleMs = now;
+  }
+  return true;
+}
+
 int estimateBatteryPercent(float batteryVoltage) {
+  const uint32_t now = millis();
+  if (motorCommandActive() && latestRestingBatteryVoltageValid &&
+      now - latestRestingBatterySampleMs <= BATTERY_RESTING_PERCENT_MAX_AGE_MS) {
+    batteryVoltage = latestRestingBatteryVolts;
+  }
+  if (!isfinite(batteryVoltage) || batteryVoltage < BATTERY_MIN_VALID_PACK_VOLTAGE ||
+      batteryVoltage > BATTERY_MAX_VALID_PACK_VOLTAGE) return 0;
   float normalized = (batteryVoltage - BATTERY_EMPTY_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_EMPTY_VOLTAGE);
   normalized = clampf(normalized, 0.0, 1.0);
   return round(normalized * 100.0);
@@ -4324,8 +4539,19 @@ float currentAmpsFromSensorVoltage(float sensorVoltage) {
   return CURRENT_SENSOR_STARTUP_LOAD_AMPS + loadChangeAmps;
 }
 
+float updateLatestCurrentSample(float sensorVoltage) {
+  const uint32_t now = millis();
+  latestCurrentSampleMs = now;
+  latestCurrentSampleValid = isfinite(sensorVoltage);
+  if (!latestCurrentSampleValid) return NAN;
+  latestCurrentAmps = currentAmpsFromSensorVoltage(sensorVoltage);
+  return latestCurrentAmps;
+}
+
 float readCurrentSensorAmps() {
-  return currentAmpsFromSensorVoltage(readCurrentSensorVoltage());
+  const float sensorVoltage = readCurrentSensorVoltage();
+  const float amps = updateLatestCurrentSample(sensorVoltage);
+  return isfinite(amps) ? amps : 0.0f;
 }
 
 void sampleElrsWaterMotion(uint32_t now) {
@@ -4581,24 +4807,27 @@ void serviceElrsTelemetry(uint32_t now) {
   if (now - lastElrsBatteryMs >= ELRS_BATTERY_INTERVAL_MS) {
     lastElrsBatteryMs = now;
     const float battery = readBatterySystemVoltage();
-    if (battery > 0) {
-      latestBatteryVolts = battery;
-      latestCurrentAmps = readCurrentSensorAmps();
+    if (updateLatestBatteryVoltage(battery)) {
+      const float current = readCurrentSensorAmps();
       lastStandalonePowerSampleMs = now;
-      elrs.sendBattery(battery, latestCurrentAmps, estimateBatteryPercent(battery));
+      elrs.sendBattery(battery, current, estimateBatteryPercent(battery));
     }
   }
   if (now - lastElrsGpsMs >= ELRS_GPS_INTERVAL_MS) {
     lastElrsGpsMs = now;
-    if (gps.location.isValid() && gps.location.age() < 2000) {
-      sendElrsHomeTelemetry();
-      elrs.sendGps(gps.location.lat(), gps.location.lng(),
-                   gps.speed.isValid() ? gps.speed.mps() : NAN,
-                   gps.course.isValid() ? gps.course.deg() : NAN,
-                   gps.altitude.isValid() ? gps.altitude.meters() : 0.0f,
-                   gps.satellites.isValid() ? static_cast<uint8_t>(constrain(gps.satellites.value(), 0UL, 255UL)) : 0,
-                   gps.hdop.isValid() ? static_cast<float>(gps.hdop.hdop()) : NAN);
-    }
+    const bool fixValid = gps.location.isValid() && gps.location.age() < 2000;
+    if (fixValid) sendElrsHomeTelemetry();
+    const bool altitudeValid = fixValid && gps.altitude.isValid() && gps.altitude.age() < 2000;
+    const uint8_t gpsFixType = !fixValid ? 1 : (altitudeValid ? 3 : 2);
+    elrs.sendGps(fixValid ? gps.location.lat() : 0.0,
+                 fixValid ? gps.location.lng() : 0.0,
+                 fixValid && gps.speed.isValid() ? gps.speed.mps() : NAN,
+                 fixValid && gps.course.isValid() ? gps.course.deg() : NAN,
+                 altitudeValid ? gps.altitude.meters() : NAN,
+                 gps.satellites.isValid() ? static_cast<uint8_t>(constrain(gps.satellites.value(), 0UL, 254UL)) : 255,
+                 gpsFixType,
+                 gps.hdop.isValid() ? static_cast<float>(gps.hdop.hdop()) : NAN,
+                 static_cast<uint64_t>(esp_timer_get_time()));
   }
   sendElrsAttitudeTelemetry(now);
   sendElrsCompactStatus(now);
@@ -4683,17 +4912,30 @@ bool recordStandaloneTelemetrySnapshot() {
     return false;
   }
   if (file.size() == 0) {
-    file.println(F("boot_id,timestamp_us,gps_valid,gps_age_ms,gps_date_ddmmyy,gps_time_hhmmsscc,latitude,longitude,gps_satellites,gps_hdop,speed_mps,course_deg,control_mode,control_source,telemetry_mode,hold_position,mission_mode_requested,elrs_armed,elrs_arm_ready,elrs_rc_fresh,elrs_rc_age_ms,elrs_link_fresh,elrs_link_age_ms,elrs_link_quality,elrs_rssi_dbm,elrs_snr_db,elrs_rc_frames,elrs_radio_status,elrs_crc_errors,elrs_override_frames,elrs_crc_ok,elrs_crc_bad,elrs_short,elrs_target_reject,elrs_channel_reject,ch1_us,ch2_us,ch3_us,ch4_us,ch5_us,ch6_us,ch7_us,ch8_us,ch9_us,ch10_us,ch11_us,ch12_us,ch13_us,ch14_us,ch15_us,ch16_us,drive_rear,left,right,target_rear,target_left,target_right,pwm_rear_signed,pwm_left_signed,pwm_right_signed,motors_enabled,battery_v,current_a,battery_valid,power_sample_age_ms,range_valid,range_mm,water_temp_valid,water_temp_c,aux_sensor_sample_age_ms,imu_valid,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,imu_temp_c,tds_v,turbidity_probe_v,sd_mount_failures,sd_write_failures,audio_frames_dropped,last_failsafe"));
+    file.print(F("boot_id,timestamp_us,gps_valid,gps_age_ms,gps_date_ddmmyy,gps_time_hhmmsscc,latitude,longitude,gps_satellites,gps_hdop,speed_mps,course_deg,gps_altitude_m,gps_altitude_age_ms,gps_satellites_age_ms,gps_hdop_age_ms,gps_speed_age_ms,gps_course_age_ms,control_mode,control_source,telemetry_mode,hold_position,mission_mode_requested,elrs_armed,elrs_arm_ready,elrs_rc_fresh,elrs_rc_age_ms,elrs_link_fresh,elrs_link_age_ms,elrs_link_quality,elrs_rssi_dbm,elrs_snr_db,elrs_rc_frames,elrs_radio_status,elrs_crc_errors,elrs_override_frames,elrs_crc_ok,elrs_crc_bad,elrs_short,elrs_target_reject,elrs_channel_reject,ch1_us,ch2_us,ch3_us,ch4_us,ch5_us,ch6_us,ch7_us,ch8_us,ch9_us,ch10_us,ch11_us,ch12_us,ch13_us,ch14_us,ch15_us,ch16_us,drive_rear,left,right,target_rear,target_left,target_right,pwm_rear_signed,pwm_left_signed,pwm_right_signed,motors_enabled,battery_v,current_a,battery_valid,current_valid,power_sample_age_ms,range_valid,range_mm,range_age_ms,water_temp_valid,water_temp_c,water_temp_age_ms,aux_sensor_sample_age_ms,imu_valid,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,imu_temp_c,tds_v,turbidity_probe_v,"));
+    file.println(F("mag_available,mag_calibrated,mag_sample_valid,mag_sample_age_ms,mag_x_raw,mag_y_raw,mag_z_raw,mag_status,mag_samples_ok,mag_not_ready,mag_overflows,mag_i2c_errors,tilt_heading_deg,mission_heading_valid,mission_heading_age_ms,mission_heading_deg,mission_active,mission_waypoint_index,mission_waypoint_count,mission_checkpoint_active,mission_returning_home,mission_start_locked,mission_start_block_code,mission_run_status,mission_id,manual_assist_requested,manual_assist_heading_available,manual_assist_target_deg,mixer_input_lateral,mixer_input_thrust,mixer_input_yaw,mixer_input_tx12,science_state,calibration_active,calibration_test_active,sd_mount_failures,sd_write_failures,audio_frames_dropped,last_failsafe"));
   }
 
   const uint32_t nowMs = millis();
   const bool rcFresh = elrs.rcFresh(nowMs);
   const bool linkFresh = elrs.linkFresh(nowMs);
-  file.print(sdLogBootId, HEX);
+  const bool gpsFresh = gps.location.isValid() && gps.location.age() < 2000;
+  if (!standaloneFirstGpsFixRecorded && gpsFresh && gps.date.isValid() && gps.time.isValid()) {
+    File manifest = SD.open((standaloneRunDirectory() + "/run.txt").c_str(), FILE_APPEND);
+    if (manifest) {
+      manifest.println(String("first_gps_fix_utc=") + currentScienceTimestamp());
+      manifest.println(String("first_gps_fix_uptime_ms=") + String(nowMs));
+      standaloneFirstGpsFixRecorded = true;
+      manifest.close();
+    } else {
+      ++sdWriteFailures;
+    }
+  }
+  file.print(standaloneBootId());
   file.print(',');
   printSdTimestamp(file, static_cast<uint64_t>(esp_timer_get_time()));
   file.print(',');
-  file.print(gps.location.isValid() ? 1 : 0);
+  file.print(gpsFresh ? 1 : 0);
   file.print(',');
   if (gps.location.isValid()) file.print(gps.location.age());
   file.print(',');
@@ -4701,9 +4943,9 @@ bool recordStandaloneTelemetrySnapshot() {
   file.print(',');
   if (gps.time.isValid()) file.print(gps.time.value());
   file.print(',');
-  if (gps.location.isValid()) file.print(gps.location.lat(), 7);
+  if (gpsFresh) file.print(gps.location.lat(), 7);
   file.print(',');
-  if (gps.location.isValid()) file.print(gps.location.lng(), 7);
+  if (gpsFresh) file.print(gps.location.lng(), 7);
   file.print(',');
   if (gps.satellites.isValid()) file.print(gps.satellites.value());
   file.print(',');
@@ -4712,6 +4954,18 @@ bool recordStandaloneTelemetrySnapshot() {
   if (gps.speed.isValid()) file.print(gps.speed.mps(), 3);
   file.print(',');
   if (gps.course.isValid()) file.print(gps.course.deg(), 2);
+  file.print(',');
+  if (gps.altitude.isValid()) file.print(gps.altitude.meters(), 2);
+  file.print(',');
+  if (gps.altitude.isValid()) file.print(gps.altitude.age());
+  file.print(',');
+  if (gps.satellites.isValid()) file.print(gps.satellites.age());
+  file.print(',');
+  if (gps.hdop.isValid()) file.print(gps.hdop.age());
+  file.print(',');
+  if (gps.speed.isValid()) file.print(gps.speed.age());
+  file.print(',');
+  if (gps.course.isValid()) file.print(gps.course.age());
   file.print(',');
   file.print(encodeControlMode(controlMode));
   file.print(',');
@@ -4782,7 +5036,9 @@ bool recordStandaloneTelemetrySnapshot() {
   file.print(',');
   file.print(latestCurrentAmps, 3);
   file.print(',');
-  file.print(latestBatteryVolts > 0.0f ? 1 : 0);
+  file.print(isfinite(latestBatteryVolts) && latestBatteryVolts > 0.0f ? 1 : 0);
+  file.print(',');
+  file.print(isfinite(latestCurrentAmps) ? 1 : 0);
   file.print(',');
   file.print(nowMs - lastStandalonePowerSampleMs);
   file.print(',');
@@ -4790,9 +5046,13 @@ bool recordStandaloneTelemetrySnapshot() {
   file.print(',');
   if (latestRangeValid) file.print(latestRangeDistanceMm);
   file.print(',');
+  if (lastRangeStreamMs != 0) file.print(nowMs - lastRangeStreamMs);
+  file.print(',');
   file.print(ds18b20HasReading ? 1 : 0);
   file.print(',');
   if (ds18b20HasReading) file.print(ds18b20TemperatureC, 3);
+  file.print(',');
+  if (ds18b20HasReading) file.print(nowMs - lastDs18b20RequestMs);
   file.print(',');
   file.print(nowMs - lastStandaloneScienceSampleMs);
   file.print(',');
@@ -4808,6 +5068,85 @@ bool recordStandaloneTelemetrySnapshot() {
   printCsvFloat(file, standaloneTdsVoltage, 5);
   file.print(',');
   printCsvFloat(file, standaloneTurbidityVoltage, 5);
+  const bool magSampleFresh = magnetometerAvailable && lastMagnetometerSampleValid &&
+    nowMs - lastMagnetometerSampleMs <= MISSION_HEADING_MAX_AGE_MS;
+  file.print(',');
+  file.print(magnetometerAvailable ? 1 : 0);
+  file.print(',');
+  file.print(magnetometerCalibrationLoaded ? 1 : 0);
+  file.print(',');
+  file.print(magSampleFresh ? 1 : 0);
+  file.print(',');
+  if (lastMagnetometerSampleValid) file.print(nowMs - lastMagnetometerSampleMs);
+  file.print(',');
+  if (magSampleFresh) file.print(lastMagnetometerReadings.x);
+  file.print(',');
+  if (magSampleFresh) file.print(lastMagnetometerReadings.y);
+  file.print(',');
+  if (magSampleFresh) file.print(lastMagnetometerReadings.z);
+  file.print(',');
+  file.print(lastMagnetometerStatus);
+  file.print(',');
+  file.print(magnetometerSamplesOk);
+  file.print(',');
+  file.print(magnetometerNotReady);
+  file.print(',');
+  file.print(magnetometerOverflows);
+  file.print(',');
+  file.print(magnetometerI2cErrors);
+  float loggedHeading = NAN;
+  if (magSampleFresh && magnetometerCalibrationLoaded && standaloneImuValid &&
+      nowMs - lastStandaloneScienceSampleMs <= MISSION_HEADING_MAX_AGE_MS) {
+    calculateTiltHeadingDegrees(lastMagnetometerReadings, standaloneImuReadings, loggedHeading);
+  }
+  file.print(',');
+  printCsvFloat(file, loggedHeading, 2);
+  const bool missionHeadingFresh = magnetometerAvailable && missionHeadingCacheValid &&
+    nowMs - missionHeadingCacheUpdatedMs <= MISSION_HEADING_MAX_AGE_MS;
+  file.print(',');
+  file.print(missionHeadingFresh ? 1 : 0);
+  file.print(',');
+  if (missionHeadingCacheValid) file.print(nowMs - missionHeadingCacheUpdatedMs);
+  file.print(',');
+  if (missionHeadingFresh) file.print(missionHeadingCacheDegrees, 2);
+  file.print(',');
+  file.print(missionExecutionActive ? 1 : 0);
+  file.print(',');
+  if (missionExecutionActive && missionCurrentWaypoint < missionWaypointCount) file.print(missionCurrentWaypoint + 1);
+  file.print(',');
+  file.print(missionWaypointCount);
+  file.print(',');
+  file.print(missionCheckpointActive ? 1 : 0);
+  file.print(',');
+  file.print(missionReturningHome ? 1 : 0);
+  file.print(',');
+  file.print(missionStartLocked ? 1 : 0);
+  file.print(',');
+  file.print(missionStartBlockCode);
+  file.print(',');
+  printCsvQuoted(file, missionRunStatus);
+  file.print(',');
+  printCsvQuoted(file, missionExecutionActive ? String(runningMissionId) : String(missionId));
+  file.print(',');
+  file.print(manualAssistRequested ? 1 : 0);
+  file.print(',');
+  file.print(manualAssistHeadingAvailable ? 1 : 0);
+  file.print(',');
+  if (manualAssistTargetValid) file.print(manualAssistTargetHeadingDegrees, 2);
+  file.print(',');
+  file.print(latestMixerInputLateral);
+  file.print(',');
+  file.print(latestMixerInputThrust);
+  file.print(',');
+  file.print(latestMixerInputYaw);
+  file.print(',');
+  file.print(latestMixerInputTx12 ? 1 : 0);
+  file.print(',');
+  file.print(scienceExperimentState);
+  file.print(',');
+  file.print(elrsCalibrationActive ? 1 : 0);
+  file.print(',');
+  file.print(elrsCalibrationTestActive ? 1 : 0);
   file.print(',');
   file.print(sdMountFailures);
   file.print(',');
@@ -4853,11 +5192,9 @@ void recordScienceSnapshot() {
   float turbidityProbeVoltage = isnan(turbidityAdcVoltage)
     ? NAN
     : turbidityAdcVoltage / TURBIDITY_INPUT_DIVIDER_RATIO;
-  if (!isnan(currentVoltage)) {
-    latestCurrentAmps = currentAmpsFromSensorVoltage(currentVoltage);
-  }
+  if (!isnan(currentVoltage)) updateLatestCurrentSample(currentVoltage);
   if (!isnan(batteryAdcVoltage)) {
-    latestBatteryVolts = batteryAdcVoltage * (BATTERY_SENSOR_MAX_VOLTAGE / ADC_REFERENCE_VOLTAGE);
+    updateLatestBatteryVoltage(batteryAdcVoltage * (BATTERY_SENSOR_MAX_VOLTAGE / ADC_REFERENCE_VOLTAGE));
   }
 
   printSdTimestamp(sdScienceFile, static_cast<uint64_t>(esp_timer_get_time()));
@@ -4967,8 +5304,8 @@ void serviceSdRecorder(uint32_t nowMs) {
   if (!serviceMode && !sdTransferActive &&
       nowMs - lastStandalonePowerSampleMs >= ELRS_BATTERY_INTERVAL_MS) {
     lastStandalonePowerSampleMs = nowMs;
-    latestBatteryVolts = readBatterySystemVoltage();
-    latestCurrentAmps = readCurrentSensorAmps();
+    updateLatestBatteryVoltage(readBatterySystemVoltage());
+    readCurrentSensorAmps();
   }
   const uint32_t standaloneSensorIntervalMs = missionExecutionActive && missionCheckpointActive
     ? SD_SCIENCE_INTERVAL_MS
@@ -5115,13 +5452,28 @@ bool readQmc5883(MagnetometerReadings& readings) {
   uint8_t status = 0;
   if (!qmc5883ReadBytes(0x06, &status, 1) ||
       !qmc5883ReadBytes(0x00, raw, sizeof(raw))) {
+    ++magnetometerI2cErrors;
     magnetometerAvailable = false;
+    lastMagnetometerSampleValid = false;
+    missionHeadingCacheValid = false;
     return false;
   }
-  if ((status & 0x02) != 0 || (status & 0x01) == 0) return false;
+  lastMagnetometerStatus = status;
+  if ((status & 0x02) != 0) {
+    ++magnetometerOverflows;
+    return false;
+  }
+  if ((status & 0x01) == 0) {
+    ++magnetometerNotReady;
+    return false;
+  }
   readings.x = static_cast<int16_t>((static_cast<uint16_t>(raw[1]) << 8) | raw[0]);
   readings.y = static_cast<int16_t>((static_cast<uint16_t>(raw[3]) << 8) | raw[2]);
   readings.z = static_cast<int16_t>((static_cast<uint16_t>(raw[5]) << 8) | raw[4]);
+  lastMagnetometerReadings = readings;
+  lastMagnetometerSampleMs = millis();
+  lastMagnetometerSampleValid = true;
+  ++magnetometerSamplesOk;
   return true;
 }
 
@@ -5272,12 +5624,13 @@ void sendUdpImuTelemetry() {
 }
 
 void sendUdpPowerTelemetry() {
-  float batteryVolts = readBatterySystemVoltage();
+  const float measuredBatteryVolts = readBatterySystemVoltage();
+  const bool batteryValid = updateLatestBatteryVoltage(measuredBatteryVolts);
+  const float batteryVolts = batteryValid ? measuredBatteryVolts :
+    (latestBatteryVoltageValid ? latestBatteryVolts : 0.0f);
   float currentAmps = readCurrentSensorAmps();
-  latestBatteryVolts = batteryVolts;
-  latestCurrentAmps = currentAmps;
   lastStandalonePowerSampleMs = millis();
-  int batteryPct = estimateBatteryPercent(batteryVolts);
+  int batteryPct = batteryValid || latestBatteryVoltageValid ? estimateBatteryPercent(batteryVolts) : 0;
 
   PowerPacketPayload payload = {
     static_cast<uint16_t>(round(batteryVolts * 1000.0f)),
@@ -6484,6 +6837,7 @@ void loop() {
   serviceOtaUpdate();
   elrs.poll();
   updateMotorCommandWatchdog();
+  updateMotorStallProtection(millis());
   if (serviceMode) {
     serviceElrsCalibration(millis());
     updateMissionExecution(millis());

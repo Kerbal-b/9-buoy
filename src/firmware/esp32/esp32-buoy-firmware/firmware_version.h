@@ -6,7 +6,7 @@
 // compatible features, and patch for fixes. The date identifies this build.
 constexpr uint16_t kFirmwareVersionMajor = 1;
 constexpr uint16_t kFirmwareVersionMinor = 16;
-constexpr uint16_t kFirmwareVersionPatch = 27;
+constexpr uint16_t kFirmwareVersionPatch = 29;
 constexpr uint32_t kFirmwareBuildDate = 20261108;
 
 inline String firmwareVersionString() {

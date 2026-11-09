@@ -7,10 +7,14 @@ It does not configure the transmitter or command the buoy.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 
-DEFAULT_TX12_MAPPING_PATH = Path(__file__).resolve().parents[1] / "config" / "tx12-channel-map.json"
+DEFAULT_TX12_MAPPING_PATH = (
+    Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parents[1]
+) / "config" / "tx12-channel-map.json"
 
 
 def load_tx12_mapping(path: Path = DEFAULT_TX12_MAPPING_PATH) -> list[dict[str, object]]:
@@ -43,6 +47,9 @@ def load_tx12_mapping(path: Path = DEFAULT_TX12_MAPPING_PATH) -> list[dict[str, 
         purpose = item.get("purpose", "")
         if not isinstance(purpose, str):
             raise ValueError(f"TX12 control {control_id} purpose must be text")
+        details = item.get("details", "")
+        if not isinstance(details, str):
+            raise ValueError(f"TX12 control {control_id} details must be text")
         positions = item.get("positions", [])
         if kind == "rf_switch":
             if not isinstance(positions, list) or len(positions) not in (2, 3):
@@ -68,6 +75,7 @@ def load_tx12_mapping(path: Path = DEFAULT_TX12_MAPPING_PATH) -> list[dict[str, 
             "kind": kind,
             "channel": channel,
             "purpose": purpose,
+            "details": details,
             "positions": [{"label": position["label"], "meaning": position.get("meaning")} for position in positions],
             "image_x": image_x if kind != "radio_ui" else None,
             "image_y": image_y if kind != "radio_ui" else None,

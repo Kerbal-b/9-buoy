@@ -175,7 +175,11 @@
         }
       });
       if (data.show_boundary_points !== false && data.edit_mode !== "points") boundary.forEach((point, index) => marker(point, String(index + 1), "boundary", index));
-      if (data.edit_mode !== "boundary" && data.home) marker(data.home, data.end_is_home ? "H/E" : "H", "home", -1);
+      if (data.edit_mode !== "boundary" && data.home) {
+        L.circle(latLng(data.home), {radius: 30, color: "#57c8ff", weight: 2,
+          dashArray: "7 5", fillColor: "#57c8ff", fillOpacity: .10, interactive: false}).addTo(missionLayer);
+        marker(data.home, data.end_is_home ? "H/E" : "H", "home", -1);
+      }
       if (data.edit_mode !== "boundary" && data.end && !data.end_is_home) marker(data.end, "E", "end", -1);
       if (data.current_location && Number.isFinite(Number(data.current_location.lat)) && Number.isFinite(Number(data.current_location.lon))) {
         marker(data.current_location, "B", "buoy", -1);

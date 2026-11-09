@@ -152,37 +152,52 @@ class ElrsLink {
 
   void sendGps(double latitude, double longitude, float speedMps,
                float courseDegrees, float altitudeMeters, uint8_t satellites,
-               float hdop) {
-    if (!isfinite(latitude) || !isfinite(longitude) ||
-        latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return;
-    int32_t latE7 = static_cast<int32_t>(round(latitude * 1e7));
-    int32_t lonE7 = static_cast<int32_t>(round(longitude * 1e7));
-    uint8_t payload[28] = {};
-    putLe32(payload + 4, static_cast<uint32_t>(latE7));
-    putLe32(payload + 8, static_cast<uint32_t>(lonE7));
-    putLe32(payload + 12, static_cast<uint32_t>(static_cast<int32_t>(roundf(altitudeMeters * 1000.0f))));
-    if (isfinite(speedMps) && isfinite(courseDegrees)) {
-      const float courseRadians = courseDegrees * (PI / 180.0f);
-      putLe16(payload + 20, static_cast<uint16_t>(static_cast<int16_t>(constrain(
-        roundf(speedMps * cosf(courseRadians) * 100.0f), -32767.0f, 32767.0f))));
-      putLe16(payload + 22, static_cast<uint16_t>(static_cast<int16_t>(constrain(
-        roundf(speedMps * sinf(courseRadians) * 100.0f), -32767.0f, 32767.0f))));
-      putLe16(payload + 26, static_cast<uint16_t>(constrain(roundf(courseDegrees * 100.0f), 0.0f, 35999.0f)));
-    } else {
-      putLe16(payload + 26, 0xFFFF);
-    }
-    sendMavlink(33, 104, payload, sizeof(payload), kComponentId);
+               uint8_t fixType, float hdop, uint64_t timeUsec) {
+    const bool fixValid = fixType >= 2 && isfinite(latitude) && isfinite(longitude) &&
+      latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180;
+    if (!fixValid) fixType = 1;  // MAV_GPS_FIX_TYPE_NO_FIX.
+    const int32_t latE7 = fixValid ? static_cast<int32_t>(round(latitude * 1e7)) : 0;
+    const int32_t lonE7 = fixValid ? static_cast<int32_t>(round(longitude * 1e7)) : 0;
+
+    // GPS_RAW_INT wire order: time, lat/lon/alt, eph/epv, velocity/course,
+    // fix type, satellite count. eph is HDOP * 100; epv is VDOP * 100.
     uint8_t rawPayload[30] = {};
-    rawPayload[8] = 2;  // Position fix reported by TinyGPSPlus; dimensional quality is unavailable.
-    putLe32(rawPayload + 9, static_cast<uint32_t>(latE7));
-    putLe32(rawPayload + 13, static_cast<uint32_t>(lonE7));
-    putLe32(rawPayload + 17, static_cast<uint32_t>(static_cast<int32_t>(roundf(altitudeMeters * 1000.0f))));
-    putLe16(rawPayload + 21, isfinite(hdop) ? static_cast<uint16_t>(constrain(roundf(hdop * 100.0f), 0.0f, 65534.0f)) : 0xFFFF);
-    putLe16(rawPayload + 23, 0xFFFF);  // Vertical dilution unavailable.
-    putLe16(rawPayload + 25, isfinite(speedMps) ? static_cast<uint16_t>(constrain(roundf(speedMps * 100.0f), 0.0f, 65534.0f)) : 0xFFFF);
-    putLe16(rawPayload + 27, isfinite(courseDegrees) ? static_cast<uint16_t>(constrain(roundf(courseDegrees * 100.0f), 0.0f, 35999.0f)) : 0xFFFF);
+    putLe64(rawPayload, timeUsec);  // Monotonic microseconds since ESP32 boot.
+    putLe32(rawPayload + 8, static_cast<uint32_t>(latE7));
+    putLe32(rawPayload + 12, static_cast<uint32_t>(lonE7));
+    const int32_t altitudeMm = fixValid && isfinite(altitudeMeters)
+      ? static_cast<int32_t>(roundf(altitudeMeters * 1000.0f)) : 0;
+    putLe32(rawPayload + 16, static_cast<uint32_t>(altitudeMm));
+    putLe16(rawPayload + 20, fixValid && isfinite(hdop)
+      ? static_cast<uint16_t>(constrain(roundf(hdop * 100.0f), 0.0f, 65534.0f)) : 0xFFFF);
+    putLe16(rawPayload + 22, 0xFFFF);  // Vertical dilution unavailable.
+    putLe16(rawPayload + 24, fixValid && isfinite(speedMps)
+      ? static_cast<uint16_t>(constrain(roundf(speedMps * 100.0f), 0.0f, 65534.0f)) : 0xFFFF);
+    putLe16(rawPayload + 26, fixValid && isfinite(courseDegrees)
+      ? static_cast<uint16_t>(constrain(roundf(courseDegrees * 100.0f), 0.0f, 35999.0f)) : 0xFFFF);
+    rawPayload[28] = fixType;
     rawPayload[29] = satellites;
     sendMavlink(24, 24, rawPayload, sizeof(rawPayload), kComponentId);
+    if (!fixValid) return;
+
+    // Keep GLOBAL_POSITION_INT available to common GCS clients.
+    uint8_t positionPayload[28] = {};
+    putLe32(positionPayload, millis());
+    putLe32(positionPayload + 4, static_cast<uint32_t>(latE7));
+    putLe32(positionPayload + 8, static_cast<uint32_t>(lonE7));
+    putLe32(positionPayload + 12, static_cast<uint32_t>(altitudeMm));
+    putLe32(positionPayload + 16, 0);  // Relative altitude is unavailable.
+    if (fixValid && isfinite(speedMps) && isfinite(courseDegrees)) {
+      const float courseRadians = courseDegrees * (PI / 180.0f);
+      putLe16(positionPayload + 20, static_cast<uint16_t>(static_cast<int16_t>(constrain(
+        roundf(speedMps * cosf(courseRadians) * 100.0f), -32767.0f, 32767.0f))));
+      putLe16(positionPayload + 22, static_cast<uint16_t>(static_cast<int16_t>(constrain(
+        roundf(speedMps * sinf(courseRadians) * 100.0f), -32767.0f, 32767.0f))));
+    }
+    putLe16(positionPayload + 26, fixValid && isfinite(courseDegrees)
+      ? static_cast<uint16_t>(constrain(roundf(courseDegrees * 100.0f), 0.0f, 35999.0f)) : 0xFFFF);
+    sendMavlink(33, 104, positionPayload, sizeof(positionPayload), kComponentId);
+
   }
 
   void sendHomePosition(double latitude, double longitude, float altitudeMeters) {
@@ -274,6 +289,10 @@ class ElrsLink {
   }
   static void putLe32(uint8_t* out, uint32_t value) {
     for (uint8_t i = 0; i < 4; ++i) out[i] = static_cast<uint8_t>(value >> (8 * i));
+  }
+  static void putLe64(uint8_t* out, uint64_t value) {
+    putLe32(out, static_cast<uint32_t>(value));
+    putLe32(out + 4, static_cast<uint32_t>(value >> 32));
   }
   static void putBe16(uint8_t* out, uint16_t value) {
     out[0] = static_cast<uint8_t>(value >> 8);

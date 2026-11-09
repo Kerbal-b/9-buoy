@@ -26,6 +26,19 @@ Item {
     readonly property color ink: "#e6ecf2"
     readonly property color muted: "#9eb5c7"
 
+    function liveSessionSummary() {
+        if (String(backendState.telemetrySource || "").toUpperCase() === "ELRS" && backendState.radioBuoyState) {
+            if (!backendState.radioBuoyState.recording) return "Session idle"
+            return backendState.radioAudioRecording === true ? "Session + audio" : "Session only"
+        }
+        if (!backendState.wifiDetailTelemetryLive && !backendState.wifiSafetyTelemetryLive) return "Session state waiting"
+        const state = String(backendState.scienceExperimentState || "UNKNOWN").toUpperCase()
+        if (state === "RECORDING") return backendState.audioRecordingEnabled ? "Session + audio" : "Session only"
+        if (state === "STOPPED") return "Session save pending"
+        if (state === "IDLE") return "Session idle"
+        return "Session state waiting"
+    }
+
     function runMap(script) {
         if (webMapReady) missionMap.runJavaScript(script)
     }
@@ -227,7 +240,7 @@ Item {
                     color: root.muted; font.pixelSize: 10; wrapMode: Text.WordWrap
                 }
                 Text { Layout.fillWidth: true; text: "Boundary edges uncross as you edit. Points within 2 m of another boundary point are ignored; review the shaded area before saving."; color: root.muted; font.pixelSize: 10; wrapMode: Text.WordWrap }
-                Text { Layout.fillWidth: true; text: "Home and End may be outside the survey boundary. If End is unset, the mission ends at Home. Dashed final travel is a preview; routing outside the survey is not planned yet."; color: root.muted; font.pixelSize: 10; wrapMode: Text.WordWrap }
+                Text { Layout.fillWidth: true; text: "The blue 30 m circle around Home is the mission start area. Hold SA while starting Mission to capture the buoy's current GPS position as Home for this run. The buoy still requires that position and the route to the first waypoint to stay inside the survey boundary. If End is unset, the mission ends at Home."; color: root.muted; font.pixelSize: 10; wrapMode: Text.WordWrap }
             }
         }
     }
@@ -524,7 +537,7 @@ Item {
                         text: (backendState.missionIssues || []).length ? (backendState.missionIssues || []).join("\n") : "Plan geometry and settings are ready for future mission support."
                         color: (backendState.missionIssues || []).length ? "#ffb454" : "#4dca81"; wrapMode: Text.WordWrap; font.pixelSize: 11
                     }
-                    Text { text: "Live buoy: " + (backendState.buoyMode || "Unknown") + " · " + (backendState.radioArmStatus || "Unknown") + " · " + (backendState.recoveryStatus || "Unknown"); color: root.muted; font.pixelSize: 11; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                    Text { text: "Live buoy: " + (backendState.buoyMode || "Unknown") + " · " + (backendState.radioArmStatus || "Unknown") + " · " + (backendState.recoveryStatus || "Unknown") + " · " + root.liveSessionSummary(); color: root.muted; font.pixelSize: 11; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                 }
             }
         }

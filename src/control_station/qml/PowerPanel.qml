@@ -259,7 +259,7 @@ Item {
                 width: 100; height: 24; radius: 12
                 color: root.samples.length ? "#173b34" : "#3a3030"
                 border.color: root.samples.length ? "#346e58" : "#68504a"
-                Text { anchors.centerIn: parent; text: root.samples.length ? "LIVE HISTORY" : "NO HISTORY"; color: root.samples.length ? "#78ddb2" : "#f2bb74"; font.pixelSize: 9; font.bold: true }
+                Text { anchors.centerIn: parent; text: root.samples.length ? "SAVED HISTORY" : "NO HISTORY"; color: root.samples.length ? "#78ddb2" : "#f2bb74"; font.pixelSize: 9; font.bold: true }
             }
         }
 

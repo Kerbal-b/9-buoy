@@ -12,7 +12,7 @@ from typing import Any
 
 
 # Common.xml CRC_EXTRA values from the MAVLink generated message headers.
-CRC_EXTRAS = {0: 50, 1: 124, 24: 24, 33: 104, 35: 244, 65: 118, 109: 185, 251: 170, 252: 44}
+CRC_EXTRAS = {0: 50, 1: 124, 24: 24, 33: 104, 35: 244, 65: 118, 109: 185, 242: 104, 251: 170, 252: 44, 253: 83}
 
 
 def _crc_x25(data: bytes, extra: int) -> int:
@@ -32,6 +32,31 @@ def gcs_heartbeat() -> bytes:
 
 
 def _decode_payload(message_id: int, payload: bytes) -> dict[str, Any] | None:
+    if message_id == 253 and len(payload) >= 2:  # STATUSTEXT, versioned buoy status
+        text = payload[1:51].split(b"\0", 1)[0].decode("ascii", errors="replace")
+        if text.startswith("B1,"):
+            try:
+                fields = [int(value) for value in text[3:].split(",")]
+            except ValueError:
+                return None
+            if len(fields) != 13 or fields[0] not in (0, 1) or fields[6] not in (0, 1) or fields[7] not in (0, 1):
+                return None
+            return {"kind": "compact_status", "armed": bool(fields[0]), "assist": fields[1],
+                    "mission_state": fields[2], "percent": fields[3], "waypoint": fields[4],
+                    "waypoint_count": fields[5], "recording": bool(fields[6]),
+                    "audio_recording": bool(fields[7]), "heading_deg": fields[8],
+                    "home_distance_m": fields[9], "gps_fix": bool(fields[10]), "home_kind": fields[11],
+                    "mission_block": fields[12]}
+        if text.startswith("BC1,"):
+            try:
+                fields = [int(value) for value in text[4:].split(",")]
+            except ValueError:
+                return None
+            if len(fields) != 5:
+                return None
+            return {"kind": "calibration_status", "state": fields[0], "step": fields[1],
+                    "power": fields[2], "max_power": fields[3], "duration_s": fields[4]}
+        return None
     if message_id == 0 and len(payload) >= 9:  # HEARTBEAT
         return {
             "kind": "heartbeat",
@@ -59,17 +84,30 @@ def _decode_payload(message_id: int, payload: bytes) -> dict[str, Any] | None:
             "ground_speed_mps": None if track_cdeg == 0xFFFF else round(math.hypot(north_cm_s, east_cm_s) / 100.0, 2),
             "ground_track_deg": None if track_cdeg == 0xFFFF else track_cdeg / 100.0,
         }
+    if message_id == 242 and len(payload) >= 52:  # HOME_POSITION
+        latitude, longitude = struct.unpack_from("<ii", payload, 0)
+        if not (-900000000 <= latitude <= 900000000 and -1800000000 <= longitude <= 1800000000):
+            return None
+        return {"kind": "home_position", "latitude": latitude / 1e7, "longitude": longitude / 1e7}
     if message_id == 24 and len(payload) >= 30:  # GPS_RAW_INT
-        fix_type = payload[8]
-        eph = struct.unpack_from("<H", payload, 21)[0]
+        eph = struct.unpack_from("<H", payload, 20)[0]
+        fix_type = payload[28]
         satellites = payload[29]
         return {
             "kind": "gps_quality",
             "satellites": None if satellites == 255 else satellites,
             "hdop": None if eph == 0xFFFF else eph / 100.0,
+            "fix_type": fix_type,
             "fix_valid": fix_type >= 2,
         }
     if message_id == 252 and len(payload) >= 18:  # NAMED_VALUE_INT
+        if payload[8:18] == b"BUOY_AUDIO":
+            return {
+                "kind": "buoy_audio_state",
+                "audio_recording": bool(struct.unpack_from("<i", payload, 4)[0]),
+            }
+        if payload[8:18].startswith(b"HOME_KIND"):
+            return {"kind": "home_source", "source": int(struct.unpack_from("<i", payload, 4)[0])}
         if payload[8:18] != b"BUOY_STATE":
             return None
         rear, left, right, flags = struct.unpack_from("<bbbB", payload, 4)
@@ -90,7 +128,10 @@ def _decode_payload(message_id: int, payload: bytes) -> dict[str, Any] | None:
             name = raw_name.decode("ascii")
         except UnicodeDecodeError:
             return None
-        if name not in {"WATER_TEMP", "DEPTH_M", "TDS_V", "TURBIDITY"}:
+        if name not in {"WATER_TEMP", "DEPTH_M", "TDS_V", "TURBIDITY", "HOME_DIST", "DIST_HOME",
+                        "MIS_STATE", "MIS_BLOCK", "MIS_PCT", "MIS_COUNT", "DIST_WP", "MIS_WP",
+                        "MAG_HEAD", "TILT_HEAD", "SEA_ACC", "SEA_GYR", "MAN_AST",
+                        "CAL_STAT", "CAL_STEP", "CAL_PWR", "CAL_MAX", "CAL_DUR"}:
             return None
         value = struct.unpack_from("<f", payload, 4)[0]
         if not math.isfinite(value):

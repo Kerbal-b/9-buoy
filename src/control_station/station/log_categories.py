@@ -9,6 +9,49 @@ NAVIGATION_LOG = "navigation"
 SCIENTIFIC_LOG = "scientific"
 
 
+def communication_kind(entry: str) -> str | None:
+    """Keep the link timeline focused on transport, radio, and commands."""
+    value = entry.strip().upper()
+    if not value:
+        return None
+    if value.startswith("ELRS MAVLINK RX") or "ELRS" in value or "MAVLINK" in value or "RADIO_STATUS" in value:
+        return "elrs"
+    if "TELEMETRY_MODE" in value or value.startswith((
+        "CONNECT", "RECONNECT", "DISCONNECT", "LINK ", "PING ", "WIFI ", "NETWORK ", "BACKPACK ",
+        "TX PING", "RX ACK PING",
+    )):
+        return "wifi"
+    if value.startswith(("TX ", "RX ACK", "RX ERR")):
+        return "commands"
+    if any(word in value for word in ("TIMEOUT", "LINK LOST", "DISCONNECT", "CONNECT FAILED", "RECONNECT FAILED")):
+        return "wifi"
+    return None
+
+
+def communication_source(entry: str) -> str:
+    value = entry.strip().upper()
+    if value.startswith("ELRS MAVLINK RX"):
+        return "Backpack"
+    if value.startswith("RX "):
+        return "Buoy"
+    if value.startswith("TX "):
+        return "Station"
+    if "ELRS" in value or "RADIO_STATUS" in value:
+        return "Receiver"
+    return "Station"
+
+
+def communication_severity(entry: str) -> str:
+    value = entry.strip().upper()
+    if "FAILSAFE NONE" in value:
+        return "info"
+    if any(word in value for word in ("RX ERR", "TX FAILED", "FAILSAFE", "TIMEOUT", "LINK LOST", "CONNECT FAILED", "RECONNECT FAILED")):
+        return "error"
+    if any(word in value for word in ("STALE", "DISCONNECT", "ZERO_LQ", "WARNING")):
+        return "warning"
+    return "info"
+
+
 def classify_log_entry(entry: str) -> str:
     """Assign a communication entry to the most useful operator-facing stream."""
     normalized = entry.strip().upper()

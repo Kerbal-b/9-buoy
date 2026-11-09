@@ -46,7 +46,7 @@ MISSION_BLOCKS = {
     6: "Buoy GPS position is outside the mission boundary",
     7: "Move within 5 m of mission Home",
     8: "Magnetometer calibration or heading is unavailable",
-    9: "Select Manual on SB, then select Mission again",
+    9: "Cycle SE low before retrying Mission",
     10: "Load a V4 mission with Home and a boundary",
     11: "Buoy SD card is unavailable",
     12: "Stop or save the existing science session first",

@@ -39,7 +39,42 @@ GridLayout {
     function positionIndex(control) {
         const value = channelValue(control)
         if (value === null || !control.positions || !control.positions.length) return -1
+        if (control.positions.length === 3) return value < 1300 ? 0 : (value >= 1700 ? 2 : 1)
+        if (control.positions.length === 2) return value < 1500 ? 0 : 1
         return Math.min(control.positions.length - 1, Math.floor(channelFraction(value) * control.positions.length))
+    }
+
+    Rectangle {
+        Layout.columnSpan: root.columns
+        Layout.fillWidth: true
+        implicitHeight: 58
+        radius: 8
+        color: "#10231f"
+        border.color: "#39776d"
+        RowLayout {
+            anchors.fill: parent
+            anchors.margins: 9
+            spacing: 12
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 2
+                Text {
+                    text: "HOME  |  " + String(root.backendState.activeHomeStatus || "Unknown")
+                    color: String(root.backendState.activeHomeStatus || "") === "Manual Home" || String(root.backendState.activeHomeStatus || "") === "Mission Home" ? "#79d6cf" : "#f1cc80"
+                    font.pixelSize: 12; font.bold: true; elide: Text.ElideRight
+                }
+                Text {
+                    text: String(root.backendState.activeHomeCoordinates || "") || String(root.backendState.manualHomeStatus || "No location saved")
+                    color: "#9eb8b5"; font.pixelSize: 10; elide: Text.ElideRight
+                    Layout.fillWidth: true
+                }
+            }
+            ColumnLayout {
+                spacing: 2
+                Text { text: root.backendState.homeDistanceMeters === null || root.backendState.homeDistanceMeters === undefined ? "--" : Number(root.backendState.homeDistanceMeters).toFixed(1) + " m"; color: "#dff8f2"; font.pixelSize: 15; font.bold: true }
+                Text { text: "TO HOME"; color: "#9eb8b5"; font.pixelSize: 9; font.bold: true }
+            }
+        }
     }
 
     Repeater {
@@ -53,10 +88,11 @@ GridLayout {
             Layout.fillWidth: true
             implicitHeight: 54
             radius: 6
-            color: "#111c28"
+            color: "#121c28"
             border.color: "#395166"
 
             ColumnLayout {
+                id: contentColumn
                 anchors.fill: parent
                 anchors.margins: 7
                 spacing: 4
@@ -118,11 +154,6 @@ GridLayout {
                             }
                         }
                     }
-                }
-                Text {
-                    visible: !controlCard.stick && !(controlCard.control.positions && controlCard.control.positions.length)
-                    text: "No function mapped"
-                    color: "#829aad"; font.pixelSize: 10
                 }
             }
         }

@@ -15,6 +15,7 @@ Item {
     property int configFetchIdSeen: 0
     property int configVisitId: 0
     property string lastConfigRequestKey: ""
+    property int calibrationAckIdSeen: 0
 
     property var motorList: [
         { key: "front_left", label: "LEFT MOTOR", name: "Front left" },
@@ -23,13 +24,21 @@ Item {
     ]
     property var motorProfiles: ({
         front_left: { startPwm: 171, pulseMs: 260, minimum: 130, maximum: 255, curve: 2.0, rampSeconds: 1.0, reversed: true, loaded: false },
-        rear: { startPwm: 171, pulseMs: 260, minimum: 130, maximum: 255, curve: 2.0, rampSeconds: 1.0, reversed: true, loaded: false },
-        front_right: { startPwm: 171, pulseMs: 260, minimum: 130, maximum: 255, curve: 2.0, rampSeconds: 1.0, reversed: false, loaded: false }
+        rear: { startPwm: 171, pulseMs: 260, minimum: 130, maximum: 255, curve: 2.0, rampSeconds: 1.0, reversed: false, loaded: false },
+        front_right: { startPwm: 171, pulseMs: 260, minimum: 130, maximum: 255, curve: 2.0, rampSeconds: 1.0, reversed: true, loaded: false }
     })
     property var dirtyProfiles: ({})
 
+    Component.onCompleted: calibrationAckIdSeen = Number((backendState.motorCalibrationAckId) || 0)
+
     function isConnected() {
         return String(backendState.serialStatus || "").startsWith("Connected")
+    }
+
+    function canApplyCalibration() {
+        return isConnected()
+            && String(backendState.radioArmStatus || "DISARMED").toUpperCase() !== "ARMED"
+            && String(backendState.buoyMode || "idle").toLowerCase() !== "mission"
     }
 
     function profileFor(key) {
@@ -78,6 +87,31 @@ Item {
     function syncConfiguration() {
         if (!backendObject) return
         const state = backendObject.state || backendState
+        const configurations = state.motorConfigurations || ({})
+        const configuredKeys = Object.keys(configurations)
+        if (configuredKeys.length > 0) {
+            const profiles = Object.assign({}, motorProfiles)
+            let changed = false
+            for (let index = 0; index < configuredKeys.length; ++index) {
+                const key = configuredKeys[index]
+                const config = configurations[key]
+                if (!motorProfiles[key] || dirtyProfiles[key] || !config || config.direction !== "forward") continue
+                profiles[key] = {
+                    startPwm: Number(config.start_boost_pwm),
+                    pulseMs: Number(config.start_boost_ms),
+                    minimum: Number(config.sustain_min_pwm),
+                    maximum: Number(config.max_pwm),
+                    curve: Number(config.curve),
+                    rampSeconds: Number(config.ramp_seconds),
+                    reversed: Boolean(config.default_reversed),
+                    loaded: true
+                }
+                changed = true
+            }
+            if (changed) motorProfiles = profiles
+            configFetchIdSeen = Number(state.motorConfigFetchId || configFetchIdSeen)
+            return
+        }
         const fetchId = Number(state.motorConfigFetchId || 0)
         if (!Number.isFinite(fetchId) || fetchId <= configFetchIdSeen) return
         configFetchIdSeen = fetchId
@@ -113,12 +147,6 @@ Item {
             profile.rampSeconds,
             profile.reversed
         )
-        const dirty = Object.assign({}, dirtyProfiles)
-        dirty[key] = false
-        dirtyProfiles = dirty
-        const profiles = Object.assign({}, motorProfiles)
-        profiles[key] = Object.assign({}, profile, { loaded: true })
-        motorProfiles = profiles
     }
 
     function reloadAllConfigurations() {
@@ -203,6 +231,10 @@ Item {
     function motorPwm(key) {
         const field = key === "rear" ? "rearMotorPwm" : key === "front_left" ? "frontLeftMotorPwm" : "frontRightMotorPwm"
         return backendState[field] === undefined ? -1 : Number(backendState[field])
+    }
+
+    function hasMotorPwm(key) {
+        return Boolean(backendState.motorOutputTelemetry) && motorPwm(key) !== -1
     }
 
     component PanelButton: Button {
@@ -324,10 +356,10 @@ Item {
                         }
                         RowLayout {
                             Layout.fillWidth: true
-                            Text { text: root.motorPwm(modelData.key) < 0 ? "—" : root.motorDrive(modelData.key) + "%"; color: "#eef5f9"; font.pixelSize: 27; font.bold: true }
+                            Text { text: root.hasMotorPwm(modelData.key) ? root.motorDrive(modelData.key) + "%" : "—"; color: "#eef5f9"; font.pixelSize: 27; font.bold: true }
                             ColumnLayout { Layout.fillWidth: true; spacing: 1
-                                Text { text: "APPLIED DRIVE"; color: "#91a9b9"; font.pixelSize: 9; font.bold: true }
-                                Text { text: root.motorPwm(modelData.key) < 0 ? "PWM unavailable" : "PWM " + root.motorPwm(modelData.key) + " / 255"; color: "#91a9b9"; font.pixelSize: 10 }
+                                Text { text: backendState.telemetrySource === "ELRS" ? "PWM LEVEL" : "APPLIED DRIVE"; color: "#91a9b9"; font.pixelSize: 9; font.bold: true }
+                                Text { text: !root.hasMotorPwm(modelData.key) ? "PWM unavailable" : "PWM " + root.motorPwm(modelData.key) + " / 255"; color: "#91a9b9"; font.pixelSize: 10 }
                             }
                         }
                         Rectangle { Layout.fillWidth: true; height: 1; color: "#2a4051" }
@@ -372,9 +404,9 @@ Item {
                                         color: "#236d76"
                                     }
                                     Rectangle {
-                                        x: Math.max(0, Math.min(parent.width - width, root.motorPwm(modelData.key) / 255 * parent.width - width / 2))
+                                        x: Math.max(0, Math.min(parent.width - width, Math.abs(root.motorPwm(modelData.key)) / 255 * parent.width - width / 2))
                                         y: 0; width: 5; height: 15; radius: 2; color: "#65d4da"
-                                        visible: root.motorPwm(modelData.key) >= 0
+                                        visible: root.hasMotorPwm(modelData.key)
                                     }
                                 }
                                 RowLayout {
@@ -405,20 +437,35 @@ Item {
                         Rectangle { Layout.fillWidth: true; height: 1; color: "#2a4051" }
                         RowLayout {
                             Layout.fillWidth: true; spacing: 8
-                            PanelButton { text: "Apply to buoy"; enabled: root.isConnected() && root.profileFor(modelData.key).loaded && !root.testRunning; onClicked: root.saveProfile(modelData.key) }
-                            Text { text: root.dirtyProfiles[modelData.key] ? "Changes pending" : root.profileFor(modelData.key).loaded ? "RAM only" : "Read settings"; color: root.dirtyProfiles[modelData.key] ? "#f2bb74" : "#91a9b9"; font.pixelSize: 10; Layout.fillWidth: true; horizontalAlignment: Text.AlignRight }
+                            PanelButton { text: "Apply to buoy"; enabled: root.canApplyCalibration() && root.profileFor(modelData.key).loaded && !root.testRunning; onClicked: root.saveProfile(modelData.key) }
+                            Text {
+                                text: !root.canApplyCalibration() ? "Disarm to apply" : root.dirtyProfiles[modelData.key] ? (String(root.backendState.motorCalibrationStatus || "").includes(modelData.key) ? root.backendState.motorCalibrationStatus : "Changes pending") : root.profileFor(modelData.key).loaded ? "RAM only" : "Read settings"
+                                color: root.dirtyProfiles[modelData.key] ? (String(root.backendState.motorCalibrationStatus || "").includes("failed") || String(root.backendState.motorCalibrationStatus || "").includes("rejected") ? "#ef8c87" : "#f2bb74") : "#91a9b9"
+                                font.pixelSize: 10; Layout.fillWidth: true; horizontalAlignment: Text.AlignRight; wrapMode: Text.WordWrap
+                            }
                         }
                     }
                 }
             }
         }
 
-        Text { Layout.fillWidth: true; text: "Motor settings are currently applied in buoy RAM and reset on reboot. An SD profile and GPS/heading based water calibration are planned."; color: "#91a9b9"; font.pixelSize: 10; wrapMode: Text.WordWrap }
+        Text { Layout.fillWidth: true; text: "Low-power drive uses a shared pulse cycle to preserve motor ratios. The current firmware defaults start at 110 PWM with no startup boost and ramp the command gradually; confirm the minimum that spins reliably while watching current. Motor settings are applied in buoy RAM and reset on reboot."; color: "#91a9b9"; font.pixelSize: 10; wrapMode: Text.WordWrap }
     }
 
     Connections {
         target: root.backendObject || null
         function onStateChanged() {
+            const state = root.backendObject.state || ({})
+            const ackId = Number(state.motorCalibrationAckId || 0)
+            if (ackId > root.calibrationAckIdSeen) {
+                root.calibrationAckIdSeen = ackId
+                const key = String(state.motorCalibrationAckMotor || "")
+                if (key && root.dirtyProfiles[key]) {
+                    const dirty = Object.assign({}, root.dirtyProfiles)
+                    dirty[key] = false
+                    root.dirtyProfiles = dirty
+                }
+            }
             const connected = root.isConnected()
             const wasConnected = root.configWasConnected
             root.configWasConnected = connected
