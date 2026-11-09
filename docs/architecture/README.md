@@ -3,7 +3,7 @@
 Use [System Architecture](system-architecture.md) for the current high-level design. The other files serve narrower purposes:
 
 - [Physical Design](physical-design.md) records hull, propulsion geometry, and Fusion/build decisions.
-- [Sketched Layout](sketched-layout.md) is a conceptual drawing and must not be used as the dimensioned CAD reference.
+- [Layout Reference Status](sketched-layout.md) records why the former propeller-placement sketch was removed and what measurements are required before publishing a replacement.
 - [Testing Plan](testing-plan.md) lists subsystem and integration checks.
 
 ## Current System Groups
