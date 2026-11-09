@@ -213,12 +213,16 @@ class State(object):
                 lat, lon, alt = struct.unpack_from("<iii", payload, 8)
                 eph, epv, velocity, course = struct.unpack_from("<HHHH", payload, 20)
                 fix_type, satellites = payload[28], payload[29]
+                hdop = None if eph == 0xffff else eph / 100.0
+                vdop = None if epv == 0xffff else epv / 100.0
                 decoded["gps_raw"] = {
                     "time_usec": time_usec,
                     "latitude_deg": None if lat == 0 else lat / 1e7,
                     "longitude_deg": None if lon == 0 else lon / 1e7,
-                    "altitude_m": alt / 1000.0, "eph_m": None if eph == 0xffff else eph / 100.0,
-                    "epv_m": None if epv == 0xffff else epv / 100.0,
+                    "altitude_m": alt / 1000.0,
+                    "hdop": hdop, "vdop": vdop,
+                    # Backward-compatible aliases; MAVLink eph/epv are DOP * 100, not metres.
+                    "eph_m": hdop, "epv_m": vdop,
                     "ground_speed_mps": None if velocity == 0xffff else velocity / 100.0,
                     "course_deg": None if course == 0xffff else course / 100.0,
                     "fix_type": fix_type, "fix_valid": fix_type >= 2,

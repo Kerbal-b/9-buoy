@@ -105,7 +105,8 @@ Every decoded group below has `received_at`, the epoch seconds when that message
 | `time_usec` | integer | GPS time in microseconds as supplied by firmware. |
 | `latitude_deg`, `longitude_deg` | number or null | WGS84 coordinates in degrees; null when source coordinate is zero. |
 | `altitude_m` | number | GPS altitude in metres. |
-| `eph_m`, `epv_m` | number or null | Horizontal/vertical position error estimate in metres; null for `0xffff`. |
+| `hdop`, `vdop` | number or null | Horizontal/vertical dilution of precision, decoded from MAVLink `eph`/`epv` divided by 100; null when the wire value is `0xffff`. These are dimensionless DOP values, not metres. |
+| `eph_m`, `epv_m` | number or null | Deprecated compatibility aliases for `hdop`/`vdop`. Despite the legacy `_m` names, the values are dimensionless DOP values, not metres. |
 | `ground_speed_mps` | number or null | GPS ground speed in m/s; null for `0xffff`. |
 | `course_deg` | number or null | Course over ground in degrees; null for `0xffff`. |
 | `fix_type` | integer | MAV GPS_FIX_TYPE: 0 no GPS, 1 no fix, 2 2D, 3 3D, 4 DGPS, 5 RTK float, 6 RTK fixed, 7 static, 8 PPP; values above are preserved if received. |
